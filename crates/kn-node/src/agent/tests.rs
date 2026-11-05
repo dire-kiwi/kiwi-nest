@@ -479,3 +479,65 @@ async fn the_poll_loop_carries_on_while_a_long_deploy_and_commands_run() {
     assert!(c.nodes().await[0].online);
     assert!(c.wait("blog", 1).await.ok);
 }
+
+/// The applier on its own, with a server that can't be reached (so every download is retried).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_replaced_by_a_later_one_wakes_whoever_waits_on_it() {
+    install_tls();
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let mut cfg = NodeConfig::new(root.join("state"));
+    cfg.volumes_dir = root.join("volumes");
+    let apps = Apps::open_with_runtime(cfg, Arc::new(crate::volumes::fake::Fake::default()), Fake::new())
+        .await
+        .unwrap();
+    // Port 1 refuses connections: the agent's downloads fail, and it retries them.
+    let server = "http://127.0.0.1:1";
+    let file = AgentFile {
+        version: FILE_VERSION,
+        server: server.into(),
+        node_id: 1,
+        name: "a".into(),
+        token: "knn_test".into(),
+        applied: Applied::default(),
+    };
+    std::fs::write(root.join("state/agent.json"), serde_json::to_vec(&file).unwrap()).unwrap();
+    let agent = Agent::start(apps, AgentConfig::new(server, "a")).await.unwrap();
+    let inner = &agent.inner;
+    let deploy = |generation, seq, shared: &[&str]| {
+        Want::App(AppChange {
+            name: "x".into(),
+            generation,
+            seq,
+            want: AppWant::Deploy {
+                bundle_digest: format!("sha256:{}", "0".repeat(64)),
+                from: None,
+                shared: shared.iter().map(|s| s.to_string()).collect(),
+            },
+        })
+    };
+    // x's deploy (seq 4) can't download its bundle, so it stays pending.
+    inner.want(Key::App("x".into()), deploy(1, 4, &[]));
+    // Volume v (seq 5) waits for every earlier change, so for x's.
+    inner.want(
+        Key::Volume("v".into()),
+        Want::Volume(VolumeChange {
+            name: "v".into(),
+            generation: 1,
+            seq: 5,
+            want: VolumeWant::Present { data_digest: None },
+        }),
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(inner.applied().volumes.is_empty(), "v waits for x's earlier deploy");
+    // x is redeployed (seq 7) mounting v: x now waits for v, and v must notice that x's change is no longer
+    // earlier than its own.
+    inner.want(Key::App("x".into()), deploy(2, 7, &["v"]));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !inner.applied().volumes.contains_key("v") {
+        assert!(Instant::now() < deadline, "v and x waited on each other");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(inner.applied().volumes["v"].ok);
+    assert!(inner.applied().apps.is_empty(), "x is still retrying its download");
+}

@@ -162,7 +162,7 @@ struct Inner {
     report_now: Notify,
     running: Mutex<BTreeSet<u64>>,
     work: Mutex<HashMap<Key, watch::Sender<Option<Want>>>>,
-    /// Bumped whenever a change finishes, for workers waiting on others.
+    /// Bumped whenever a change finishes or a new one is stored, for workers waiting on others.
     progress: watch::Sender<u64>,
     /// The serial of the next report: milliseconds since the epoch when the agent started, so it keeps growing
     /// across restarts too.
@@ -449,23 +449,30 @@ impl Inner {
     }
 
     /// Hands a change to its worker, starting one if needed. An older change than the worker has is ignored.
+    ///
+    /// Workers blocked on others' earlier changes are woken, since what they wait on depends on every key's pending
+    /// sequence number: a change replaced by a later one (with a higher sequence number) may no longer be earlier
+    /// than theirs, and if nobody looked again, two workers could each wait on the other's old change for ever.
     fn want(self: &Arc<Self>, key: Key, want: Want) {
         let mut work = self.work.lock().expect("work");
-        match work.get(&key) {
-            Some(tx) => {
-                tx.send_if_modified(|w| match w {
-                    Some(old) if old.generation() >= want.generation() => false,
-                    _ => {
-                        *w = Some(want);
-                        true
-                    }
-                });
-            }
+        let stored = match work.get(&key) {
+            Some(tx) => tx.send_if_modified(|w| match w {
+                Some(old) if old.generation() >= want.generation() => false,
+                _ => {
+                    *w = Some(want);
+                    true
+                }
+            }),
             None => {
                 let (tx, rx) = watch::channel(Some(want));
                 work.insert(key.clone(), tx);
                 tokio::spawn(self.clone().worker(key, rx));
+                true
             }
+        };
+        drop(work);
+        if stored {
+            self.progress.send_modify(|n| *n += 1);
         }
     }
 
