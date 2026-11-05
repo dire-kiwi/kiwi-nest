@@ -42,7 +42,8 @@ struct NodeArgs {
     /// Where the node keeps its state, bundles and generated files.
     #[arg(long, env = "KIWI_NEST_STATE_DIR", default_value = "/var/lib/kiwi-nest")]
     state_dir: PathBuf,
-    /// Where apps' volumes live [default: STATE_DIR/volumes].
+    /// Where apps' volumes live, as btrfs subvolumes: a directory on btrfs, reached without symlinks
+    /// [default: STATE_DIR/volumes].
     #[arg(long, env = "KIWI_NEST_VOLUMES_DIR")]
     volumes_dir: Option<PathBuf>,
     /// Put before each app's name to make its Compose project name.

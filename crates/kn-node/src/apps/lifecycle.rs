@@ -1,9 +1,9 @@
 //! Starting, stopping and adopting apps, run by each app's task.
 //!
-//! - **Starting** runs `docker compose start` (or `up`, if some of the app's containers are missing), then waits
-//!   until every container is running and healthy and the app's port answers. A start that fails or times out is
-//!   followed by `docker compose stop`, so a crashing app isn't left for Docker to restart over and over, and the
-//!   gate refuses requests for the cooldown.
+//! - **Starting** checks the app's mounts, as before every start, and runs `docker compose start` (or `up`, if some
+//!   of the app's containers are missing). It then waits until every container is running and healthy and the
+//!   app's port answers. A start that fails or times out is followed by `docker compose stop`, so a crashing app
+//!   isn't left for Docker to restart over and over, and the gate refuses requests for the cooldown.
 //! - **Idle stops** run `docker compose stop` once the reaper finds an app with no open requests for its timeout.
 //! - **Suspending** is an explicit stop, refused while requests are open. Requests don't start a suspended app;
 //!   a resume does.
@@ -199,6 +199,10 @@ impl App<'_> {
 
     async fn bring_up(&self, r: &AppRecord, project: &Project) -> std::result::Result<(), String> {
         let rt = &self.inner.runtime;
+        // As before every start: the mounts must be the subvolumes kiwi-nest made, and the shared volumes it mounts
+        // can't change meanwhile.
+        let _locks = self.inner.lock_shared(r.shared.keys()).await;
+        self.verify_mounts().await.map_err(|e| e.to_string())?;
         let containers = rt.ps(project).await.map_err(|e| e.to_string())?;
         let missing = r.services.iter().any(|s| !containers.iter().any(|c| &c.service == s));
         if missing {

@@ -1,5 +1,6 @@
 //! End-to-end tests of the gateway with real Docker: waking, idling, WebSockets, the starting page, a crashing
-//! app, and restarting the node agent. They only run with `KIWI_NEST_INTEGRATION=1`.
+//! app, and restarting the node agent. They only run with `KIWI_NEST_INTEGRATION=1` and `KIWI_NEST_TEST_BTRFS_DIR`
+//! (see `common`).
 
 mod common;
 
@@ -186,11 +187,10 @@ services:
 
 #[test]
 fn waking_idling_websockets_and_the_starting_page() {
-    if !integration() {
+    if !docker_and_btrfs() {
         return;
     }
     let prefix = random_prefix();
-    let _cleanup = Cleanup(prefix.clone());
     let node = Node::start(&prefix);
     let bundle = tempfile::tempdir().unwrap();
     write_python_bundle(bundle.path(), "4s");
@@ -282,11 +282,10 @@ volumes:
 
 #[test]
 fn a_crashing_app_doesnt_restart_in_a_loop() {
-    if !integration() {
+    if !docker_and_btrfs() {
         return;
     }
     let prefix = random_prefix();
-    let _cleanup = Cleanup(prefix.clone());
     let node = Node::start_with(&prefix, &["--start-cooldown", "1m", "--start-timeout", "30s"]);
     let bundle = tempfile::tempdir().unwrap();
     write_crashing_bundle(bundle.path());
@@ -329,11 +328,10 @@ fn a_crashing_app_doesnt_restart_in_a_loop() {
 
 #[test]
 fn restarting_the_agent_leaves_apps_running() {
-    if !integration() {
+    if !docker_and_btrfs() {
         return;
     }
     let prefix = random_prefix();
-    let _cleanup = Cleanup(prefix.clone());
     let mut node = Node::start(&prefix);
     let bundle = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(bundle.path().join("site")).unwrap();

@@ -1,14 +1,16 @@
 //! End-to-end tests of a standalone node and the CLI, through the real binary.
 //!
-//! The tests that need Docker only run with `KIWI_NEST_INTEGRATION=1`. Each uses a random Compose project prefix,
-//! so concurrent runs don't collide, and removes only the projects with its own prefix.
+//! A node keeps its volumes on btrfs, so the tests that start one need `KIWI_NEST_TEST_BTRFS_DIR`, a directory on
+//! btrfs (such as a loop-mounted file: see `scripts/test-btrfs.sh`). The tests that need Docker also need
+//! `KIWI_NEST_INTEGRATION=1`. Each uses a random Compose project prefix, so concurrent runs don't collide, and
+//! removes only the projects with its own prefix and the directories it made.
 
 mod common;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use common::*;
 
@@ -79,13 +81,21 @@ fn redis(project: &str, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
+fn project_exists(project: &str) -> bool {
+    let out = Command::new("docker")
+        .args(["compose", "ls", "--all", "--format", "json"])
+        .output()
+        .unwrap();
+    let projects: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    projects.iter().any(|p| p["Name"] == project)
+}
+
 #[test]
 fn deploy_redeploy_and_delete_a_two_service_app() {
-    if !integration() {
+    if !docker_and_btrfs() {
         return;
     }
     let prefix = random_prefix();
-    let _cleanup = Cleanup(prefix.clone());
     let node = Node::start(&prefix);
     let bundle = tempfile::tempdir().unwrap();
     write_two_service_bundle(bundle.path(), "version one");
@@ -146,7 +156,7 @@ fn deploy_redeploy_and_delete_a_two_service_app() {
     node.ok(&["delete", "shop"]);
     assert!(!project_exists(&project), "the project should be gone");
     assert!(unreachable(port), "nothing should listen on {port} any more");
-    assert!(!node.dir.path().join("volumes/apps/shop").exists());
+    assert!(!node.volume("apps/shop").exists());
     assert!(!node.dir.path().join("state/apps/shop").exists());
     let err = node.fails(&["inspect", "shop"]);
     assert!(err.contains("doesn't exist"), "{err}");
@@ -176,11 +186,10 @@ services:
 
 #[test]
 fn two_nodes_share_one_engine() {
-    if !integration() {
+    if !docker_and_btrfs() {
         return;
     }
     let (pa, pb) = (random_prefix(), random_prefix());
-    let (_ca, _cb) = (Cleanup(pa.clone()), Cleanup(pb.clone()));
     let (a, b) = (Node::start(&pa), Node::start(&pb));
     let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     write_web_bundle(da.path(), "on a");
@@ -204,9 +213,9 @@ fn two_nodes_share_one_engine() {
     assert!(!project_exists(&format!("{}same", b.prefix)));
 }
 
-/// Doesn't need Docker: the version, and the refusals that happen before anything runs.
+/// Doesn't need Docker or btrfs: the version, and the node's refusals at startup.
 #[test]
-fn refuses_bad_requests_without_docker() {
+fn version_and_refusals_at_startup() {
     let out = Command::new(BIN).arg("version").output().unwrap();
     let version = String::from_utf8(out.stdout).unwrap();
     assert!(
@@ -214,6 +223,36 @@ fn refuses_bad_requests_without_docker() {
         "{version}"
     );
 
+    // A non-loopback address is refused outright.
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(BIN)
+        .args(["node", "--standalone", "--listen", "0.0.0.0:0", "--state-dir"])
+        .arg(dir.path().join("state"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only listens on loopback"));
+
+    // So is a volumes directory that isn't on btrfs (unless the temporary directory happens to be).
+    let real = std::fs::canonicalize(dir.path()).unwrap();
+    if matches!(kn_btrfs::filesystem(&real), Err(kn_btrfs::Error::NotBtrfs(_))) {
+        let out = Command::new(BIN)
+            .args(["node", "--standalone", "--listen", "127.0.0.1:0", "--state-dir"])
+            .arg(real.join("state"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success());
+        assert!(stderr.contains("isn't on btrfs"), "{stderr}");
+    }
+}
+
+/// Doesn't need Docker: the refusals that happen before anything runs.
+#[test]
+fn refuses_bad_requests_without_docker() {
+    if btrfs_dir().is_none() {
+        return;
+    }
     let node = Node::start(&random_prefix());
     let bundle = tempfile::tempdir().unwrap();
     let b = bundle.path().to_str().unwrap();
@@ -261,12 +300,257 @@ fn refuses_bad_requests_without_docker() {
     let resp = raw("GET /v1/version HTTP/1.1\r\nHost: localhost:1\r\nConnection: close\r\n\r\n");
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
 
-    // A non-loopback address is refused outright.
-    let out = Command::new(BIN)
-        .args(["node", "--standalone", "--listen", "0.0.0.0:0", "--state-dir"])
-        .arg(bundle.path().join("state"))
+    // Shared volume refusals that need no app.
+    let err = node.fails(&["volume", "delete", "nothing"]);
+    assert!(err.contains("shared volume `nothing` doesn't exist"), "{err}");
+    let err = node.fails(&["volume", "create", "_x"]);
+    assert!(err.contains("isn't a valid volume name"), "{err}");
+    node.ok(&["volume", "create", "corpus"]);
+    let err = node.fails(&["volume", "create", "corpus"]);
+    assert!(err.contains("already exists"), "{err}");
+    let list = node.ok(&["volume", "list"]);
+    assert!(list.lines().any(|l| l.starts_with("corpus")), "{list}");
+    node.ok(&["volume", "delete", "corpus"]);
+    assert!(!node.volume("shared/corpus").exists());
+}
+
+/// A web service and a Redis database that writes every change to its append-only file, so a snapshot taken at any
+/// instant holds every write it acknowledged, as after a power cut.
+fn write_database_bundle(dir: &Path, domain: &str) {
+    let user = uid_gid();
+    std::fs::create_dir_all(dir.join("site")).unwrap();
+    std::fs::write(dir.join("site/index.html"), domain).unwrap();
+    std::fs::write(
+        dir.join("compose.yaml"),
+        format!(
+            r#"x-kiwi-nest: {{ domain: {domain}, service: web, port: 8080 }}
+services:
+  web:
+    image: busybox:1.37
+    command: ["httpd", "-f", "-p", "8080", "-h", "/www"]
+    user: "{user}"
+    init: true
+    volumes: ["./site:/www"]
+  db:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    user: "{user}"
+    volumes: ["data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      retries: 60
+volumes:
+  data: {{}}
+"#
+        ),
+    )
+    .unwrap();
+}
+
+/// Runs `redis-cli ARGS` in an app's database, with `stdin` as its input (for `-x`).
+fn redis_with_input(project: &str, args: &[&str], stdin: &[u8]) -> String {
+    let out = Command::new("docker")
+        .args(["ps", "-q", "--filter"])
+        .arg(format!("label=com.docker.compose.project={project}"))
+        .args(["--filter", "label=com.docker.compose.service=db"])
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("only listens on loopback"));
+    let id = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    assert!(!id.is_empty(), "the db container of {project} should be running");
+    let mut child = Command::new("docker")
+        .args(["exec", "-i", &id, "redis-cli"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "redis-cli {args:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// A megabyte of hex that doesn't compress to nothing.
+fn blob() -> Vec<u8> {
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    (0..1024 * 1024)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            b"0123456789abcdef"[(x & 15) as usize]
+        })
+        .collect()
+}
+
+/// `btrfs filesystem du -s --raw DIR`'s total and shared bytes, if `btrfs` is installed.
+fn btrfs_du(dir: &Path) -> Option<(u64, u64)> {
+    let out = Command::new("btrfs")
+        .args(["filesystem", "du", "-s", "--raw"])
+        .arg(dir)
+        .output()
+        .ok()?;
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let cols: Vec<u64> = text
+        .lines()
+        .nth(1)?
+        .split_whitespace()
+        .take(3)
+        .map(|c| c.parse().unwrap())
+        .collect();
+    Some((cols[0], cols[2]))
+}
+
+#[test]
+fn a_preview_starts_from_an_instant_snapshot_of_production() {
+    if !docker_and_btrfs() {
+        return;
+    }
+    let node = Node::start(&random_prefix());
+    let (prod_b, preview_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write_database_bundle(prod_b.path(), "shop.localhost");
+    write_database_bundle(preview_b.path(), "shop-pr1.localhost");
+    let (prod_b, preview_b) = (prod_b.path().to_str().unwrap(), preview_b.path().to_str().unwrap());
+
+    // Production writes data, and doesn't save it explicitly: only its append-only file has it.
+    node.ok(&["deploy", "shop", prod_b]);
+    let prod = node.inspect("shop")["project"].as_str().unwrap().to_string();
+    let blob = blob();
+    assert_eq!(redis(&prod, &["SET", "greeting", "kia ora"]), "OK");
+    assert_eq!(redis_with_input(&prod, &["-x", "SET", "blob"], &blob), "OK");
+
+    // A preview from it sees the same data, at once.
+    let out = node.ok(&["deploy", "shop-pr1", preview_b, "--from", "shop"]);
+    assert!(out.contains("snapshotted volume `data` from `shop`"), "{out}");
+    let info = node.inspect("shop-pr1");
+    assert_eq!(info["from"], "shop");
+    let preview = info["project"].as_str().unwrap().to_string();
+    assert_eq!(redis(&preview, &["GET", "greeting"]), "kia ora");
+    assert_eq!(redis(&preview, &["STRLEN", "blob"]), blob.len().to_string());
+    // Production was unpaused.
+    assert_eq!(redis(&prod, &["PING"]), "PONG");
+
+    // The two share their extents on disk, then diverge.
+    if let Some((total, shared)) = btrfs_du(&node.volume("apps")) {
+        assert!(shared > 300_000, "shared {shared} of {total}");
+    } else {
+        eprintln!("note: `btrfs` isn't installed, so the shared extents weren't checked");
+    }
+    assert_eq!(redis(&preview, &["SET", "greeting", "preview"]), "OK");
+    assert_eq!(redis(&prod, &["SET", "greeting", "production"]), "OK");
+    assert_eq!(redis(&preview, &["GET", "greeting"]), "preview");
+    assert_eq!(redis(&prod, &["GET", "greeting"]), "production");
+
+    // Redeploying the preview keeps its data: only the first deploy snapshots.
+    let out = node.ok(&["deploy", "shop-pr1", preview_b, "--from", "shop"]);
+    assert!(out.contains("--from only applies to an app's first deploy"), "{out}");
+    assert_eq!(redis(&preview, &["GET", "greeting"]), "preview");
+
+    // A volume swapped for a symlink is refused at start, and the running generation stays.
+    let data = node.volume("apps/shop-pr1/data");
+    let aside = node.volume("apps/shop-pr1/data-aside");
+    std::fs::rename(&data, &aside).unwrap();
+    std::os::unix::fs::symlink(&aside, &data).unwrap();
+    let err = node.fails(&["deploy", "shop-pr1", preview_b]);
+    assert!(
+        err.contains("refusing to start") && err.contains("is a symlink"),
+        "{err}"
+    );
+    assert_eq!(redis(&preview, &["GET", "greeting"]), "preview");
+    std::fs::remove_file(&data).unwrap();
+    std::fs::rename(&aside, &data).unwrap();
+    node.ok(&["deploy", "shop-pr1", preview_b]);
+
+    // Deleting with --keep-data keeps the preview's data for its next deploy.
+    node.ok(&["delete", "shop-pr1", "--keep-data"]);
+    assert!(data.exists());
+    let out = node.ok(&["deploy", "shop-pr1", preview_b, "--from", "shop"]);
+    assert!(out.contains("kept volume `data` from before"), "{out}");
+    assert_eq!(redis(&preview, &["GET", "greeting"]), "preview");
+    node.ok(&["delete", "shop-pr1"]);
+    assert!(!node.volume("apps/shop-pr1").exists());
+    assert_eq!(redis(&prod, &["GET", "greeting"]), "production");
+}
+
+/// A web service that serves a shared volume, mounted in `mode`.
+fn write_shared_bundle(dir: &Path, domain: &str, mode: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("compose.yaml"),
+        format!(
+            r#"x-kiwi-nest:
+  domain: {domain}
+  service: web
+  port: 8080
+  shared: {{ corpus: {{ target: /corpus, mode: {mode} }} }}
+services:
+  web:
+    image: busybox:1.37
+    command: ["httpd", "-f", "-p", "8080", "-h", "/corpus"]
+    user: "{}"
+    init: true
+"#,
+            uid_gid()
+        ),
+    )
+    .unwrap();
+}
+
+#[test]
+fn shared_volumes_and_the_delete_refusals() {
+    if !docker_and_btrfs() {
+        return;
+    }
+    let node = Node::start(&random_prefix());
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(data.join("index.html"), "corpus one").unwrap();
+    let data = data.to_str().unwrap();
+    node.ok(&["volume", "create", "corpus"]);
+    node.ok(&["volume", "load", "corpus", data]);
+
+    let (ro, snap) = (dir.path().join("ro"), dir.path().join("snap"));
+    write_shared_bundle(&ro, "reader.localhost", "ro");
+    write_shared_bundle(&snap, "snapper.localhost", "snapshot");
+    node.ok(&["deploy", "reader", ro.to_str().unwrap()]);
+    let out = node.ok(&["deploy", "snapper", snap.to_str().unwrap()]);
+    assert!(out.contains("snapshotted shared volume `corpus`"), "{out}");
+    let (reader_port, snapper_port) = (
+        node.inspect("reader")["port"].as_u64().unwrap(),
+        node.inspect("snapper")["port"].as_u64().unwrap(),
+    );
+    assert_eq!(get(reader_port), "corpus one");
+    assert_eq!(get(snapper_port), "corpus one");
+    let list = node.ok(&["volume", "list"]);
+    assert!(list.contains("reader (ro), snapper (snapshot)"), "{list}");
+
+    // Loading is refused while an app mounts it read-only; deleting while any app mounts it.
+    let err = node.fails(&["volume", "load", "corpus", data]);
+    assert!(err.contains("while app `reader` mounts it"), "{err}");
+    let err = node.fails(&["volume", "delete", "corpus"]);
+    assert!(err.contains("while app `reader`, `snapper` mounts it"), "{err}");
+    // A snapshot can't be deleted while its app is deployed.
+    let err = node.fails(&["volume", "delete-snapshot", "corpus", "snapper"]);
+    assert!(err.contains("while the app is deployed"), "{err}");
+
+    // Without the reader, a new load is allowed; the snapshot keeps what it had.
+    node.ok(&["delete", "reader"]);
+    std::fs::write(dir.path().join("data/index.html"), "corpus two").unwrap();
+    node.ok(&["volume", "load", "corpus", data]);
+    node.ok(&["deploy", "reader", ro.to_str().unwrap()]);
+    let reader_port = node.inspect("reader")["port"].as_u64().unwrap();
+    assert_eq!(get(reader_port), "corpus two");
+    assert_eq!(get(snapper_port), "corpus one");
+
+    // A kept snapshot still blocks deleting the volume, until it's deleted itself.
+    node.ok(&["delete", "reader"]);
+    node.ok(&["delete", "snapper", "--keep-data"]);
+    let err = node.fails(&["volume", "delete", "corpus"]);
+    assert!(err.contains("while snapshots of it exist, for app `snapper`"), "{err}");
+    node.ok(&["volume", "delete-snapshot", "corpus", "snapper"]);
+    node.ok(&["volume", "delete", "corpus"]);
+    assert!(!node.volume("shared/corpus").exists());
 }

@@ -59,6 +59,20 @@ impl Default for Limits {
     }
 }
 
+impl Limits {
+    /// Limits for `volume load`, whose contents are data rather than an app: larger and with more files.
+    pub fn for_volumes() -> Limits {
+        Limits {
+            max_archive_size: 4 * 1024 * 1024 * 1024,
+            max_files: 1_000_000,
+            max_file_size: 16 * 1024 * 1024 * 1024,
+            max_expanded_size: 64 * 1024 * 1024 * 1024,
+            max_path_len: 4096,
+            max_depth: 64,
+        }
+    }
+}
+
 /// Why a bundle couldn't be read.
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {

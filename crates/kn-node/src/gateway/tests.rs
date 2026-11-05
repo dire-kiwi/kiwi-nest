@@ -16,7 +16,7 @@ use tokio::net::TcpStream;
 use super::gate::Phase;
 use super::normalize_host;
 use crate::NodeConfig;
-use crate::apps::{Apps, AppsError};
+use crate::apps::{Apps, AppsError, DeployOptions};
 use crate::testing::{Behaviour, Fake};
 
 struct Env {
@@ -48,7 +48,10 @@ impl Env {
     }
 
     async fn open(dir: tempfile::TempDir, fake: Arc<Fake>) -> Env {
-        let apps = Apps::open_with(config(dir.path()), fake.clone()).await.unwrap();
+        let volumes = Arc::new(crate::volumes::fake::Fake::default());
+        let apps = Apps::open_with_runtime(config(dir.path()), volumes, fake.clone())
+            .await
+            .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gw = listener.local_addr().unwrap();
         tokio::spawn(super::serve(listener, apps.clone(), std::future::pending()));
@@ -68,7 +71,7 @@ impl Env {
         )
         .unwrap();
         let staged = self.apps.stage_dir(b).await.unwrap();
-        self.apps.deploy(name, staged, false).await.unwrap();
+        self.apps.deploy(name, staged, DeployOptions::default()).await.unwrap();
     }
 
     fn project(name: &str) -> String {
@@ -481,7 +484,7 @@ async fn delete_breaks_open_leases() {
     env.deploy("blog", "0").await;
     let mut ws = env.websocket("blog.test").await;
     echo(&mut ws, b"hello").await;
-    env.apps.delete("blog").await.unwrap();
+    env.apps.delete("blog", false).await.unwrap();
     let mut buf = [0u8; 16];
     let n = tokio::time::timeout(Duration::from_secs(2), ws.read(&mut buf))
         .await

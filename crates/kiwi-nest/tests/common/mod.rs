@@ -1,7 +1,9 @@
 //! What the end-to-end tests share: a standalone node run from the real binary, the CLI, and cleaning up.
 //!
-//! The tests that need Docker only run with `KIWI_NEST_INTEGRATION=1`. Each uses a random Compose project prefix,
-//! so concurrent runs don't collide, and removes only the projects with its own prefix.
+//! A node keeps its volumes on btrfs, so the tests that start one need `KIWI_NEST_TEST_BTRFS_DIR`, a directory on
+//! btrfs (such as a loop-mounted file: see `scripts/test-btrfs.sh`). The tests that need Docker also need
+//! `KIWI_NEST_INTEGRATION=1`. Each uses a random Compose project prefix, so concurrent runs don't collide, and
+//! removes only the projects with its own prefix and the directories it made.
 
 #![allow(dead_code)]
 
@@ -9,6 +11,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
@@ -24,37 +27,52 @@ pub fn integration() -> bool {
     }
 }
 
+/// The directory on btrfs for nodes' volumes, or `None` (and a note) if it isn't set.
+pub fn btrfs_dir() -> Option<PathBuf> {
+    match std::env::var_os("KIWI_NEST_TEST_BTRFS_DIR") {
+        Some(d) => Some(std::fs::canonicalize(d).expect("KIWI_NEST_TEST_BTRFS_DIR should exist")),
+        None => {
+            eprintln!(
+                "skipped: set KIWI_NEST_TEST_BTRFS_DIR to a directory on btrfs to run the tests that start a node"
+            );
+            None
+        }
+    }
+}
+
+/// Whether the tests that need Docker and btrfs can run.
+pub fn docker_and_btrfs() -> bool {
+    integration() && btrfs_dir().is_some()
+}
+
 pub fn random_prefix() -> String {
     let n = RandomState::new().hash_one((std::process::id(), SystemTime::now()));
     format!("knit{:08x}-", n as u32)
 }
 
-/// Removes the Compose projects whose names start with a prefix, when dropped.
-pub struct Cleanup(pub String);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let Ok(out) = Command::new("docker")
-            .args(["compose", "ls", "--all", "--format", "json"])
-            .output()
-        else {
-            return;
-        };
-        let Ok(projects) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
-            return;
-        };
-        for p in projects {
-            if let Some(name) = p["Name"].as_str().filter(|n| n.starts_with(&self.0)) {
-                eprintln!("cleaning up project {name}");
-                let _ = Command::new("docker")
-                    .args(["compose", "-p", name, "down", "--remove-orphans"])
-                    .status();
-            }
+/// Removes the Compose projects whose names start with a prefix.
+pub fn remove_projects(prefix: &str) {
+    let Ok(out) = Command::new("docker")
+        .args(["compose", "ls", "--all", "--format", "json"])
+        .output()
+    else {
+        return;
+    };
+    let Ok(projects) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
+        return;
+    };
+    for p in projects {
+        if let Some(name) = p["Name"].as_str().filter(|n| n.starts_with(prefix)) {
+            eprintln!("cleaning up project {name}");
+            let _ = Command::new("docker")
+                .args(["compose", "-p", name, "down", "--remove-orphans"])
+                .status();
         }
     }
 }
 
-/// A standalone node running in the background, killed when dropped.
+/// A standalone node running in the background. When dropped, it's killed, its projects are removed, and then its
+/// directories.
 pub struct Node {
     child: Child,
     /// The node API.
@@ -63,6 +81,7 @@ pub struct Node {
     pub gateway: u16,
     pub prefix: String,
     pub dir: tempfile::TempDir,
+    pub volumes: tempfile::TempDir,
     extra: Vec<String>,
 }
 
@@ -74,14 +93,16 @@ impl Node {
     /// A node with extra `kiwi-nest node` flags.
     pub fn start_with(prefix: &str, extra: &[&str]) -> Node {
         let dir = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir_in(btrfs_dir().expect("KIWI_NEST_TEST_BTRFS_DIR")).unwrap();
         let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        let (child, url, gateway) = spawn_node(dir.path(), prefix, &extra);
+        let (child, url, gateway) = spawn_node(dir.path(), volumes.path(), prefix, &extra);
         Node {
             child,
             url,
             gateway,
             prefix: prefix.to_string(),
             dir,
+            volumes,
             extra,
         }
     }
@@ -90,10 +111,15 @@ impl Node {
     pub fn restart(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let (child, url, gateway) = spawn_node(self.dir.path(), &self.prefix, &self.extra);
+        let (child, url, gateway) = spawn_node(self.dir.path(), self.volumes.path(), &self.prefix, &self.extra);
         self.child = child;
         self.url = url;
         self.gateway = gateway;
+    }
+
+    /// A path in the node's volumes directory.
+    pub fn volume(&self, path: &str) -> PathBuf {
+        self.volumes.path().join(path)
     }
 
     pub fn cli(&self, args: &[&str]) -> Output {
@@ -131,7 +157,7 @@ impl Node {
 
 /// Starts `kiwi-nest node --standalone` on loopback ports of its own; returns it, its API's URL and its gateway's
 /// port.
-fn spawn_node(dir: &std::path::Path, prefix: &str, extra: &[String]) -> (Child, String, u16) {
+pub fn spawn_node(dir: &Path, volumes: &Path, prefix: &str, extra: &[String]) -> (Child, String, u16) {
     let mut child = Command::new(BIN)
         .args([
             "node",
@@ -145,7 +171,7 @@ fn spawn_node(dir: &std::path::Path, prefix: &str, extra: &[String]) -> (Child, 
         .arg("--state-dir")
         .arg(dir.join("state"))
         .arg("--volumes-dir")
-        .arg(dir.join("volumes"))
+        .arg(volumes)
         .arg("--project-prefix")
         .arg(prefix)
         .args(extra)
@@ -185,6 +211,9 @@ impl Drop for Node {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::env::var("KIWI_NEST_INTEGRATION").as_deref() == Ok("1") {
+            remove_projects(&self.prefix);
+        }
     }
 }
 
@@ -223,13 +252,4 @@ pub fn uid_gid() -> String {
     let out = Command::new("id").arg("-g").output().unwrap();
     let gid = String::from_utf8(out.stdout).unwrap().trim().to_string();
     format!("{uid}:{gid}")
-}
-
-pub fn project_exists(project: &str) -> bool {
-    let out = Command::new("docker")
-        .args(["compose", "ls", "--all", "--format", "json"])
-        .output()
-        .unwrap();
-    let projects: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
-    projects.iter().any(|p| p["Name"] == project)
 }

@@ -134,6 +134,18 @@ pub enum Mount {
     Tmpfs { target: String, options: Mapping },
 }
 
+impl Mount {
+    /// Where it's mounted in the container.
+    pub fn target(&self) -> &str {
+        match self {
+            Mount::Volume { target, .. }
+            | Mount::Bundle { target, .. }
+            | Mount::Host { target, .. }
+            | Mount::Tmpfs { target, .. } => target,
+        }
+    }
+}
+
 /// Service settings passed through without changes.
 const PASSTHROUGH: &[&str] = &[
     "command",
@@ -272,6 +284,9 @@ pub fn check(yaml: &str, files: &FileIndex, options: &CheckOptions) -> Result<Ch
             Some(_) => {}
         }
     }
+    if let Some(m) = &manifest {
+        c.check_shared(m, &services, services_map);
+    }
     match manifest {
         Some(manifest) if c.problems.is_empty() => Ok(CheckedBundle {
             manifest,
@@ -348,6 +363,42 @@ impl Checker<'_> {
             }
             Value::Tagged(_) => self.refuse(at, "uses a YAML tag (`!…`), which isn't supported"),
             _ => {}
+        }
+    }
+
+    /// Shared volumes must name services that exist, and not land on a path that something else is mounted at.
+    fn check_shared(&mut self, m: &Manifest, services: &[Service], declared: Option<&Mapping>) {
+        for (name, shared) in &m.shared {
+            let at = format!("x-kiwi-nest.shared.{name}");
+            for s in shared.services.iter().flatten() {
+                if !declared.is_some_and(|d| d.contains_key(s.as_str())) {
+                    self.refuse(&at, format!("names service `{s}`, which doesn't exist"));
+                }
+            }
+            for svc in services.iter().filter(|s| shared.mounted_into(&s.name)) {
+                if svc.mounts.iter().any(|mount| mount.target() == shared.target) {
+                    self.refuse(
+                        &at,
+                        format!(
+                            "mounts at `{}`, where service `{}` already mounts something",
+                            shared.target, svc.name
+                        ),
+                    );
+                }
+                if let Some((other, _)) = m
+                    .shared
+                    .iter()
+                    .find(|(o, s)| *o < name && s.target == shared.target && s.mounted_into(&svc.name))
+                {
+                    self.refuse(
+                        &at,
+                        format!(
+                            "mounts at `{}` in service `{}`, like shared volume `{other}`",
+                            shared.target, svc.name
+                        ),
+                    );
+                }
+            }
         }
     }
 

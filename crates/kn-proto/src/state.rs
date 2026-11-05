@@ -1,4 +1,4 @@
-//! What a node has applied for each app.
+//! What a node has applied for each app, and how apps mount shared volumes.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,5 +30,33 @@ impl std::fmt::Display for AppStatus {
             AppStatus::Suspended => "suspended",
             AppStatus::Failed => "failed",
         })
+    }
+}
+
+/// How an app mounts a shared volume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedMode {
+    /// Its own writable snapshot, made on its first deploy and kept across redeploys.
+    Snapshot,
+    /// Read-only.
+    Ro,
+    /// Read-write: every app mounting it sees the writes.
+    Rw,
+}
+
+impl SharedMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SharedMode::Snapshot => "snapshot",
+            SharedMode::Ro => "ro",
+            SharedMode::Rw => "rw",
+        }
+    }
+}
+
+impl std::fmt::Display for SharedMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }

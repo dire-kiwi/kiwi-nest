@@ -7,6 +7,6 @@ pull-request previews, live together in a *nest* on one node, so previews can st
 production's data. Idle apps stop and wake on their next request.
 
 kiwi-nest is being built: see [docs/design.md](docs/design.md) for the design and the build plan. So far a single node
-runs apps from bundles (`kiwi-nest node --standalone`), driven by the CLI
-(`kiwi-nest deploy|list|inspect|logs|suspend|resume|delete`), with a gateway on loopback that starts stopped apps for
-their requests and stops idle ones.
+runs apps from bundles (`kiwi-nest node --standalone`), with their data in btrfs subvolumes, driven by the CLI
+(`kiwi-nest deploy|list|inspect|logs|suspend|resume|delete`, `deploy --from` for previews, and `kiwi-nest volume …`
+for shared volumes), with a gateway on loopback that starts stopped apps for their requests and stops idle ones.

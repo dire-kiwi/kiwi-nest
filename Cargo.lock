@@ -655,6 +655,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "kn-btrfs",
  "kn-bundle",
  "kn-cli",
  "kn-node",
@@ -664,6 +665,15 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "kn-btrfs"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
@@ -706,6 +716,7 @@ dependencies = [
  "humantime",
  "hyper",
  "hyper-util",
+ "kn-btrfs",
  "kn-bundle",
  "kn-proto",
  "serde",
