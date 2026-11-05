@@ -1,8 +1,8 @@
 //! Each app's lifecycle on the node, and the node's shared volumes.
 //!
-//! Every app has one task, and every operation on the app (deploy, inspect, logs, delete, and snapshotting it for
-//! another app's `--from`) goes through it, so an app's operations never overlap. Different apps proceed in
-//! parallel. Shared volumes ([`shared`]) each have a lock: deploys that mount one hold it shared, and `volume`
+//! Every app has one task, and every operation on the app (deploy, inspect, logs, delete, snapshotting it for
+//! another app's `--from`, and the gateway's starts and idle stops) goes through it, so an app's operations never
+//! overlap. Different apps proceed in parallel. Shared volumes ([`shared`]) each have a lock: deploys that mount one hold it shared, and `volume`
 //! commands that change one hold it exclusively.
 //!
 //! What the node has applied is kept in `STATE/state.json`, written atomically. On disk:
@@ -19,7 +19,11 @@
 //! something else (a symlink, a plain directory, another subvolume) is refused rather than mounted. A subvolume
 //! that's in its place but not recorded (kept with `--keep-data`, or made just before a crash) is adopted by the next
 //! deploy.
+//!
+//! Each app also has a [`Gate`], which the gateway reads to route a request and which the app's task updates as
+//! the app is deployed, started and stopped. See [`lifecycle`] for starting, stopping and adopting apps.
 
+mod lifecycle;
 mod shared;
 #[cfg(test)]
 mod tests;
@@ -29,8 +33,8 @@ use std::hash::BuildHasher;
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kn_bundle::manifest::{Arch, is_valid_app_name};
 use kn_bundle::{BundleError, CheckOptions, CheckedBundle, Problems};
@@ -41,7 +45,8 @@ use tokio::process::Child;
 use tokio::sync::{Mutex as AsyncMutex, OwnedRwLockReadGuard, RwLock, mpsc, oneshot};
 
 use crate::NodeConfig;
-use crate::runtime::{LogsOptions, Project, Runtime, RuntimeError};
+use crate::gateway::gate::{Gate, Phase};
+use crate::runtime::{Docker, LogsOptions, Project, Runtime, RuntimeError};
 use crate::volumes::{Backend, Btrfs, VolumeError, Volumes};
 
 pub use shared::LoadSource;
@@ -141,6 +146,10 @@ pub enum AppsError {
     Mount(String),
     #[error("deploying `{name}` failed: {message}")]
     DeployFailed { name: String, message: String },
+    #[error("starting `{name}` failed: {message}")]
+    StartFailed { name: String, message: String },
+    #[error("{0}")]
+    Busy(String),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
@@ -206,6 +215,19 @@ enum Op {
         volumes: Vec<String>,
         reply: oneshot::Sender<Result<BTreeMap<String, u64>>>,
     },
+    /// Start the app: for a request (`explicit` is false, and the gateway has set the gate to `Starting`), or for
+    /// a resume, which also starts a suspended or failed app and skips the cooldown after a failed start.
+    Start {
+        explicit: bool,
+        reply: Option<oneshot::Sender<Result<AppInfo>>>,
+    },
+    /// Stop the app for being idle (the reaper has set the gate to `Stopping`).
+    IdleStop,
+    Suspend {
+        reply: oneshot::Sender<Result<AppInfo>>,
+    },
+    /// Find out what the app's containers are doing after the node agent started.
+    Adopt,
 }
 
 /// The node's apps.
@@ -216,16 +238,83 @@ pub struct Apps {
 
 struct Inner {
     cfg: NodeConfig,
-    runtime: Runtime,
+    runtime: Arc<dyn Runtime>,
     volumes: Volumes,
     state: AsyncMutex<StateFile>,
     /// Each app's task. Senders are only used with this lock held, so a task can retire without losing an op.
     actors: Mutex<HashMap<String, mpsc::UnboundedSender<Op>>>,
-    /// Each shared volume's lock: held shared by deploys that mount it, exclusively by `volume` commands.
+    /// Each shared volume's lock: held shared by deploys and starts that mount it, exclusively by `volume` commands.
     shared_locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
+    gates: Mutex<Gates>,
+}
+
+/// Every app's gate, by name and by domain.
+#[derive(Default)]
+struct Gates {
+    by_name: HashMap<String, Arc<Gate>>,
+    by_domain: HashMap<String, Arc<Gate>>,
+}
+
+/// The gate's phase for an app that isn't known to be running: what a request should do with it.
+fn resting_phase(status: AppStatus) -> Phase {
+    match status {
+        AppStatus::Running | AppStatus::Idle => Phase::Stopped,
+        AppStatus::Suspended => Phase::Suspended,
+        AppStatus::Failed => Phase::Broken,
+        AppStatus::Deploying => Phase::Busy,
+    }
 }
 
 impl Inner {
+    fn gates(&self) -> std::sync::MutexGuard<'_, Gates> {
+        self.gates.lock().expect("gates lock")
+    }
+
+    fn gate(&self, name: &str) -> Option<Arc<Gate>> {
+        self.gates().by_name.get(name).cloned()
+    }
+
+    /// Routes `domain` to the app's gate, creating it (busy) if needed.
+    fn set_route(&self, name: &str, domain: &str, port: u16, idle_timeout_secs: u64) -> Arc<Gate> {
+        let idle = Duration::from_secs(idle_timeout_secs);
+        let mut gates = self.gates();
+        let gate = gates
+            .by_name
+            .entry(name.to_string())
+            .or_insert_with(|| Gate::new(name, port, idle, Phase::Busy))
+            .clone();
+        gate.configure(port, idle);
+        gates.by_domain.retain(|_, g| g.name() != name);
+        gates.by_domain.insert(domain.to_ascii_lowercase(), gate.clone());
+        gate
+    }
+
+    fn remove_route(&self, name: &str) -> Option<Arc<Gate>> {
+        let mut gates = self.gates();
+        gates.by_domain.retain(|_, g| g.name() != name);
+        gates.by_name.remove(name)
+    }
+
+    /// Sends an op to an app's task, starting the task if needed.
+    fn send(self: &Arc<Self>, name: &str, op: Op) -> Result<()> {
+        if !is_valid_app_name(name) {
+            return Err(AppsError::InvalidName(name.to_string()));
+        }
+        let mut actors = self.actors.lock().expect("actors lock");
+        let mut op = Some(op);
+        if let Some(tx) = actors.get(name) {
+            match tx.send(op.take().expect("op")) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::error::SendError(back)) => op = Some(back),
+            }
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(op.take().expect("op")).expect("a new channel is open");
+        actors.insert(name.to_string(), tx);
+        tokio::spawn(actor(self.clone(), name.to_string(), rx));
+        Ok(())
+    }
+
     fn shared_lock(&self, name: &str) -> Arc<RwLock<()>> {
         self.shared_locks
             .lock()
@@ -315,12 +404,23 @@ impl Apps {
         Self::open_with(cfg, Arc::new(Btrfs)).await
     }
 
-    /// Opens the node's state with a given subvolume backend.
+    /// Opens the node's state with a given subvolume backend, and Docker.
+    pub async fn open_with(cfg: NodeConfig, backend: Arc<dyn Backend>) -> anyhow::Result<Apps> {
+        let runtime = Arc::new(Docker::new(&cfg.docker));
+        Self::open_with_runtime(cfg, backend, runtime).await
+    }
+
+    /// Opens the node's state with a given subvolume backend and runtime.
     ///
     /// Recovers from a crash: a deploy that was cut off is recorded as failed (its containers are left as they are),
     /// a `volume load` cut off is finished or undone, staging leftovers are destroyed, shared volumes in place but
-    /// not recorded are adopted, and apps left paused for a snapshot are unpaused.
-    pub async fn open_with(cfg: NodeConfig, backend: Arc<dyn Backend>) -> anyhow::Result<Apps> {
+    /// not recorded are adopted, and apps left paused for a snapshot are unpaused. Then every app is adopted as its
+    /// containers are found (see [`lifecycle`]), and the idle reaper starts.
+    pub async fn open_with_runtime(
+        cfg: NodeConfig,
+        backend: Arc<dyn Backend>,
+        runtime: Arc<dyn Runtime>,
+    ) -> anyhow::Result<Apps> {
         cfg.validate()?;
         let d = cfg.state_dir.join("apps");
         std::fs::create_dir_all(&d).map_err(|e| anyhow::anyhow!("creating {}: {e}", d.display()))?;
@@ -360,7 +460,8 @@ impl Apps {
             write_atomic(&path, &serde_json::to_vec_pretty(&state)?)?;
         }
         let paused: Vec<AppRecord> = state.apps.values().filter(|a| a.paused).cloned().collect();
-        let runtime = Runtime::new(&cfg.docker);
+        let records: Vec<AppRecord> = state.apps.values().cloned().collect();
+        let idle_check = cfg.idle_check_interval;
         let apps = Apps {
             inner: Arc::new(Inner {
                 cfg,
@@ -369,6 +470,7 @@ impl Apps {
                 state: AsyncMutex::new(state),
                 actors: Mutex::new(HashMap::new()),
                 shared_locks: Mutex::new(HashMap::new()),
+                gates: Mutex::new(Gates::default()),
             }),
         };
         for r in paused {
@@ -390,6 +492,12 @@ impl Apps {
                 }
             }
         }
+        // Requests wait until each app has been adopted.
+        for r in &records {
+            apps.inner.set_route(&r.name, &r.domain, r.port, r.idle_timeout_secs);
+            apps.inner.send(&r.name, Op::Adopt)?;
+        }
+        tokio::spawn(reaper(Arc::downgrade(&apps.inner), idle_check));
         Ok(apps)
     }
 
@@ -397,8 +505,34 @@ impl Apps {
         &self.inner.cfg
     }
 
-    pub fn runtime(&self) -> &Runtime {
-        &self.inner.runtime
+    pub fn runtime(&self) -> &dyn Runtime {
+        &*self.inner.runtime
+    }
+
+    /// The gate of the app serving `host` (a domain in lowercase, without a port).
+    pub fn route(&self, host: &str) -> Option<Arc<Gate>> {
+        self.inner.gates().by_domain.get(host).cloned()
+    }
+
+    /// Starts the app behind `gate` for a request, unless it's already starting or can't be started now; returns
+    /// whether it did. The start runs in the app's task, so it carries on even if every request waiting for it
+    /// goes away.
+    pub fn wake(&self, gate: &Gate) -> bool {
+        let woken = gate.begin_start(Instant::now());
+        if woken {
+            tracing::debug!(app = gate.name(), "waking for a request");
+            if let Err(e) = self.inner.send(
+                gate.name(),
+                Op::Start {
+                    explicit: false,
+                    reply: None,
+                },
+            ) {
+                tracing::warn!(app = gate.name(), error = %e, "couldn't start the app");
+                gate.set_phase(Phase::Stopped);
+            }
+        }
+        woken
     }
 
     pub fn volumes(&self) -> &Volumes {
@@ -465,22 +599,7 @@ impl Apps {
     }
 
     fn send(&self, name: &str, op: Op) -> Result<()> {
-        if !is_valid_app_name(name) {
-            return Err(AppsError::InvalidName(name.to_string()));
-        }
-        let mut actors = self.inner.actors.lock().expect("actors lock");
-        let mut op = Some(op);
-        if let Some(tx) = actors.get(name) {
-            match tx.send(op.take().expect("op")) {
-                Ok(()) => return Ok(()),
-                Err(mpsc::error::SendError(back)) => op = Some(back),
-            }
-        }
-        let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(op.take().expect("op")).expect("a new channel is open");
-        actors.insert(name.to_string(), tx);
-        tokio::spawn(actor(self.inner.clone(), name.to_string(), rx));
-        Ok(())
+        self.inner.send(name, op)
     }
 
     async fn ask<T>(&self, name: &str, op: impl FnOnce(oneshot::Sender<Result<T>>) -> Op) -> Result<T> {
@@ -504,9 +623,24 @@ impl Apps {
         self.ask(name, |reply| Op::Logs { query, reply }).await
     }
 
-    /// Removes the app's containers and its bundle, and its subvolumes unless `keep_data`.
+    /// Removes the app's containers and its bundle, and its subvolumes unless `keep_data`, cutting off its open
+    /// requests.
     pub async fn delete(&self, name: &str, keep_data: bool) -> Result<()> {
         self.ask(name, |reply| Op::Delete { keep_data, reply }).await
+    }
+
+    /// Stops the app and keeps it stopped until a resume. Refused while it has open requests.
+    pub async fn suspend(&self, name: &str) -> Result<AppInfo> {
+        self.ask(name, |reply| Op::Suspend { reply }).await
+    }
+
+    /// Starts the app, whatever stopped it, and returns once it's ready. Skips the cooldown after a failed start.
+    pub async fn resume(&self, name: &str) -> Result<AppInfo> {
+        self.ask(name, |reply| Op::Start {
+            explicit: true,
+            reply: Some(reply),
+        })
+        .await
     }
 
     /// Every app, with what Docker reports for its containers.
@@ -630,6 +764,40 @@ async fn actor(inner: Arc<Inner>, name: String, mut rx: mpsc::UnboundedReceiver<
             }
             Op::SnapshotFor { dest, volumes, reply } => {
                 let _ = reply.send(app.snapshot_for(dest, volumes).await);
+            }
+            Op::Start { explicit, reply } => {
+                let result = app.start(explicit).await;
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+            }
+            Op::IdleStop => app.idle_stop().await,
+            Op::Suspend { reply } => {
+                let _ = reply.send(app.suspend().await);
+            }
+            Op::Adopt => app.adopt().await,
+        }
+    }
+}
+
+/// Stops apps that have been idle for their timeout, checking every `every`.
+async fn reaper(inner: Weak<Inner>, every: Duration) {
+    let mut tick = tokio::time::interval(every);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let Some(inner) = inner.upgrade() else { return };
+        let now = Instant::now();
+        let due: Vec<String> = inner
+            .gates()
+            .by_name
+            .values()
+            .filter(|g| g.begin_idle_stop(now))
+            .map(|g| g.name().to_string())
+            .collect();
+        for name in due {
+            if let Err(e) = inner.send(&name, Op::IdleStop) {
+                tracing::warn!(app = name, error = %e, "couldn't stop an idle app");
             }
         }
     }
@@ -832,6 +1000,11 @@ impl App<'_> {
             self.inner.persist(&state).await?;
             (record, previous)
         };
+        // Requests wait for the deploy.
+        let gate = self
+            .inner
+            .set_route(self.name, &record.domain, record.port, record.idle_timeout_secs);
+        gate.set_phase(Phase::Busy);
         tracing::info!(app = self.name, generation = record.generation, digest = %record.bundle_digest, first, "deploying");
 
         let generation = record.generation;
@@ -842,9 +1015,10 @@ impl App<'_> {
         let failed = match self.apply(&record, previous.as_ref(), staged, first, &mut notes).await {
             Ok(()) => {
                 self.cleanup_generations(generation).await;
-                let record = self.update(|r| r.status = AppStatus::Running).await?;
+                let record = self.update(|r| r.status = AppStatus::Running).await;
+                gate.set_phase(Phase::Ready);
                 tracing::info!(app = self.name, generation, "deployed");
-                let mut info = self.info(record).await?;
+                let mut info = self.info(record?).await?;
                 info.notes = notes;
                 return Ok(info);
             }
@@ -866,6 +1040,10 @@ impl App<'_> {
                     prev.generation
                 ));
                 prev.updated_at = now();
+                // Its containers may still be running: the next request checks, and starts them if needed.
+                self.inner
+                    .set_route(self.name, &prev.domain, prev.port, prev.idle_timeout_secs);
+                gate.set_phase(resting_phase(prev.status));
                 let mut state = self.inner.state.lock().await;
                 state.apps.insert(self.name.to_string(), prev);
                 self.inner.persist(&state).await?;
@@ -876,6 +1054,7 @@ impl App<'_> {
             }
         };
         let message = failed.to_string();
+        gate.set_phase(Phase::Broken);
         self.update(|r| {
             r.status = AppStatus::Failed;
             r.error = Some(message.clone());
@@ -1371,6 +1550,7 @@ impl App<'_> {
     }
 
     async fn info(&self, r: AppRecord) -> Result<AppInfo> {
+        let open_requests = self.inner.gate(self.name).map_or(0, |g| g.open_leases());
         let containers = self
             .inner
             .runtime
@@ -1412,6 +1592,7 @@ impl App<'_> {
             created_at: rfc3339(r.created_at),
             updated_at: rfc3339(r.updated_at),
             containers,
+            open_requests,
         })
     }
 
@@ -1459,7 +1640,37 @@ impl App<'_> {
     async fn delete(&self, keep_data: bool) -> Result<()> {
         let r = self.record().await?;
         tracing::info!(app = self.name, keep_data, "deleting");
-        self.inner.runtime.down(&self.project(&r)).await?;
+        let gate = self.inner.gate(self.name);
+        if let Some(g) = &gate {
+            g.set_phase(Phase::Busy);
+            g.break_leases();
+        }
+        if let Err(e) = self.inner.runtime.down(&self.project(&r)).await {
+            if let Some(g) = &gate {
+                g.set_phase(resting_phase(r.status));
+            }
+            return Err(e.into());
+        }
+        // Its containers are gone: if removing its files fails, it's unavailable until the delete is tried again.
+        let removed = self.remove_files(keep_data).await;
+        if removed.is_err()
+            && let Some(g) = &gate
+        {
+            g.set_phase(Phase::Broken);
+        }
+        removed?;
+        let mut state = self.inner.state.lock().await;
+        state.apps.remove(self.name);
+        if let Some(g) = self.inner.remove_route(self.name) {
+            g.set_phase(Phase::Gone);
+        }
+        self.inner.persist(&state).await?;
+        tracing::info!(app = self.name, keep_data, "deleted");
+        Ok(())
+    }
+
+    /// The files of a deleted app: its subvolumes unless `keep_data`, and its bundles and generated files.
+    async fn remove_files(&self, keep_data: bool) -> Result<()> {
         if !keep_data {
             let names: Vec<String> = self.inner.state.lock().await.shared.keys().cloned().collect();
             let _locks = self.inner.lock_shared(&names).await;
@@ -1479,12 +1690,7 @@ impl App<'_> {
         let app_dir = self.app_dir();
         blocking(move || remove_dir_if_exists(&app_dir))
             .await?
-            .map_err(|e| AppsError::Internal(anyhow::anyhow!("removing the app's files: {e}")))?;
-        let mut state = self.inner.state.lock().await;
-        state.apps.remove(self.name);
-        self.inner.persist(&state).await?;
-        tracing::info!(app = self.name, keep_data, "deleted");
-        Ok(())
+            .map_err(|e| AppsError::Internal(anyhow::anyhow!("removing the app's files: {e}")))
     }
 }
 

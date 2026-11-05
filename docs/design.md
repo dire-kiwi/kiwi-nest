@@ -172,7 +172,12 @@ volumes:
   one that fails after that leaves the new generation as a failed app.
 - **The standalone node's API** (steps 1 to 3, before the server exists) listens on loopback only and has no tokens. It
   answers only requests whose `Host` is `localhost`, `127.x.x.x` or `[::1]` and that carry no `Origin`, so a web page
-  can't reach it by rebinding its DNS name to 127.0.0.1.
+  can't reach it by rebinding its DNS name to 127.0.0.1. Besides deploy, list, inspect, logs and delete, it has
+  `suspend` and `resume` (step 3). The standalone node's gateway (`--gateway-listen`, `127.0.0.1:7381` by default)
+  is on loopback too, until step 6 moves it to the private address.
+- **An app's status** is kiwi-nest's view of it: `deploying`, `running`, `idle` (stopped for being idle, or its last
+  start failed; a request starts it), `suspended` (stopped on purpose; only `resume` starts it) or `failed` (its last
+  deploy failed). `inspect` also shows the app's open requests through the gateway.
 
 ## Volumes and snapshots
 
@@ -284,15 +289,50 @@ VOLUMES/                         one btrfs filesystem per node
   loopback ports.
 - **It listens on the node's private address for the ingress**, and only accepts requests that carry the node's
   ingress token, so a machine on the private network can't skip basic auth.
-- **A request to a stopped app starts it.** Concurrent requests share one start, which runs `docker compose start`
-  and waits for healthchecks and a TCP connection. A browser page load that isn't ready after about a second gets a
-  small "starting" page, which reloads itself when the app is up or shows an error if it fails. Other requests wait.
+- **Routing.** The Host is compared case-insensitively, without its port or a trailing dot. The method, path, query,
+  headers (bar hop-by-hop ones) and body are passed on unchanged, Host included; HTTP/1.1 upgrades such as WebSockets
+  become a byte stream between the client and the app. Unknown hosts get 404. Forwarding headers
+  (`X-Forwarded-For` and so on) are left to the ingress, in step 6.
+- **A request to a stopped app starts it.** Concurrent requests share one start, which checks the app's mounts (as
+  before every start), runs `docker compose start` (or `up`, if some containers are missing) and waits for healthchecks and a TCP connection. A browser page load
+  that isn't ready after about a second gets a small "starting" page, which reloads itself when the app is up or
+  shows an error if it fails. Other requests wait.
+  - **Each app has a gate**: its phase (busy deploying or being adopted, starting, ready, stopping, stopped, failed
+    with a cooldown, suspended, broken, gone) and its open leases, behind one lock, with a watch channel that
+    waiting requests follow. The gateway only reads the gate and asks for a start; the start itself, like every
+    stop, deploy and delete, runs in the app's own task, so they never overlap, and a client that disconnects only
+    drops its own wait.
+  - **Ready** means `docker compose start` has finished; every container is running and, if it has a healthcheck,
+    healthy (one-off services may have exited 0, but the routed one must run); and the app's loopback port accepts a
+    connection and doesn't close it within 100 ms (a published port can accept for a container that isn't
+    listening, then drop the connection). A container that's restarting, unhealthy, paused or exited with an error
+    fails the start straight away. Starts time out after `--start-timeout` (2 minutes).
+  - **The starting page** is a `GET` with `Sec-Fetch-Mode: navigate`, answered with 503, `Retry-After: 2` and
+    `Cache-Control: no-store`. It's self-contained, and polls the same URL once a second with a `Kiwi-Nest-Status`
+    header, which the gateway answers itself (`{"state": "starting" | "ready" | "failed" | "suspended" |
+    "unavailable"}`) and never passes to the app. A poll starts a stopped app (a page is waiting for it) but never a
+    failed one. The page reloads only on `ready`; anything else shows a message and stops polling, so a failed start
+    can't turn into a reload loop. The error pages have no script at all.
 - **Idle apps are stopped.** Each request holds the app until its response finishes, streams and WebSockets included.
   Once `idle_timeout` has passed with nothing open, the app gets `docker compose stop`, which frees its memory and
   keeps its containers and data. Only HTTP traffic counts as activity; background work needs `idle_timeout: 0`.
-- **Failures.** A failed upstream connection returns 503 and marks the app for recovery on its next request. A failed
-  start is cooled down briefly, so repeated requests don't loop. When the node agent restarts, it adopts the
-  containers already running, and nothing is restarted.
+  A reaper checks every second; taking a lease and deciding to stop happen under the gate's lock, so a request can't
+  slip in between. The timeout counts from the last lease's end, or from when the app came up.
+- **Suspend and resume.** `suspend` stops an app and keeps it stopped: requests get 503 rather than starting it. It's
+  refused while the app has open requests. `resume` starts an app whatever stopped it (suspended, idle, a failed
+  start or a failed deploy) and returns once it's ready. `delete` breaks open leases: their responses and WebSockets
+  are cut off.
+- **Failures.** A failed upstream connection (refused, or closed before a response) returns 503, isn't retried, and
+  marks the app for recovery: the next request runs a start, which finds a running app ready at once or brings a
+  stopped one back. A failed start is followed by `docker compose stop`, so Docker's restart policy doesn't keep a
+  crashing app going, and requests are refused for `--start-cooldown` (15 seconds) before one may try again; an
+  explicit `resume` skips the cooldown. The app shows as `idle`, with the start's error.
+- **When the node agent restarts**, it adopts each app from its containers, and nothing that's running is restarted.
+  Requests wait while it looks.
+  - All running (healthy or not, or one-off services exited 0): ready.
+  - Nothing running: stopped, until a request; an always-on app is started.
+  - Partly running: stopped and suspended, with an error saying so, since nothing knows what it was in the middle of.
+  - A suspended app stays suspended (and is stopped if something started it); a failed deploy stays failed.
 
 ## Ingress
 
@@ -413,6 +453,8 @@ for macOS.
 | D11 | Each backup target chooses `send` (default) or `tar`; the server's own state always uses tar. | Only `send` couldn't be read without btrfs; only tar is slower, larger and loses sharing. Incremental tar isn't worth its complexity for occasional off-site copies. |
 | D12 | Bundles can't use Compose variable interpolation; Compose runs with an empty environment and no `.env`. | The node's environment (tokens, paths) never reaches an app, and a bundle behaves the same on every node. Interpolating from the node's environment leaks it; interpolating from a `.env` in the bundle adds a second way to say what `env_file` already says. |
 | D13 | Every subvolume's ID is recorded when it's put in place and checked before every start; a missing or different one is refused, never recreated. | Previews and shared volumes make it easy to mount the wrong data: a swapped directory could give a preview production's live database, or give production an empty one. Checking only that the path is some subvolume wouldn't catch a swap of one for another. |
+| D14 | The gateway only reads each app's gate and asks for starts; starts, idle stops, suspends and deploys all run in the app's own task. | Nothing overlaps (a stop can't race a start or a deploy), and a start belongs to no request, so a client that goes away can't cancel it. A start owned by the first request would need hand-offs when that request is cancelled. |
+| D15 | The starting page polls its own URL with a `Kiwi-Nest-Status` header, and reloads only on `ready`. | A reserved path would take a URL away from every app; a header doesn't. Reloading only on success means a failed start shows its error once rather than reloading into another start. |
 
 ## Build plan
 

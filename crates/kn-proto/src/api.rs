@@ -9,6 +9,8 @@
 //! | `PUT /apps/{name}?` [`DeployQuery`] | a ZIP (`application/zip`), or [`DeployDirectory`] as JSON | [`AppInfo`] |
 //! | `GET /apps/{name}` | | [`AppInfo`] |
 //! | `GET /apps/{name}/logs?` [`LogsQuery`] | | plain text, streamed when following |
+//! | `POST /apps/{name}/suspend` | | [`AppInfo`]; `409` while the app has open requests |
+//! | `POST /apps/{name}/resume` | | [`AppInfo`], once the app is ready |
 //! | `DELETE /apps/{name}?` [`DeleteQuery`] | | `204 No Content` |
 //! | `GET /volumes` | | `Vec<`[`VolumeInfo`]`>` |
 //! | `PUT /volumes/{name}` | | [`VolumeInfo`] (`201 Created`) |
@@ -125,6 +127,9 @@ pub struct AppInfo {
     pub updated_at: String,
     /// The app's containers as Docker reports them now.
     pub containers: Vec<ContainerInfo>,
+    /// Requests to the app through the gateway whose responses haven't finished, WebSockets included.
+    #[serde(default)]
+    pub open_requests: u64,
 }
 
 /// One container of an app.

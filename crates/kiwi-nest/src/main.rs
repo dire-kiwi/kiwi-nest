@@ -23,7 +23,7 @@ enum Cmd {
     /// Print the version and the git commit it was built from.
     Version,
     /// Run a node.
-    Node(NodeArgs),
+    Node(Box<NodeArgs>),
     #[command(flatten)]
     Client(kn_cli::Command),
 }
@@ -36,6 +36,9 @@ struct NodeArgs {
     /// The address of the standalone API; it must be loopback.
     #[arg(long, default_value = "127.0.0.1:7380")]
     listen: SocketAddr,
+    /// The address of the gateway, which proxies requests to apps by Host; it must be loopback for now.
+    #[arg(long, default_value = "127.0.0.1:7381")]
+    gateway_listen: SocketAddr,
     /// Where the node keeps its state, bundles and generated files.
     #[arg(long, env = "KIWI_NEST_STATE_DIR", default_value = "/var/lib/kiwi-nest")]
     state_dir: PathBuf,
@@ -58,6 +61,17 @@ struct NodeArgs {
     /// How long a deploy waits for the app to be running and healthy, such as 90s or 5m.
     #[arg(long, default_value = "5m")]
     up_timeout: String,
+    /// How long starting a stopped app for a request may take, until it's healthy and its port answers.
+    #[arg(long, default_value = "2m")]
+    start_timeout: String,
+    /// After a start fails, how long requests are refused before one may try again (`resume` doesn't wait).
+    #[arg(long, default_value = "15s")]
+    start_cooldown: String,
+}
+
+fn duration(flag: &str, value: &str) -> anyhow::Result<Duration> {
+    let secs = kn_bundle::manifest::parse_duration(value).with_context(|| format!("bad {flag} {value}"))?;
+    Ok(Duration::from_secs(secs))
 }
 
 fn parse_ports(s: &str) -> anyhow::Result<std::ops::RangeInclusive<u16>> {
@@ -93,11 +107,10 @@ async fn node(args: NodeArgs) -> anyhow::Result<()> {
         .map(absolute)
         .collect::<Result<_, _>>()?;
     cfg.docker = args.docker;
-    cfg.up_timeout = Duration::from_secs(
-        kn_bundle::manifest::parse_duration(&args.up_timeout)
-            .with_context(|| format!("bad --up-timeout {}", args.up_timeout))?,
-    );
-    kn_node::run_standalone(cfg, args.listen).await
+    cfg.up_timeout = duration("--up-timeout", &args.up_timeout)?;
+    cfg.start_timeout = duration("--start-timeout", &args.start_timeout)?;
+    cfg.start_cooldown = duration("--start-cooldown", &args.start_cooldown)?;
+    kn_node::run_standalone(cfg, args.listen, args.gateway_listen).await
 }
 
 fn main() -> std::process::ExitCode {
@@ -125,7 +138,7 @@ fn main() -> std::process::ExitCode {
                 println!("kiwi-nest {}", kn_proto::LONG_VERSION);
                 Ok(())
             }
-            Cmd::Node(args) => node(args).await,
+            Cmd::Node(args) => node(*args).await,
             Cmd::Client(cmd) => kn_cli::run(&cli.global, cmd).await,
         }
     });

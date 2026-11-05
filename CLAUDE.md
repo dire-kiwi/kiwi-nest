@@ -23,11 +23,13 @@ To try it by hand:
 
 ```sh
 # The volumes directory must be on btrfs. Prints: listening on http://127.0.0.1:7380
+# and: gateway on http://127.0.0.1:7381
 cargo run -- node --standalone --state-dir /tmp/kn --volumes-dir /mnt/kiwi-nest-test/kn &
 cargo run -- deploy blog ./path/to/bundle
 cargo run -- deploy blog-pr1 ./path/to/bundle --from blog
 cargo run -- volume create corpus && cargo run -- volume load corpus ./dir
 cargo run -- list
+curl -H 'Host: blog.example.com' http://127.0.0.1:7381/  # through the gateway, which wakes the app if it's idle
 ```
 
 ## Layout
@@ -38,13 +40,17 @@ cargo run -- list
   No I/O beyond the bundle, so plain unit tests cover it.
 - `crates/kn-btrfs`: the btrfs ioctls (create, snapshot, destroy), subvolume checks, paths opened without symlinks.
 - `crates/kn-node`: `volumes` (the subvolume layout and the check before every start, with a fake backend for unit
-  tests), `runtime` (`docker compose`), `apps` (one task per app, the state file, `--from`; `apps/shared.rs` for shared
-  volumes), `api` (standalone API).
+  tests), `runtime` (the `Runtime` trait, and `Docker`, which runs `docker compose`), `apps` (one task per app, the
+  state file, `--from`; `apps/shared.rs` for shared volumes; `apps/lifecycle.rs` starts, stops and adopts apps),
+  `gateway` (the proxy, each app's `gate` of phases and leases, the starting page), `api` (standalone API). `testing`
+  is a fake runtime for unit tests.
 - `crates/kn-cli`: the CLI commands.
 
 ## Conventions
 
 - Integration tests that need Docker or btrfs are opt-in through `KIWI_NEST_INTEGRATION=1` and
-  `KIWI_NEST_TEST_BTRFS_DIR`, use a random Compose project prefix, and clean up only what they made.
-- Unit tests use the fake subvolume backend (`volumes::fake`) wherever btrfs itself isn't what's being tested.
+  `KIWI_NEST_TEST_BTRFS_DIR`, use a random Compose project prefix, and clean up only what they made. Their shared
+  harness is `crates/kiwi-nest/tests/common`.
+- Unit tests use the fake subvolume backend (`volumes::fake`) wherever btrfs itself isn't what's being tested, and the
+  fake runtime (`testing`) for the node's lifecycle and gateway.
 - Every rule the bundle checker enforces has a unit test.

@@ -21,7 +21,10 @@ bytes = "1"
 clap = { version = "4.6", features = ["derive", "env"] }
 futures-util = "0.3"
 hex = "0.4"
+http-body-util = "0.1"
 humantime = "2"
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 # Plain HTTP to the loopback node API for now; TLS (rustls) arrives with the server in step 4.
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream"] }

@@ -3,13 +3,17 @@
 //! - [`volumes`] is the layout of the node's btrfs subvolumes, and the checks before every start.
 //! - [`runtime`] runs `docker compose` for each app's project.
 //! - [`apps`] handles each app's lifecycle, one task per app, its volumes, shared volumes, and the node's state file.
+//! - [`gateway`] proxies requests to apps by Host, starts stopped apps for them, and lets idle ones be stopped.
 //! - [`api`] is the standalone node's loopback HTTP API.
 //!
-//! Later steps add the gateway and the link to the server.
+//! Later steps add the link to the server.
 
 pub mod api;
 pub mod apps;
+pub mod gateway;
 pub mod runtime;
+#[cfg(test)]
+mod testing;
 pub mod volumes;
 
 use std::net::SocketAddr;
@@ -40,6 +44,14 @@ pub struct NodeConfig {
     pub docker: PathBuf,
     /// How long `docker compose up` may wait for an app's containers to be running and healthy.
     pub up_timeout: Duration,
+    /// How long starting a stopped app may take, until it's healthy and its port answers.
+    pub start_timeout: Duration,
+    /// After a failed start, how long requests are refused before one may start the app again.
+    pub start_cooldown: Duration,
+    /// How long a browser's page load waits for a starting app before it gets the starting page instead.
+    pub starting_page_after: Duration,
+    /// How often idle apps are looked for.
+    pub idle_check_interval: Duration,
 }
 
 impl NodeConfig {
@@ -55,6 +67,10 @@ impl NodeConfig {
             load_limits: Limits::for_volumes(),
             docker: "docker".into(),
             up_timeout: Duration::from_secs(300),
+            start_timeout: Duration::from_secs(120),
+            start_cooldown: Duration::from_secs(15),
+            starting_page_after: Duration::from_secs(1),
+            idle_check_interval: Duration::from_secs(1),
         }
     }
 
@@ -99,7 +115,7 @@ impl NodeConfig {
     }
 }
 
-/// Refuses an address that isn't loopback: the standalone API has no authentication.
+/// Refuses an address that isn't loopback: the standalone API and gateway have no authentication.
 pub fn check_loopback(addr: &SocketAddr) -> anyhow::Result<()> {
     if !addr.ip().is_loopback() {
         bail!("the standalone node only listens on loopback (such as 127.0.0.1), not {addr}");
@@ -107,19 +123,36 @@ pub fn check_loopback(addr: &SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Runs a standalone node: its apps and its loopback API, until interrupted.
+/// Runs a standalone node: its apps, its loopback API and its gateway, until interrupted.
 ///
-/// Prints `listening on http://ADDR` to stdout once the API is up. Apps keep running after the node exits.
-pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr) -> anyhow::Result<()> {
+/// Prints `listening on http://ADDR` (the API), then `gateway on http://ADDR`, to stdout once both are up. Apps
+/// keep running after the node exits, and the next node agent adopts them.
+pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen: SocketAddr) -> anyhow::Result<()> {
     check_loopback(&listen)?;
+    check_loopback(&gateway_listen)?;
     let apps = apps::Apps::open(cfg).await?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("listening on {listen}"))?;
-    let addr = listener.local_addr()?;
+    let gw_listener = tokio::net::TcpListener::bind(gateway_listen)
+        .await
+        .with_context(|| format!("listening on {gateway_listen}"))?;
+    let (addr, gw_addr) = (listener.local_addr()?, gw_listener.local_addr()?);
     println!("listening on http://{addr}");
-    tracing::info!(%addr, "standalone node API listening");
-    api::serve(listener, apps, shutdown_signal()).await?;
+    println!("gateway on http://{gw_addr}");
+    tracing::info!(%addr, gateway = %gw_addr, "standalone node listening");
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            shutdown_signal().await;
+            stop.cancel();
+        }
+    });
+    tokio::try_join!(
+        api::serve(listener, apps.clone(), stop.clone().cancelled_owned()),
+        gateway::serve(gw_listener, apps, stop.cancelled_owned()),
+    )?;
     tracing::info!("stopped; apps keep running");
     Ok(())
 }
