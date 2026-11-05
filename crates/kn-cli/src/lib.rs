@@ -1686,7 +1686,7 @@ async fn nest(client: &Client, cmd: NestCommand) -> anyhow::Result<()> {
                 return Ok(());
             }
             print_table(
-                &["NAME", "NODE", "APPS", "VOLUMES", "MEMORY", "PLACED"],
+                &["NAME", "NODE", "APPS", "VOLUMES", "MEMORY", "DISK", "PLACED"],
                 nests
                     .iter()
                     .map(|n| {
@@ -1700,6 +1700,7 @@ async fn nest(client: &Client, cmd: NestCommand) -> anyhow::Result<()> {
                             n.apps.join(","),
                             n.volumes.join(","),
                             gib(n.memory_bytes),
+                            n.disk_bytes.map_or_else(|| "-".into(), |b| size(Some(b))),
                             n.placement.clone(),
                         ]
                     })

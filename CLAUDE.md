@@ -9,7 +9,12 @@ kiwi-nest is written from scratch; don't copy from or refer to other deployment 
 
 ## Build and test
 
-- `make check` runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` (what CI runs).
+- `make check` runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` and the web UI's
+  typecheck (what CI runs).
+- `make web` builds the web UI (`web/`, React and Vite, `npm ci` and `npm run build`) into `web/dist`, which the
+  server embeds; until then the server serves a page saying it wasn't built (`crates/kn-server/build.rs` chooses).
+  A debug server reads `web/dist` from disk, so a rebuilt UI shows without rebuilding the server. `cd web && npm run
+  dev` serves it with hot reloading, proxying `/v1` to `KN_SERVER` (the dev cluster's server by default).
 - `make integration` also runs the tests that need Docker (`KIWI_NEST_INTEGRATION=1`).
 - Tests that need btrfs (every test that starts a node, since its volumes are subvolumes) run when
   `KIWI_NEST_TEST_BTRFS_DIR` names a directory on btrfs, and are skipped otherwise. `make test-btrfs`
@@ -59,6 +64,7 @@ cargo run -q -- deploy blog ./path/to/bundle      # waits for the node; --node a
 curl -H 'Host: blog.example.com' http://127.0.0.1:7481/
 curl --cacert .dev-cluster/server/ingress-ca.crt https://blog.localhost:7443/   # through the ingress, with Caddy
 cargo run -q -- nest list
+cargo run -q -- user add ivan                     # then log in to the web UI at http://127.0.0.1:7400/
 scripts/dev-cluster.sh stop a                     # then `node forget a`; `start a` or `rejoin a` brings it back
 scripts/dev-cluster.sh down                       # or `clean`, which also removes the cluster's state
 ```
@@ -75,7 +81,7 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
 - `crates/kn-bundle`: safe ZIP and directory reading, the Compose subset, `x-kiwi-nest`, the generated Compose file.
   No I/O beyond the bundle, so plain unit tests cover it.
 - `crates/kn-btrfs`: the btrfs ioctls (create, snapshot, destroy, send), subvolume checks, paths opened without
-  symlinks.
+  symlinks, and `usage` (a subvolume's space from its files' extents, and what it shares).
 - `crates/kn-backup`: backups. `key` (keys, chains, choosing a parent, retention), `target` (a configured target,
   uploads and downloads through zstd), `store` with `s3` and `ssh` (where backups are kept; a failed upload never
   looks complete), `sendstream` and `receive` (the send stream format, received as file operations confined by
@@ -83,19 +89,23 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
 - `crates/kn-node`: `volumes` (the subvolume layout and the check before every start, with a fake backend for unit
   tests), `runtime` (the `Runtime` trait, and `Docker`, which runs `docker compose`), `apps` (one task per app, the
   state file, `--from`; `apps/shared.rs` for shared volumes; `apps/lifecycle.rs` starts, stops and adopts apps),
-  `apps/backup.rs` backs up snapshot sets and restores into first deploys and new volumes;
+  `apps/backup.rs` backs up snapshot sets and restores into first deploys and new volumes; `apps/usage.rs` measures
+  the volumes' space now and then, grouped by what can share data;
   `gateway` (the proxy, each app's `gate` of phases and leases, the starting page, the ingress listener's token
   check), `agent` (the link to the server: joining, the poll loop, the per-app applier and commands; `agent/link.rs`
   is its HTTP client; `agent/forgotten.rs` takes a forgotten node's apps down and sets its data aside), `api`
   (standalone API). `testing` is a fake runtime for unit tests.
 - `crates/kn-server`: `store` (SQLite on its own thread, numbered migrations; `tokens`, `nodes` (cordons, labels,
   forgetting and tombstones), `apps` for apps, volumes, their nests, desired state and change status, `nests`,
-  `commands`), `bundles` (the store by digest, checking uploads), `backups` (the targets, the schedule, the
+  `commands` (also each app's history), `users` (the web UI's users and sessions)), `bundles` (the store by digest, checking uploads), `backups` (the targets, the schedule, the
   server's own backups and `server restore`), `auth`, `scheduler` (placing new nests: a pure
   filter and score, with table tests), `hub` (in memory: online nodes, waking polls, callers waiting on commands),
-  `api` (for the CLI), `agent` (for nodes) and `ingress` (Caddy's generated configuration, kept loaded through its
-  admin API).
+  `api` (for the CLI), `agent` (for nodes), `ingress` (Caddy's generated configuration, kept loaded through its
+  admin API) and `ui` (the embedded web UI, logins, and the same-origin and JSON checks on requests with its session
+  cookie).
 - `crates/kn-cli`: the CLI commands, and `config` (clusters in `~/.config/kiwi-nest/clusters.json`).
+- `web/`: the web UI (React, TypeScript, Vite; no other dependencies). `src/api.ts` mirrors `kn-proto`'s types;
+  `src/views/` has a file per view. It talks only to the CLI's API, sending JSON on every change.
 
 ## Conventions
 
