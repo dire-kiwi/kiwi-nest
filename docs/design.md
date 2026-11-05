@@ -170,11 +170,12 @@ volumes:
   recorded as failed. A redeploy that fails before the old project is stopped (its files can't be written, or `down`
   fails) leaves the old generation's bundle, file and record in place, since its containers may still be running;
   one that fails after that leaves the new generation as a failed app.
-- **The standalone node's API** (steps 1 to 3, before the server exists) listens on loopback only and has no tokens. It
-  answers only requests whose `Host` is `localhost`, `127.x.x.x` or `[::1]` and that carry no `Origin`, so a web page
-  can't reach it by rebinding its DNS name to 127.0.0.1. Besides deploy, list, inspect, logs and delete, it has
-  `suspend` and `resume` (step 3). The standalone node's gateway (`--gateway-listen`, `127.0.0.1:7381` by default)
-  is on loopback too, until step 6 moves it to the private address.
+- **The standalone node's API** (steps 1 to 3, before the server existed; still there for development) listens on
+  loopback only and has no tokens. It answers only requests whose `Host` is `localhost`, `127.x.x.x` or `[::1]` and
+  that carry no `Origin`, so a web page can't reach it by rebinding its DNS name to 127.0.0.1. Besides deploy, list,
+  inspect, logs and delete, it has `suspend` and `resume` (step 3). A node's gateway (`--gateway-listen`,
+  `127.0.0.1:7381` by default), standalone or joined to a server, is on loopback too, until step 6 moves it to the
+  private address.
 - **An app's status** is kiwi-nest's view of it: `deploying`, `running`, `idle` (stopped for being idle, or its last
   start failed; a request starts it), `suspended` (stopped on purpose; only `resume` starts it) or `failed` (its last
   deploy failed). `inspect` also shows the app's open requests through the gateway.
@@ -266,22 +267,65 @@ VOLUMES/                         one btrfs filesystem per node
 
 - **Nodes connect out.** Each node long-polls the server's API over HTTPS (normally through the ingress) with its own
   token. Nodes need no inbound port except the gateway, and they work behind NAT.
+- **Joining.** `kiwi-nest node --server URL --join-token TOKEN` swaps a one-time join token for the node's own token on
+  its first start, and keeps it with the server's URL in `STATE/agent.json` (mode 0600), so later starts need
+  neither. A node that joined but never polled (it didn't get the answer) may join again under its name with a new
+  join token.
 - **Desired state for what's deployed.** For each node, the server keeps the list of apps and shared volumes it
-  should have, each with a bundle digest and a generation number. A poll returns what changed since the generation
-  the node last applied. The node applies one change at a time per app, in order, downloads bundles by digest, and
-  reports for each app the generation it reached, its state and any error. A node that was offline catches up when it
-  reconnects: nothing needs re-sending, and nothing runs twice.
-- **Commands for one-off actions** (logs, suspend, resume, back up now, …) return their result through the same link.
-- **`deploy` waits until the node reports the new generation**, then prints the result. If the target node is
-  offline, `deploy` refuses up front and saves nothing, so CI fails rather than waits; `--queue` overrides that.
-- **The server owns names and domains.** It reserves both before it changes the desired state, so two apps can never
-  claim the same domain on different nodes.
+  should have, each with a bundle digest and a generation number. Every change to a node's desired state bumps the
+  node's sequence number, and the entry records the number it changed at. A poll carries the number of the last
+  poll the node got and returns the entries that changed after it; a node that has just started asks from 0 and
+  gets its whole desired state. Entries are states, not steps: an app redeployed twice while its node was offline
+  arrives once, at its latest generation, and a bundle no entry refers to any more is deleted. A name's generations
+  only ever grow, even across a delete, so a node can't mistake a new app for one it has applied.
+- **Applying.** The node applies one change at a time per app (or shared volume), always the latest it has, and
+  downloads bundles by digest, checking the digest. It records each change it finishes, done or failed, with its
+  generation in `agent.json` before reporting it, so a change it gets again never runs twice; a change cut off by a
+  restart wasn't recorded, so it runs again, once, when the node is back. A deploy `--from` another app or mounting
+  a shared volume waits for that app's or volume's earlier changes; deletes and volume changes wait for every
+  earlier change. A change whose bundle can't be downloaded yet is retried. Each poll reports the node's facts
+  (architecture, memory, btrfs space including unallocated, disk space, labels, version), each app's generation,
+  state and error, and the changes it has finished. A node that finishes a change also sends a report at once on a route of its
+  own, beside its open poll (never cancelling it, so a command on its way can't be lost), and reports carry a
+  serial, so one that arrives late never replaces a newer one. A node that has applied generations beyond what the
+  server records (its database restored from an older backup) moves the server's generations up to them. A node that was offline catches up when it reconnects: nothing
+  needs re-sending, and nothing runs twice.
+- **Commands for one-off actions** (inspect, logs, suspend, resume, back up now, …) return their result through the
+  same link. Each is handed out in at most one poll response, in the same transaction that marks it delivered. The
+  node runs it in a task of its own (so its polls carry on while a resume waits for an app, or logs stream), lists it
+  in each report until its result is sent, and sends the result, or streams the output for logs, back to the server,
+  which passes it to the caller. A delivered command that the next report doesn't list (its response was lost, or the
+  node restarted) has failed, and the caller is told; a command whose caller gave up before it was handed out is
+  cancelled, so it never runs late; a caller stops waiting as soon as the node goes offline. Only the newest of a
+  node's polls hands anything out.
+- **Online** means the node has a poll open, or polled within `--offline-after` (15 seconds).
+- **`deploy` waits until the node reports the new generation**, then prints the result. The server saves the deploy
+  and answers at once; the CLI then follows the change (`…/changes/GENERATION`, a long poll of its own) until the node
+  reports it done or failed, through server restarts and node outages, saying so if the node goes offline. If the
+  target node is offline, `deploy` refuses up front and saves nothing, so CI fails rather than waits; `--queue`
+  overrides that, and returns once the deploy is saved. A deploy followed by another before its outcome was seen
+  (two pushes in a row) says so and succeeds, since the app is the later one's now. Deletes and `volume
+  create|load|delete` work the same way.
+- **The server owns names and domains.** It reserves both, in the transaction that changes the desired state, so two
+  apps can never claim the same domain on different nodes. A deleted app keeps its name and domain until its node
+  reports the delete done.
+- **Choosing a node** (until nests and the full scheduler, step 5): an existing app stays where it is; a `--from` app
+  goes to its source's node, and an app mounting a shared volume to the volume's node (and those must agree);
+  otherwise `--node`, or the online node with the most memory left once its apps' `mem_limit`s are counted (256 MiB
+  for a service without one).
 - **Storage.** The server keeps SQLite (`rusqlite` with SQLite bundled, so the static musl build needs no system
-  library) for nodes, nests, apps, volumes, generations, tokens and command history. Bundles are files named by
-  digest; each app's current bundle is kept until the app is deleted. Each node keeps a small state file of what it
-  has applied.
+  library) for nodes, nests, apps, volumes, generations, tokens and command history, on a thread of its own, in WAL
+  mode with `synchronous = FULL`, so whatever the server has answered for survives a crash. Bundles are files named by
+  digest; each app's current bundle is kept until the app is deleted. An upload is checked by the node's rules before
+  anything is saved, and only moved into the store by the transaction that saves the change, so a refused deploy
+  leaves nothing. Each node keeps a small state file of what it has applied.
 - **Tokens**, all stored only as hashes: admin tokens; deploy tokens limited to name patterns (for example `blog-pr*`
-  for a repository's previews); node tokens, which `node forget` revokes; one-time join tokens.
+  for a repository's previews), which may also name apps they may use as `--from` (`blog`) without being able to
+  change them, and may mount shared volumes `ro` or `snapshot` but not `rw`; node tokens, which `node forget` revokes; one-time join tokens. The first start of a server prints
+  its first admin token, once. The last admin token can't be revoked.
+- **The CLI's clusters** are in `~/.config/kiwi-nest/clusters.json` (mode 0600): each a server URL and a token, and
+  which is current. CI can pass `--server` and `--token` (or `KIWI_NEST_SERVER` and `KIWI_NEST_TOKEN`) instead.
+  `--node-api` still talks to a standalone node.
 
 ## Gateway: wake on request, stop when idle
 
@@ -424,14 +468,14 @@ One Cargo workspace. A few crates keep the server and node apart and build in pa
 | `kn-proto` | `api`, `agent`, `state` | Types shared by the CLI, server and nodes: API requests and responses, the agent link's polls, desired state, reports and commands. Versioned, so the server can talk to nodes one version behind. |
 | `kn-bundle` | `zip`, `compose`, `manifest`, `generate` | Safe ZIP reading, validation of the Compose subset and `x-kiwi-nest`, and the generated Compose file. No I/O beyond the bundle, so plain unit tests cover it. |
 | `kn-btrfs` | | btrfs ioctls (create, snapshot, destroy, read-only snapshots), subvolume checks, paths opened without following symlinks; later, send and receive as streams. |
-| `kn-node` | `volumes`, `runtime`, `apps`, `gateway`, `agent` | The node: the volume layout and rules; `docker compose` through `tokio::process`; each app's lifecycle (one task per app, so its operations are serialized) and the state file; the `hyper` gateway; the link to the server. |
-| `kn-server` | `api`, `store`, `scheduler`, `bundles`, `auth`, `ingress`, `registry`, `ui` | The server: `axum` APIs for the CLI and agents, SQLite, placement, the bundle store, tokens, Caddy sync, the registry, and the embedded UI. |
+| `kn-node` | `volumes`, `runtime`, `apps`, `gateway`, `agent` | The node: the volume layout and rules; `docker compose` through `tokio::process`; each app's lifecycle (one task per app, so its operations are serialized) and the state file; the `hyper` gateway; the link to the server (joining, the poll loop, the per-app applier, commands). |
+| `kn-server` | `api`, `agent`, `store`, `scheduler`, `bundles`, `auth`, `hub`, `ingress`, `registry`, `ui` | The server: `axum` APIs for the CLI (`api`) and for agents (`agent`), SQLite (`store`), placement, the bundle store, tokens, what's only in memory (`hub`: online nodes, waking polls, callers waiting on commands), Caddy sync, the registry, and the embedded UI. |
 | `kn-backup` | `chain`, `s3`, `ssh` | Send and tar streams through zstd to S3, R2 or SSH, chains and retention, restores. Used by nodes, and by the server for its own state. |
 | `kn-cli` | | The CLI: clusters in `~/.config/kiwi-nest`, and the commands. |
 | `web/` | | The web UI (React and Vite), built by `make` and embedded in `kn-server` with `rust-embed`. |
 
 Main dependencies: `tokio`; `hyper` 1 and `hyper-util` (the gateway, WebSocket upgrades included); `axum`; `reqwest`
-with rustls (no OpenSSL); `rusqlite` (bundled); `serde`, `serde_json` and a maintained YAML crate; `zip`, `zstd`,
+with rustls and its `ring` provider (no OpenSSL, and nothing that needs CMake to cross-build); `rusqlite` (bundled); `serde`, `serde_json` and a maintained YAML crate; `zip`, `zstd`,
 `tar`; `libc` (the btrfs ioctls); `clap`; `tracing`; `rusty-s3` (a small S3 signer rather than the AWS SDK). Releases are static binaries
 for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, built with `cargo zigbuild`; the CLI is also built
 for macOS.
@@ -455,6 +499,9 @@ for macOS.
 | D13 | Every subvolume's ID is recorded when it's put in place and checked before every start; a missing or different one is refused, never recreated. | Previews and shared volumes make it easy to mount the wrong data: a swapped directory could give a preview production's live database, or give production an empty one. Checking only that the path is some subvolume wouldn't catch a swap of one for another. |
 | D14 | The gateway only reads each app's gate and asks for starts; starts, idle stops, suspends and deploys all run in the app's own task. | Nothing overlaps (a stop can't race a start or a deploy), and a start belongs to no request, so a client that goes away can't cancel it. A start owned by the first request would need hand-offs when that request is cancelled. |
 | D15 | The starting page polls its own URL with a `Kiwi-Nest-Status` header, and reloads only on `ready`. | A reserved path would take a URL away from every app; a header doesn't. Reloading only on success means a failed start shows its error once rather than reloading into another start. |
+| D16 | Desired-state entries are each app's latest state, stamped with a per-node sequence number; nodes record every change they finish by generation. | Polls are then "what changed after N", a restarted node asks from 0, and repeats are harmless: nothing is queued per node, and a change cut off by a crash simply runs again. A log of steps would have to be stored, re-sent and de-duplicated, and replayed in full after an outage. |
+| D17 | Commands are handed out at most once, and a delivered command missing from the node's next report has failed. | A one-off action (resume, logs) that runs twice or late is worse than one that fails and is retried by a person. Re-sending would need idempotency keys on every action. |
+| D18 | A change is saved and answered at once; the CLI follows it on a route of its own until the node reports it. | Holding the deploy's request open would tie the result to one connection: a server restart or a proxy timeout would lose it, though the change is saved. Following it can resume. |
 
 ## Build plan
 
@@ -516,6 +563,10 @@ flowchart LR
    *Verify:* two nodes join and report; a duplicate domain is refused across nodes; a node killed mid-deploy
    finishes that deploy, once, when it comes back; a deploy to an offline node is refused and saves nothing;
    restarting the server loses nothing; a deploy token for `blog-pr*` can't touch `blog`.
+   *Done:* `crates/kn-server/src/tests.rs` (the server with nodes played by the test), `crates/kn-node/src/agent/tests.rs`
+   (the agent against a real server, with nodes killed by dropping their runtime mid-deploy) and
+   `crates/kiwi-nest/tests/cluster.rs` (the real binary, Docker and btrfs). Shared volumes are created, loaded and
+   deleted through the server too, placed like apps for now.
 5. **Nests and placement.** Working out an app's nest and refusing mixed nests; the scheduler (filter, then score);
    `nest list`; `node list|label|cordon|uncordon|forget`; shared volumes created through the server; `inspect`
    showing the placement and why. `node forget` revokes the node's token, and a forgotten node that reconnects takes

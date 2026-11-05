@@ -31,6 +31,8 @@ pub struct Behaviour {
     pub start_delay: Duration,
     /// `start` succeeds, but the routed service crashes and keeps restarting.
     pub crash_on_start: bool,
+    /// How long `up` takes.
+    pub up_delay: Duration,
 }
 
 #[derive(Default)]
@@ -172,6 +174,8 @@ impl Runtime for Fake {
     fn up<'a>(&'a self, p: &'a Project, _wait: Duration) -> BoxFuture<'a, Result<(), RuntimeError>> {
         Box::pin(async move {
             self.log("up", &p.name);
+            let delay = self.behaviour.lock().unwrap().up_delay;
+            tokio::time::sleep(delay).await;
             let (services, routed, port) = read_compose(&p.file);
             {
                 let mut projects = self.projects.lock().unwrap();

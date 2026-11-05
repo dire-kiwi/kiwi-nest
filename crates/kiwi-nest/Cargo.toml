@@ -16,6 +16,7 @@ kn-bundle.workspace = true
 kn-cli.workspace = true
 kn-node.workspace = true
 kn-proto.workspace = true
+kn-server.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

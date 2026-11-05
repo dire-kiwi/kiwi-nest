@@ -75,6 +75,13 @@ impl From<AppsError> for ApiError {
     }
 }
 
+impl ApiError {
+    /// The status and body it's answered with.
+    pub fn into_parts(self) -> (StatusCode, ErrorBody) {
+        (self.0, self.1)
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         if self.0.is_server_error() {
@@ -326,6 +333,7 @@ async fn deploy(
     let opts = DeployOptions {
         create_only: q.create_only,
         from: q.from,
+        generation: None,
     };
     Ok(axum::Json(apps.deploy(&name, staged, opts).await?))
 }

@@ -22,6 +22,8 @@ pub enum LoadSource {
     Zip(PathBuf),
     /// A directory on this machine.
     Dir(PathBuf),
+    /// A ZIP downloaded from the server, whose contents must have this digest.
+    Digest { zip: PathBuf, digest: String },
 }
 
 fn check_name(name: &str) -> Result<()> {
@@ -131,6 +133,8 @@ impl Apps {
             mounts,
             snapshots,
             problem,
+            node: None,
+            pending: None,
         })
     }
 
@@ -176,6 +180,19 @@ impl Apps {
                     .map_err(|e| BundleError::Io("the upload".into(), e))
                     .and_then(|f| kn_bundle::zip::extract(std::io::BufReader::new(f), &load, &limits)),
                 LoadSource::Dir(src) => kn_bundle::dir::copy(&src, &load, &limits),
+                LoadSource::Digest { zip, digest } => std::fs::File::open(&zip)
+                    .map_err(|e| BundleError::Io("the download".into(), e))
+                    .and_then(|f| kn_bundle::zip::extract(std::io::BufReader::new(f), &load, &limits))
+                    .and_then(|index| {
+                        if index.digest() == digest {
+                            Ok(index)
+                        } else {
+                            Err(BundleError::Zip(format!(
+                                "the contents downloaded have digest {}, not {digest}",
+                                index.digest()
+                            )))
+                        }
+                    }),
             }
             .map_err(AppsError::Bundle)
             .and_then(|_| {

@@ -77,6 +77,17 @@ const IOC_SNAP_CREATE_V2: u64 = ioc(IOC_WRITE, 23, size_of::<VolArgsV2>());
 const IOC_SUBVOL_GETFLAGS: u64 = ioc(IOC_READ, 25, size_of::<u64>());
 const IOC_SUBVOL_SETFLAGS: u64 = ioc(IOC_WRITE, 26, size_of::<u64>());
 const IOC_FS_INFO: u64 = ioc(IOC_READ, 31, size_of::<FsInfoArgs>());
+const IOC_DEV_INFO: u64 = ioc(IOC_READ | IOC_WRITE, 30, size_of::<DevInfoArgs>());
+
+/// `struct btrfs_ioctl_dev_info_args`, up to the sizes; the kernel fills the rest.
+#[repr(C)]
+struct DevInfoArgs {
+    devid: u64,
+    uuid: [u8; 16],
+    bytes_used: u64,
+    total_bytes: u64,
+    rest: [u8; 4056],
+}
 
 const SUBVOL_RDONLY: u64 = 1 << 1;
 
@@ -290,6 +301,49 @@ fn fs_id_fd(fd: BorrowedFd) -> io::Result<FsId> {
     let mut args: Box<FsInfoArgs> = Box::new(unsafe { std::mem::zeroed() });
     ioctl(fd, IOC_FS_INFO, &mut *args)?;
     Ok(FsId(args.fsid))
+}
+
+/// The space on a btrfs filesystem's devices that no chunk has been allocated from yet, summed over its devices.
+///
+/// Free space as `statvfs` reports it counts only what's left in allocated chunks plus an estimate, and a
+/// filesystem whose chunks are all allocated can fail writes while it shows space free; this is the number to
+/// watch. It needs no privilege.
+pub fn unallocated(path: &Path) -> Result<u64> {
+    let fd = open_dir(path)?;
+    if !is_btrfs_fd(fd.as_fd()).map_err(|e| Error::io("checking", path, e))? {
+        return Err(Error::NotBtrfs(path.into()));
+    }
+    // SAFETY: plain integers and bytes, all valid when zeroed.
+    let mut fs: Box<FsInfoArgs> = Box::new(unsafe { std::mem::zeroed() });
+    ioctl(fd.as_fd(), IOC_FS_INFO, &mut *fs).map_err(|e| Error::io("reading the filesystem of", path, e))?;
+    let mut free = 0u64;
+    for devid in 1..=fs.max_id {
+        // SAFETY: as above.
+        let mut dev: Box<DevInfoArgs> = Box::new(unsafe { std::mem::zeroed() });
+        dev.devid = devid;
+        match ioctl(fd.as_fd(), IOC_DEV_INFO, &mut *dev) {
+            Ok(()) => free += dev.total_bytes.saturating_sub(dev.bytes_used),
+            // A device ID that was removed.
+            Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {}
+            Err(e) => return Err(Error::io("reading the devices of", path, e)),
+        }
+    }
+    Ok(free)
+}
+
+/// A filesystem's size and the space available to unprivileged users, from `statvfs`, in bytes.
+pub fn disk_space(path: &Path) -> io::Result<(u64, u64)> {
+    let c = CString::new(path.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: all integers, valid when zeroed; `statvfs` fills it.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid C string and `st` a valid out-pointer.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[allow(clippy::unnecessary_cast)]
+    let frsize = st.f_frsize as u64;
+    #[allow(clippy::unnecessary_cast)]
+    Ok((st.f_blocks as u64 * frsize, st.f_bavail as u64 * frsize))
 }
 
 fn subvolume_id_fd(fd: BorrowedFd) -> io::Result<u64> {

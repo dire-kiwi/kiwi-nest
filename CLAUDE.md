@@ -19,7 +19,7 @@ kiwi-nest is written from scratch; don't copy from or refer to other deployment 
   `dist/`, with `cargo zigbuild` (needs `zig` and `cargo-zigbuild`).
 - `cargo run -- version` prints the version (from the workspace `Cargo.toml`) and the git commit.
 
-To try it by hand:
+To try it by hand, standalone (one node, its loopback API, no server):
 
 ```sh
 # The volumes directory must be on btrfs. Prints: listening on http://127.0.0.1:7380
@@ -32,19 +32,42 @@ cargo run -- list
 curl -H 'Host: blog.example.com' http://127.0.0.1:7381/  # through the gateway, which wakes the app if it's idle
 ```
 
+Or as a cluster: `scripts/dev-cluster.sh` starts a server and two nodes (`a` and `b`, each with its own state,
+gateway port, loop-mounted btrfs file and project prefix; `KIWI_NEST_DEV_BTRFS=DIR` uses directories on an existing
+btrfs filesystem instead of loop mounts and sudo), and writes a CLI configuration with the cluster added:
+
+```sh
+scripts/dev-cluster.sh up
+export KIWI_NEST_CONFIG_DIR=$PWD/.dev-cluster/config
+cargo run -q -- node list
+cargo run -q -- deploy blog ./path/to/bundle      # waits for the node; --node a picks one
+curl -H 'Host: blog.example.com' http://127.0.0.1:7481/
+scripts/dev-cluster.sh down                       # or `clean`, which also removes the cluster's state
+```
+
+The CLI goes to `--node-api` if given, else `--server` with `--token`, else the current cluster in
+`~/.config/kiwi-nest` (`kiwi-nest cluster add|use|list`), else the standalone node on this machine.
+
 ## Layout
 
-- `crates/kiwi-nest`: the binary; `clap` picks `node`, `version` or a CLI command. End-to-end tests in `tests/`.
-- `crates/kn-proto`: API types shared by the CLI, server and nodes, and the version.
+- `crates/kiwi-nest`: the binary; `clap` picks `server`, `node`, `version` or a CLI command. End-to-end tests in
+  `tests/` (`cluster.rs` runs a server and nodes).
+- `crates/kn-proto`: API types shared by the CLI, server and nodes (`api`), the agent link's (`agent`: polls,
+  reports, desired state, commands; versioned by `PROTOCOL`), and the version.
 - `crates/kn-bundle`: safe ZIP and directory reading, the Compose subset, `x-kiwi-nest`, the generated Compose file.
   No I/O beyond the bundle, so plain unit tests cover it.
 - `crates/kn-btrfs`: the btrfs ioctls (create, snapshot, destroy), subvolume checks, paths opened without symlinks.
 - `crates/kn-node`: `volumes` (the subvolume layout and the check before every start, with a fake backend for unit
   tests), `runtime` (the `Runtime` trait, and `Docker`, which runs `docker compose`), `apps` (one task per app, the
   state file, `--from`; `apps/shared.rs` for shared volumes; `apps/lifecycle.rs` starts, stops and adopts apps),
-  `gateway` (the proxy, each app's `gate` of phases and leases, the starting page), `api` (standalone API). `testing`
-  is a fake runtime for unit tests.
-- `crates/kn-cli`: the CLI commands.
+  `gateway` (the proxy, each app's `gate` of phases and leases, the starting page), `agent` (the link to the server:
+  joining, the poll loop, the per-app applier and commands; `agent/link.rs` is its HTTP client), `api` (standalone
+  API). `testing` is a fake runtime for unit tests.
+- `crates/kn-server`: `store` (SQLite on its own thread, numbered migrations; `tokens`, `nodes`, `apps` for apps,
+  volumes, desired state and change status, `commands`), `bundles` (the store by digest, checking uploads), `auth`,
+  `scheduler`, `hub` (in memory: online nodes, waking polls, callers waiting on commands), `api` (for the CLI) and
+  `agent` (for nodes).
+- `crates/kn-cli`: the CLI commands, and `config` (clusters in `~/.config/kiwi-nest/clusters.json`).
 
 ## Conventions
 
@@ -52,5 +75,9 @@ curl -H 'Host: blog.example.com' http://127.0.0.1:7381/  # through the gateway, 
   `KIWI_NEST_TEST_BTRFS_DIR`, use a random Compose project prefix, and clean up only what they made. Their shared
   harness is `crates/kiwi-nest/tests/common`.
 - Unit tests use the fake subvolume backend (`volumes::fake`) wherever btrfs itself isn't what's being tested, and the
-  fake runtime (`testing`) for the node's lifecycle and gateway.
+  fake runtime (`testing`) for the node's lifecycle, gateway and agent. The agent's tests run a real server in the
+  process, and each node on a tokio runtime of its own, so dropping the runtime kills the node mid-operation.
+- The server's tests play the nodes themselves over HTTP (`crates/kn-server/src/tests.rs`).
+- Tests never read the user's CLI configuration: the end-to-end harness sets `KIWI_NEST_CONFIG_DIR` to an empty
+  directory.
 - Every rule the bundle checker enforces has a unit test.

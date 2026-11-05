@@ -253,3 +253,269 @@ pub fn uid_gid() -> String {
     let gid = String::from_utf8(out.stdout).unwrap().trim().to_string();
     format!("{uid}:{gid}")
 }
+
+/// A server run from the real binary, on a loopback port of its own, with short poll timeouts. Killed when dropped.
+pub struct Server {
+    child: Child,
+    pub url: String,
+    addr: String,
+    pub admin: String,
+    pub dir: tempfile::TempDir,
+    /// The CLI's configuration directory, empty, so the tests never use the user's clusters.
+    pub config: tempfile::TempDir,
+}
+
+/// Reads a child's first `n` lines of stdout, then keeps draining it.
+fn first_lines(child: &mut Child, n: usize, what: &str) -> Vec<String> {
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = BufReader::new(stdout).lines();
+        for line in lines.by_ref().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let mut out = Vec::new();
+    while out.len() < n {
+        out.push(
+            rx.recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!("{what} should start")),
+        );
+    }
+    // Keep draining in the background thread; later lines are dropped.
+    std::thread::spawn(move || for _ in rx {});
+    out
+}
+
+fn spawn_server(dir: &Path, listen: &str) -> (Child, String, Option<String>) {
+    let mut child = Command::new(BIN)
+        .args([
+            "server",
+            "--listen",
+            listen,
+            "--poll-timeout",
+            "2s",
+            "--offline-after",
+            "3s",
+        ])
+        .arg("--state-dir")
+        .arg(dir)
+        .env(
+            "KIWI_NEST_LOG",
+            std::env::var("KIWI_NEST_LOG").unwrap_or_else(|_| "warn".into()),
+        )
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first = !dir.join("server.sqlite").exists();
+    let lines = first_lines(&mut child, if first { 2 } else { 1 }, "the server");
+    let admin = first.then(|| {
+        lines[0]
+            .strip_prefix("admin token: ")
+            .expect("the first start prints an admin token")
+            .to_string()
+    });
+    let url = lines
+        .last()
+        .unwrap()
+        .strip_prefix("listening on ")
+        .expect("the server prints its address")
+        .to_string();
+    (child, url, admin)
+}
+
+impl Server {
+    pub fn start() -> Server {
+        let dir = tempfile::tempdir().unwrap();
+        let (child, url, admin) = spawn_server(&dir.path().join("server"), "127.0.0.1:0");
+        Server {
+            child,
+            addr: url.trim_start_matches("http://").to_string(),
+            url,
+            admin: admin.unwrap(),
+            dir,
+            config: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    /// Kills the server and starts it again on the same state and address.
+    pub fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let (child, url, admin) = spawn_server(&self.dir.path().join("server"), &self.addr);
+        assert!(admin.is_none(), "a restart makes no new admin token");
+        assert_eq!(url, self.url);
+        self.child = child;
+    }
+
+    /// The bundle files the server keeps.
+    pub fn bundles(&self) -> usize {
+        std::fs::read_dir(self.dir.path().join("server/bundles"))
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".zip"))
+            .count()
+    }
+
+    /// Runs the CLI against this server with a token.
+    pub fn cli_as(&self, token: &str, args: &[&str]) -> Output {
+        Command::new(BIN)
+            .args(args)
+            .env("KIWI_NEST_SERVER", &self.url)
+            .env("KIWI_NEST_TOKEN", token)
+            .env("KIWI_NEST_CONFIG_DIR", self.config.path())
+            .env_remove("KIWI_NEST_NODE_API")
+            .env_remove("KIWI_NEST_CLUSTER")
+            .output()
+            .unwrap()
+    }
+
+    pub fn ok_as(&self, token: &str, args: &[&str]) -> String {
+        let out = self.cli_as(token, args);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "kiwi-nest {args:?} failed\nstdout: {stdout}\nstderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout
+    }
+
+    pub fn fails_as(&self, token: &str, args: &[&str]) -> String {
+        let out = self.cli_as(token, args);
+        assert!(
+            !out.status.success(),
+            "kiwi-nest {args:?} should fail\nstdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    /// Runs the CLI as the admin.
+    pub fn ok(&self, args: &[&str]) -> String {
+        self.ok_as(&self.admin, args)
+    }
+
+    pub fn fails(&self, args: &[&str]) -> String {
+        self.fails_as(&self.admin, args)
+    }
+
+    pub fn join_token(&self) -> String {
+        self.ok(&["token", "create", "join"]).trim().to_string()
+    }
+
+    pub fn nodes(&self) -> Vec<serde_json::Value> {
+        serde_json::from_str(&self.ok(&["node", "list", "--json"])).unwrap()
+    }
+
+    pub fn inspect(&self, app: &str) -> serde_json::Value {
+        serde_json::from_str(&self.ok(&["inspect", app, "--json"])).unwrap()
+    }
+
+    /// Waits until node `name` is online, or offline.
+    pub fn wait_online(&self, name: &str, online: bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if self.nodes().iter().any(|n| n["name"] == name && n["online"] == online) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "node {name} should be online: {online}");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A node joined to a [`Server`], run from the real binary. When dropped, it's killed, its projects are removed,
+/// and then its directories.
+pub struct ClusterNode {
+    child: Option<Child>,
+    pub name: String,
+    server: String,
+    pub gateway: u16,
+    pub prefix: String,
+    pub dir: tempfile::TempDir,
+    pub volumes: tempfile::TempDir,
+}
+
+impl ClusterNode {
+    pub fn join(server: &Server, name: &str, prefix: &str) -> ClusterNode {
+        let mut n = ClusterNode {
+            child: None,
+            name: name.into(),
+            server: server.url.clone(),
+            gateway: 0,
+            prefix: prefix.into(),
+            dir: tempfile::tempdir().unwrap(),
+            volumes: tempfile::tempdir_in(btrfs_dir().expect("KIWI_NEST_TEST_BTRFS_DIR")).unwrap(),
+        };
+        n.spawn(Some(server.join_token()));
+        n
+    }
+
+    fn spawn(&mut self, join_token: Option<String>) {
+        let mut cmd = Command::new(BIN);
+        cmd.args(["node", "--server", &self.server, "--name", &self.name])
+            .args(["--gateway-listen", "127.0.0.1:0", "--up-timeout", "2m"])
+            .arg("--state-dir")
+            .arg(self.dir.path().join("state"))
+            .arg("--volumes-dir")
+            .arg(self.volumes.path())
+            .args(["--project-prefix", &self.prefix])
+            .env(
+                "KIWI_NEST_LOG",
+                std::env::var("KIWI_NEST_LOG").unwrap_or_else(|_| "warn".into()),
+            )
+            .env_remove("KIWI_NEST_TOKEN")
+            .stdout(Stdio::piped());
+        if let Some(t) = join_token {
+            cmd.args(["--join-token", &t]);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let lines = first_lines(&mut child, 2, "the node");
+        self.gateway = lines[0]
+            .strip_prefix("gateway on http://")
+            .and_then(|a| a.rsplit(':').next())
+            .and_then(|p| p.parse().ok())
+            .expect("the node should print its gateway's address");
+        assert!(
+            lines[1].starts_with(&format!("node {} polling", self.name)),
+            "{lines:?}"
+        );
+        self.child = Some(child);
+    }
+
+    /// Kills the node agent (SIGKILL), wherever it was. Its apps keep running.
+    pub fn kill(&mut self) {
+        let mut c = self.child.take().expect("a running node");
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    /// Starts the node again on its state.
+    pub fn start(&mut self) {
+        assert!(self.child.is_none());
+        self.spawn(None);
+    }
+
+    pub fn state(&self, file: &str) -> String {
+        std::fs::read_to_string(self.dir.path().join("state").join(file)).unwrap_or_default()
+    }
+}
+
+impl Drop for ClusterNode {
+    fn drop(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        if std::env::var("KIWI_NEST_INTEGRATION").as_deref() == Ok("1") {
+            remove_projects(&self.prefix);
+        }
+    }
+}
