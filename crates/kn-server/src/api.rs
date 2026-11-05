@@ -369,6 +369,12 @@ async fn deploy(
         .await
         .map_err(|e| Error::Internal(e.into()))??;
     drop(scratch);
+    if let Some(reserved) = s.reserved_domain(&checked.domain) {
+        return Err(Error::Conflict(format!(
+            "domain `{}` is {reserved}, so no app can use it",
+            checked.domain
+        )));
+    }
     if !caller.is_admin() && !checked.shared_rw.is_empty() {
         return Err(Error::Forbidden(format!(
             "a deploy token can't mount shared volumes read-write ({}); mount them `ro` or `snapshot`, or deploy \
@@ -401,6 +407,7 @@ async fn deploy(
         "deploy saved"
     );
     s.hub.wake(saved.node_id);
+    s.ingress_changed();
     Ok((StatusCode::ACCEPTED, axum::Json(saved.accepted)).into_response())
 }
 
@@ -418,6 +425,7 @@ async fn delete(
         .call(move |c| apps::delete(c, &online, &name, q.keep_data, q.queue, store::now()))
         .await?;
     s.hub.wake(saved.node_id);
+    s.ingress_changed();
     Ok((StatusCode::ACCEPTED, axum::Json(saved.accepted)).into_response())
 }
 
@@ -828,6 +836,7 @@ async fn node_forget(
         // An open poll (with --force) is answered at once, and says the node was forgotten.
         s.hub.wake(f.node_id);
         s.hub.reported(f.node_id);
+        s.ingress_changed();
         tracing::warn!(node = f.forgot.node, released = gone, by = caller.id, "forgot a node");
     }
     Ok(axum::Json(f.forgot))

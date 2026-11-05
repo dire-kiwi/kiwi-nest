@@ -170,6 +170,8 @@ pub struct CheckedApp {
     pub memory_bytes: u64,
     /// Whether scheduled backups include it.
     pub backups: bool,
+    /// Its basic-auth users, checked by the ingress.
+    pub auth: Vec<crate::ingress::BasicAuth>,
 }
 
 fn bundle_error(e: kn_bundle::BundleError) -> Error {
@@ -226,6 +228,14 @@ pub fn check_app(zip: &Path, scratch: &Path, limits: &Limits) -> Result<CheckedA
         host_paths,
         memory_bytes,
         backups: m.backups,
+        auth: m
+            .auth
+            .iter()
+            .map(|a| crate::ingress::BasicAuth {
+                user: a.user.clone(),
+                hash: a.hash.clone(),
+            })
+            .collect(),
     })
 }
 

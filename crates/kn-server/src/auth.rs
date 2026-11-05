@@ -14,6 +14,9 @@
 //! - **Node** tokens are a node's own, for the agent link only. `node forget` revokes one but keeps it, so the node
 //!   is told it was forgotten (`410 Gone`) rather than that its token is wrong (`401`), which a token that was
 //!   never issued gets.
+//!
+//! Each node also has an ingress token (`kni_…`), given to it when it joins, which the ingress adds to every request
+//! it passes to the node's gateway; see [`crate::ingress`].
 
 use axum::extract::FromRequestParts;
 use axum::http::header;
@@ -36,6 +39,14 @@ pub fn generate(kind: TokenKind) -> String {
         TokenKind::Node => "knn",
     };
     format!("{prefix}_{}", hex::encode(bytes))
+}
+
+/// Makes a node's ingress token (`kni_…`), which the ingress adds to its requests to the node's gateway. Unlike
+/// the other tokens, it's stored as it is, since the ingress's configuration needs it.
+pub fn generate_ingress() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("the system's random number generator");
+    format!("kni_{}", hex::encode(bytes))
 }
 
 /// What's stored for a token.

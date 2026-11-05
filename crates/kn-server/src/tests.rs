@@ -20,6 +20,7 @@ struct Env {
     targets: Vec<kn_proto::backup::TargetConfig>,
     /// The running server, for what tests reach into.
     server: Option<Server>,
+    ingress: Option<ingress::IngressConfig>,
     url: String,
     admin: String,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -39,16 +40,25 @@ fn config(dir: &std::path::Path, targets: &[kn_proto::backup::TargetConfig]) -> 
 
 impl Env {
     async fn new() -> Env {
-        Env::with_targets(Vec::new()).await
+        Env::build(None, Vec::new()).await
+    }
+
+    async fn with_ingress(ingress: Option<ingress::IngressConfig>) -> Env {
+        Env::build(ingress, Vec::new()).await
     }
 
     async fn with_targets(targets: Vec<kn_proto::backup::TargetConfig>) -> Env {
+        Env::build(None, targets).await
+    }
+
+    async fn build(ingress: Option<ingress::IngressConfig>, targets: Vec<kn_proto::backup::TargetConfig>) -> Env {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env {
             dir,
             targets,
             server: None,
+            ingress,
             url: String::new(),
             admin: String::new(),
             stop: None,
@@ -61,7 +71,9 @@ impl Env {
     }
 
     async fn start(&mut self) -> Option<String> {
-        let (server, first) = Server::open(config(self.dir.path(), &self.targets)).await.unwrap();
+        let mut cfg = config(self.dir.path(), &self.targets);
+        cfg.ingress = self.ingress.clone();
+        let (server, first) = Server::open(cfg).await.unwrap();
         self.server = Some(server.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.url = format!("http://{}{}", listener.local_addr().unwrap(), kn_proto::API_PREFIX);
@@ -134,7 +146,9 @@ impl Env {
             .await
             .unwrap();
         assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
+        assert!(j.ingress_token.starts_with("kni_") && j.ingress_token.len() == 68);
         FakeNode {
+            ingress_token: j.ingress_token,
             token: j.token,
             id: j.node_id,
             facts: node_facts.clone(),
@@ -209,6 +223,7 @@ impl Env {
 
 struct FakeNode {
     token: String,
+    ingress_token: String,
     id: u64,
     facts: NodeFacts,
     since: u64,
@@ -261,11 +276,16 @@ fn facts(memory: u64) -> NodeFacts {
 
 /// A bundle ZIP with one service at `domain`.
 fn bundle(domain: &str) -> Vec<u8> {
+    bundle_with(domain, "")
+}
+
+/// A bundle ZIP with one service at `domain`, and more of `x-kiwi-nest`.
+fn bundle_with(domain: &str, extra: &str) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("compose.yaml"),
         format!(
-            "x-kiwi-nest: {{ domain: {domain}, service: web, port: 80 }}\n\
+            "x-kiwi-nest: {{ domain: {domain}, service: web, port: 80{extra} }}\n\
              services:\n  web:\n    image: x\n    mem_limit: 128m\n"
         ),
     )
@@ -700,6 +720,7 @@ async fn a_restart_loses_nothing() {
     // Tokens still work, and the node's desired state is as it was: polling from 0 gives the same changes.
     let mut again = FakeNode {
         token: a.token.clone(),
+        ingress_token: a.ingress_token.clone(),
         id: a.id,
         facts: a.facts.clone(),
         since: 0,
@@ -1810,4 +1831,155 @@ async fn scheduled_backups_go_to_nodes_and_skip_apps_that_opt_out() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
     let _ = CommandResult::Ok { value: json!(null) };
+}
+
+const HASH: &str = "$2y$05$abcdefghijklmnopqrstuuG3dNw1n3eO1n2Cx4M3jW7sXkEw0LZ6u";
+
+#[tokio::test]
+async fn the_ingress_routes_apps_to_their_nodes_and_the_api_never_shows_hashes() {
+    let (caddy, url) = ingress::tests::FakeCaddy::start().await;
+    let mut cfg = ingress::IngressConfig::new(url, ingress::Tls::Acme { email: None, ca: None });
+    cfg.api_domain = Some("kn.test".into());
+    cfg.sync_interval = Duration::from_millis(200);
+    let env = Env::with_ingress(Some(cfg)).await;
+    caddy.until("the first load", |c| !c.is_null()).await;
+    let mut a = env.join("a", 4 << 30).await;
+    let mut b = env.join("b", 8 << 30).await;
+    assert_ne!(a.ingress_token, b.ingress_token);
+    // A node that joined before ingress tokens asks for its own.
+    let r = env
+        .req(reqwest::Method::GET, "/agent/ingress-token", &a.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let t: kn_proto::agent::IngressToken = r.json().await.unwrap();
+    assert_eq!(t.ingress_token, a.ingress_token);
+    let r = env
+        .req(reqwest::Method::GET, "/agent/ingress-token", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    // b reports where the ingress reaches it; a doesn't.
+    b.facts.ingress = "10.0.0.6:7382".into();
+    env.poll(&mut a).await;
+    env.poll(&mut b).await;
+
+    // A deploy with basic auth: Caddy gets the route, to b's ingress address with b's token, and the hash.
+    let r = env
+        .req(reqwest::Method::PUT, "/apps/blog-pr1?node=b", &env.admin)
+        .header("content-type", "application/zip")
+        .body(bundle_with(
+            "blog-pr1.test",
+            &format!(", auth: [{{ user: preview, hash: '{HASH}' }}]"),
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::ACCEPTED, "{}", r.text().await.unwrap());
+    caddy
+        .until("blog-pr1 is routed", |c| c.to_string().contains("blog-pr1.test"))
+        .await;
+    let config = caddy.current().to_string();
+    assert!(config.contains("10.0.0.6:7382"), "{config}");
+    assert!(config.contains(&b.ingress_token), "{config}");
+    assert!(config.contains(HASH), "{config}");
+    assert!(!config.contains(&a.ingress_token), "{config}");
+
+    // An app on a node the ingress can't reach isn't routed.
+    let r = env.deploy(&env.admin, "shop", "shop.test", "node=a").await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!caddy.current().to_string().contains("shop.test"));
+
+    // The API never shows the hashes.
+    for path in ["/apps", "/apps/blog-pr1"] {
+        let text = env
+            .req(reqwest::Method::GET, path, &env.admin)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(!text.contains("$2y$") && !text.contains("preview"), "{path}: {text}");
+    }
+
+    // The server's API domain is kept for it.
+    let r = env.deploy(&env.admin, "sneaky", "kn.test", "node=b").await;
+    let (status, msg) = error(r).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(msg.contains("the server's API domain"), "{msg}");
+
+    // A deleted app's route goes once the delete is saved.
+    let r = env
+        .req(reqwest::Method::DELETE, "/apps/blog-pr1", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    caddy
+        .until("blog-pr1 isn't routed", |c| !c.to_string().contains("blog-pr1.test"))
+        .await;
+
+    // So do the routes of a node that's forgotten.
+    let r = env.deploy(&env.admin, "docs", "docs.test", "node=b").await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    caddy
+        .until("docs is routed", |c| c.to_string().contains("docs.test"))
+        .await;
+    let r = env.post("/nodes/b/forget?force=true").await;
+    assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
+    caddy
+        .until("b's routes are gone", |c| {
+            let c = c.to_string();
+            !c.contains("docs.test") && !c.contains(&b.ingress_token)
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn apps_deployed_before_the_server_kept_auth_get_it_from_their_bundles() {
+    let mut env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    env.poll(&mut a).await;
+    let r = env
+        .req(reqwest::Method::PUT, "/apps/blog", &env.admin)
+        .header("content-type", "application/zip")
+        .body(bundle_with(
+            "blog.test",
+            &format!(", auth: [{{ user: preview, hash: '{HASH}' }}]"),
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let r = env.deploy(&env.admin, "shop", "shop.test", "").await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    // As if they were deployed before migration 3; shop's bundle has gone missing too.
+    let db = env.dir.path().join("server/server.sqlite");
+    let c = rusqlite::Connection::open(&db).unwrap();
+    c.execute("UPDATE apps SET auth = NULL", []).unwrap();
+    let shop: String = c
+        .query_row("SELECT bundle_digest FROM apps WHERE name = 'shop'", [], |r| r.get(0))
+        .unwrap();
+    drop(c);
+    std::fs::remove_file(
+        env.dir
+            .path()
+            .join("server/bundles")
+            .join(format!("{}.zip", shop.replace(':', "-"))),
+    )
+    .unwrap();
+    env.restart().await;
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let auth = |name: &str| -> Option<String> {
+        c.query_row("SELECT auth FROM apps WHERE name = ?1", [name], |r| r.get(0))
+            .unwrap()
+    };
+    let blog = auth("blog").expect("read from blog's bundle");
+    assert!(blog.contains(HASH), "{blog}");
+    assert_eq!(auth("shop"), None, "unknown, so the ingress won't route it");
 }

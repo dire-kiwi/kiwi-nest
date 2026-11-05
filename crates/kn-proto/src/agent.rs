@@ -8,6 +8,7 @@
 //! | Route | Body | Response |
 //! | --- | --- | --- |
 //! | `POST /agent/join` | [`JoinRequest`] | [`JoinResponse`] |
+//! | `GET /agent/ingress-token` | | [`IngressToken`], for a node that joined before ingress tokens |
 //! | `POST /agent/poll` | [`PollRequest`] | [`PollResponse`], once something changed or the wait is over |
 //! | `POST /agent/report` | [`Report`] | `204 No Content`, at once |
 //! | `GET /agent/bundles/{digest}` | | the bundle's ZIP |
@@ -71,7 +72,20 @@ pub struct JoinResponse {
     pub name: String,
     /// The node's own token, which the server stores only as a hash.
     pub token: String,
+    /// The token the ingress adds to every request it sends to the node's gateway ([`INGRESS_HEADER`]).
+    #[serde(default)]
+    pub ingress_token: String,
 }
+
+/// `GET /agent/ingress-token`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngressToken {
+    pub ingress_token: String,
+}
+
+/// The header that carries a node's ingress token, from the ingress to the node's gateway, which checks it and
+/// removes it.
+pub const INGRESS_HEADER: &str = "kiwi-nest-ingress";
 
 /// What a node is.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -95,9 +109,13 @@ pub struct NodeFacts {
     /// The Compose project prefix of its apps.
     #[serde(default)]
     pub project_prefix: String,
-    /// The address its gateway listens on.
+    /// The address its gateway listens on, on loopback.
     #[serde(default)]
     pub gateway: String,
+    /// The address its gateway listens on for the ingress (on the node's private network), which needs the node's
+    /// ingress token; empty if it has none, so the ingress can't reach its apps.
+    #[serde(default)]
+    pub ingress: String,
     /// The version of the agent link it speaks ([`PROTOCOL`]); 0 from a node of version 1, which didn't say.
     #[serde(default)]
     pub protocol: u32,

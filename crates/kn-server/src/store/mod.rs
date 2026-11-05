@@ -51,9 +51,14 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: MIGRATION_2,
         then: Some(nests::backfill),
     },
-    // 3: backups: whether scheduled backups include an app, and the backup an app or volume was restored from.
+    // 3: each app's basic-auth users, for the ingress, and each node's ingress token.
     Migration {
         sql: MIGRATION_3,
+        then: None,
+    },
+    // 4: backups: whether scheduled backups include an app, and the backup an app or volume was restored from.
+    Migration {
+        sql: MIGRATION_4,
         then: None,
     },
 ];
@@ -168,7 +173,19 @@ const MIGRATION_2: &str = r#"
     CREATE INDEX volumes_by_nest ON volumes (nest);
     "#;
 
+// 3: what the ingress needs: each app's basic-auth users, and each node's ingress token.
 const MIGRATION_3: &str = r#"
+    -- The users and bcrypt hashes from the app's bundle, as JSON. NULL for an app deployed before this migration
+    -- until the server has read them from its bundle; the ingress doesn't route an app whose users aren't known.
+    ALTER TABLE apps ADD COLUMN auth TEXT;
+    -- The token the ingress adds to its requests to the node's gateway. Kept as it is, since the ingress's
+    -- configuration needs it (unlike the node's own token, kept as a hash).
+    ALTER TABLE nodes ADD COLUMN ingress_token TEXT;
+    UPDATE nodes SET ingress_token = 'kni_' || lower(hex(randomblob(32)));
+    "#;
+
+// 4: backups: whether scheduled backups include an app, and the backup an app or volume was restored from.
+const MIGRATION_4: &str = r#"
     ALTER TABLE apps ADD COLUMN backups INTEGER NOT NULL DEFAULT 1;
     -- `{"target": …, "key": …}`, given with `--restore`; the node only uses it on the app's first deploy.
     ALTER TABLE apps ADD COLUMN restore TEXT;

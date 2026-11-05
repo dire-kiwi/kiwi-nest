@@ -24,7 +24,11 @@ struct Env {
     fake: Arc<Fake>,
     apps: Apps,
     gw: SocketAddr,
+    /// The listener for the ingress, which needs [`INGRESS_TOKEN`].
+    ingress: SocketAddr,
 }
+
+const INGRESS_TOKEN: &str = "kni_0123456789abcdef";
 
 struct Reply {
     status: StatusCode,
@@ -54,8 +58,27 @@ impl Env {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gw = listener.local_addr().unwrap();
-        tokio::spawn(super::serve(listener, apps.clone(), std::future::pending()));
-        Env { dir, fake, apps, gw }
+        tokio::spawn(super::serve(
+            listener,
+            apps.clone(),
+            super::Access::Local,
+            std::future::pending(),
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ingress = listener.local_addr().unwrap();
+        tokio::spawn(super::serve(
+            listener,
+            apps.clone(),
+            super::Access::Ingress(INGRESS_TOKEN.into()),
+            std::future::pending(),
+        ));
+        Env {
+            dir,
+            fake,
+            apps,
+            gw,
+            ingress,
+        }
     }
 
     /// Deploys `name` at `NAME.test`, with one service, `web`.
@@ -109,7 +132,11 @@ impl Env {
     }
 
     async fn send(&self, req: Request<Full<Bytes>>) -> Reply {
-        let stream = TcpStream::connect(self.gw).await.unwrap();
+        self.send_to(self.gw, req).await
+    }
+
+    async fn send_to(&self, addr: SocketAddr, req: Request<Full<Bytes>>) -> Reply {
+        let stream = TcpStream::connect(addr).await.unwrap();
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .unwrap();
@@ -591,4 +618,157 @@ async fn a_restarted_agent_adopts_running_apps_without_restarting_them() {
     // Suspended: stays so.
     assert_eq!(env.phase("off"), Phase::Suspended);
     assert_eq!(env.starts("off"), 0);
+}
+
+/// A request to `/headers` on `host`, with `headers`.
+fn headers_request(host: &str, headers: &[(&str, &str)]) -> Request<Full<Bytes>> {
+    let mut r = Request::get("/headers").header("host", host);
+    for (k, v) in headers {
+        r = r.header(*k, *v);
+    }
+    r.body(Full::default()).unwrap()
+}
+
+#[tokio::test]
+async fn the_ingress_listener_takes_only_requests_with_the_token() {
+    let env = Env::new().await;
+    env.deploy("blog", "1s").await;
+    env.until_stopped("blog").await;
+    let token = ("kiwi-nest-ingress", INGRESS_TOKEN);
+    // Without the token, with a wrong one, or with two, the answer is 403, whatever the host, and nothing wakes.
+    for headers in [
+        vec![],
+        vec![("kiwi-nest-ingress", "kni_wrong")],
+        vec![("kiwi-nest-ingress", &INGRESS_TOKEN[..INGRESS_TOKEN.len() - 1])],
+        vec![token, ("kiwi-nest-ingress", "kni_wrong")],
+        vec![token, token],
+    ] {
+        for host in ["blog.test", "other.test"] {
+            let r = env.send_to(env.ingress, headers_request(host, &headers)).await;
+            assert_eq!(r.status, StatusCode::FORBIDDEN, "{host} {headers:?}");
+        }
+    }
+    let r = env
+        .send_to(
+            env.ingress,
+            Request::get("/")
+                .header("host", "blog.test")
+                .header("kiwi-nest-status", "1")
+                .body(Full::default())
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "not even the starting page's poll");
+    assert_eq!(env.starts("blog"), 0);
+
+    // With it, the request goes through (waking the app), without the token, and with the ingress's forwarding
+    // headers as they were.
+    let r = env
+        .send_to(
+            env.ingress,
+            headers_request(
+                "blog.test",
+                &[
+                    token,
+                    ("x-forwarded-for", "203.0.113.7"),
+                    ("x-forwarded-proto", "https"),
+                    ("x-forwarded-host", "blog.test"),
+                    ("x-real-ip", "10.0.0.1"),
+                    ("forwarded", "for=10.0.0.1"),
+                    ("x-forwarded-port", "1"),
+                ],
+            ),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    assert!(!r.body.contains("kiwi-nest-ingress"), "{}", r.body);
+    assert!(!r.body.contains(INGRESS_TOKEN), "{}", r.body);
+    assert!(r.body.contains("x-forwarded-for: 203.0.113.7\n"), "{}", r.body);
+    assert!(r.body.contains("x-forwarded-proto: https\n"), "{}", r.body);
+    // Those the ingress doesn't set came from the client, so they're removed.
+    assert!(
+        !r.body.contains("x-real-ip") && !r.body.contains("forwarded:") && !r.body.contains("x-forwarded-port"),
+        "{}",
+        r.body
+    );
+    assert_eq!(env.starts("blog"), 1);
+    // An unknown host still gets 404.
+    let r = env.send_to(env.ingress, headers_request("other.test", &[token])).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn forwarding_headers_without_the_token_are_replaced() {
+    let env = Env::new().await;
+    env.deploy("blog", "0").await;
+    let r = env
+        .send(headers_request(
+            "blog.test",
+            &[
+                ("x-forwarded-for", "203.0.113.7"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-host", "bank.example"),
+                ("forwarded", "for=203.0.113.7"),
+                ("x-real-ip", "203.0.113.7"),
+                ("kiwi-nest-ingress", "kni_anything"),
+            ],
+        ))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let b = &r.body;
+    assert!(b.contains("x-forwarded-for: 127.0.0.1\n"), "{b}");
+    assert!(b.contains("x-forwarded-proto: http\n"), "{b}");
+    assert!(b.contains("x-forwarded-host: blog.test\n"), "{b}");
+    assert!(!b.contains("203.0.113.7") && !b.contains("bank.example"), "{b}");
+    assert!(!b.contains("kiwi-nest-ingress"), "{b}");
+}
+
+#[tokio::test]
+async fn a_websocket_through_the_ingress_listener_needs_the_token_and_works_with_it() {
+    let env = Env::new().await;
+    env.deploy("blog", "0").await;
+    for token in ["", "kiwi-nest-ingress: kni_wrong\r\n"] {
+        let mut s = TcpStream::connect(env.ingress).await.unwrap();
+        s.write_all(
+            format!("GET /ws HTTP/1.1\r\nHost: blog.test\r\n{token}Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut buf = [0u8; 12];
+        s.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"HTTP/1.1 403");
+    }
+    let mut s = TcpStream::connect(env.ingress).await.unwrap();
+    s.write_all(
+        format!(
+            "GET /ws HTTP/1.1\r\nHost: blog.test\r\nkiwi-nest-ingress: {INGRESS_TOKEN}\r\nConnection: Upgrade\r\n\
+             Upgrade: websocket\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut b = [0u8; 1];
+        assert_eq!(s.read(&mut b).await.unwrap(), 1);
+        head.push(b[0]);
+    }
+    assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 101"));
+    echo(&mut s, b"through the ingress").await;
+}
+
+#[test]
+fn an_empty_ingress_token_admits_nobody() {
+    let access = super::Access::Ingress("".into());
+    let mut req = Request::get("/").header("kiwi-nest-ingress", "").body(()).unwrap();
+    assert_eq!(super::admit(&access, &mut req), super::Admitted::Refused);
+    let access = super::Access::Ingress(INGRESS_TOKEN.into());
+    let mut req = Request::get("/")
+        .header("kiwi-nest-ingress", INGRESS_TOKEN)
+        .body(())
+        .unwrap();
+    assert_eq!(super::admit(&access, &mut req), super::Admitted::FromIngress);
+    assert!(!req.headers().contains_key("kiwi-nest-ingress"));
 }

@@ -165,8 +165,34 @@ pub fn parse_duration(s: &str) -> Option<u64> {
     (any && number.is_empty()).then_some(total)
 }
 
-fn is_bcrypt(hash: &str) -> bool {
-    hash.len() == 60 && ["$2a$", "$2b$", "$2y$"].iter().any(|p| hash.starts_with(p))
+/// Whether `hash` is a bcrypt hash: `$2a$`, `$2b$` or `$2y$`, a cost from 04 to 31, `$`, and 53 characters of
+/// bcrypt's base64 (the salt, then the hash). Anything else is refused here, since the ingress would refuse the
+/// whole cluster's configuration over one bad hash.
+pub fn is_bcrypt(hash: &str) -> bool {
+    let b = hash.as_bytes();
+    b.len() == 60
+        && b[0] == b'$'
+        && b[1] == b'2'
+        && matches!(b[2], b'a' | b'b' | b'y')
+        && b[3] == b'$'
+        && b[4].is_ascii_digit()
+        && b[5].is_ascii_digit()
+        && (4..=31).contains(&((b[4] - b'0') * 10 + (b[5] - b'0')))
+        && b[6] == b'$'
+        && b[7..]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'/'))
+}
+
+/// Whether `user` is a basic-auth user name kiwi-nest accepts: not empty, at most 64 bytes, no `:` (which ends the
+/// user name in the header), no spaces or control characters, and no `{` or `}` (which the ingress would read as
+/// placeholders).
+fn is_valid_user(user: &str) -> bool {
+    !user.is_empty()
+        && user.len() <= 64
+        && !user
+            .chars()
+            .any(|c| matches!(c, ':' | '{' | '}') || c.is_control() || c.is_whitespace())
 }
 
 /// Parses `x-kiwi-nest`, returning every problem found.
@@ -251,21 +277,18 @@ pub fn parse(value: &Value) -> Result<Manifest, Vec<Problem>> {
                         .as_mapping()
                         .is_some_and(|m| m.keys().any(|k| !matches!(k.as_str(), Some("user" | "hash"))));
                     match (user, hash) {
-                        (Some(u), Some(h))
-                            if !extra
-                                && !u.is_empty()
-                                && !u.contains(':')
-                                && !u.chars().any(|c| c.is_control() || c.is_whitespace())
-                                && is_bcrypt(h) =>
-                        {
-                            m.auth.push(BasicAuth {
-                                user: u.to_string(),
-                                hash: h.to_string(),
-                            })
+                        (Some(u), Some(_)) if m.auth.iter().any(|a| a.user == u) => {
+                            refuse(&format!("auth[{i}]"), format!("user `{u}` is listed twice"))
                         }
+                        (Some(u), Some(h)) if !extra && is_valid_user(u) && is_bcrypt(h) => m.auth.push(BasicAuth {
+                            user: u.to_string(),
+                            hash: h.to_string(),
+                        }),
                         _ => refuse(
                             &format!("auth[{i}]"),
-                            "must be `{ user, hash }`, with a user name without `:` or spaces and a bcrypt hash".into(),
+                            "must be `{ user, hash }`, with a user name without `:`, `{`, `}` or spaces and a bcrypt \
+                             hash"
+                                .into(),
                         ),
                     }
                 }
@@ -483,6 +506,28 @@ backups: false
             ("idle_timeout: -1", "x-kiwi-nest.idle_timeout"),
             ("auth: [{ user: a, hash: plain }]", "x-kiwi-nest.auth[0]"),
             ("auth: [{ user: 'a:b', hash: plain }]", "x-kiwi-nest.auth[0]"),
+            (
+                "auth: [{ user: 'a:b', hash: '$2y$05$abcdefghijklmnopqrstuuG3dNw1n3eO1n2Cx4M3jW7sXkEw0LZ6u' }]",
+                "x-kiwi-nest.auth[0]",
+            ),
+            (
+                "auth: [{ user: '{env.HOME}', hash: '$2y$05$abcdefghijklmnopqrstuuG3dNw1n3eO1n2Cx4M3jW7sXkEw0LZ6u' }]",
+                "x-kiwi-nest.auth[0]",
+            ),
+            (
+                "auth: [{ user: 'a b', hash: '$2y$05$abcdefghijklmnopqrstuuG3dNw1n3eO1n2Cx4M3jW7sXkEw0LZ6u' }]",
+                "x-kiwi-nest.auth[0]",
+            ),
+            (
+                "auth: [{ user: a, hash: '$2y$05$abcdefghijklmnopqrstuuG3dNw1n3eO1n2Cx4M3jW7sXkEw0LZ6u', \
+                 role: x }]",
+                "x-kiwi-nest.auth[0]",
+            ),
+            (
+                "auth: [{ user: a, hash: '$2y$05$abcdefghijklmnopqrstuuG3dNw1n3eO1n2Cx4M3jW7sXkEw0LZ6u' }, \
+                 { user: a, hash: '$2y$05$abcdefghijklmnopqrstuuG3dNw1n3eO1n2Cx4M3jW7sXkEw0LZ6u' }]",
+                "x-kiwi-nest.auth[1]: user `a` is listed twice",
+            ),
             ("auth: { user: a }", "x-kiwi-nest.auth"),
             ("shared: { corpus: { target: corpus } }", "x-kiwi-nest.shared.corpus"),
             (
@@ -518,6 +563,32 @@ backups: false
                 .join("\n");
             let p = problems(&yaml);
             assert!(p.contains(expect), "{extra}: {p}");
+        }
+    }
+
+    #[test]
+    fn only_bcrypt_hashes_are_accepted() {
+        assert!(is_bcrypt(HASH));
+        for prefix in ["$2a$", "$2b$", "$2y$"] {
+            assert!(is_bcrypt(&format!("{prefix}{}", &HASH[4..])), "{prefix}");
+        }
+        assert!(is_bcrypt(&format!("$2y$31{}", &HASH[6..])));
+        for bad in [
+            // An unknown version, a cost out of range, a missing `$`, a character outside bcrypt's base64, the wrong
+            // length, and other kinds of hash.
+            format!("$2x${}", &HASH[4..]),
+            format!("$2y$03{}", &HASH[6..]),
+            format!("$2y$32{}", &HASH[6..]),
+            format!("$2y$1a{}", &HASH[6..]),
+            format!("$2y$05#{}", &HASH[7..]),
+            format!("{}+", &HASH[..59]),
+            format!("{}{{", &HASH[..59]),
+            HASH[..59].to_string(),
+            format!("{HASH}a"),
+            "$apr1$abcdefgh$abcdefghijklmnopqrstuv".into(),
+            "plain".into(),
+        ] {
+            assert!(!is_bcrypt(&bad), "{bad}");
         }
     }
 

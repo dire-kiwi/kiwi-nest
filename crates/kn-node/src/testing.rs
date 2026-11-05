@@ -1,8 +1,9 @@
 //! A fake runtime for unit tests: each "project" is a small HTTP server on the app's loopback port, started and
 //! stopped as `docker compose` would start and stop its containers.
 //!
-//! The server answers `/` with `hello from PROJECT`, `/echo` with the request, `/stream?n=N` with N lines a tenth
-//! of a second apart, and `/ws` (an upgrade) by echoing bytes back.
+//! The server answers `/` with `hello from PROJECT`, `/echo` with the request, `/headers` with the request's
+//! headers (`name: value` lines, sorted), `/stream?n=N` with N lines a tenth of a second apart, and `/ws` (an
+//! upgrade) by echoing bytes back.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -347,6 +348,15 @@ async fn app(project: &str, mut req: Request<Incoming>) -> Response<AppBody> {
             let mut out = head.into_bytes();
             out.extend_from_slice(&body);
             Response::new(full(out))
+        }
+        "/headers" => {
+            let mut lines: Vec<String> = req
+                .headers()
+                .iter()
+                .map(|(k, v)| format!("{k}: {}\n", v.to_str().unwrap_or("?")))
+                .collect();
+            lines.sort();
+            Response::new(full(lines.concat()))
         }
         "/stream" => {
             let n: usize = req

@@ -259,7 +259,10 @@ pub fn uid_gid() -> String {
 /// A server run from the real binary, on a loopback port of its own, with short poll timeouts. Killed when dropped.
 pub struct Server {
     child: Child,
+    /// Where the CLI and nodes reach the server: its own address, or (once set) the ingress's.
     pub url: String,
+    /// A CA certificate for `url`, such as the ingress's internal CA.
+    pub ca_cert: Option<PathBuf>,
     addr: String,
     pub admin: String,
     pub dir: tempfile::TempDir,
@@ -343,6 +346,7 @@ impl Server {
             child,
             addr: url.trim_start_matches("http://").to_string(),
             url,
+            ca_cert: None,
             admin: admin.unwrap(),
             dir,
             extra,
@@ -360,6 +364,7 @@ impl Server {
             child,
             addr: url.trim_start_matches("http://").to_string(),
             url,
+            ca_cert: None,
             admin: admin.into(),
             dir,
             extra,
@@ -371,6 +376,11 @@ impl Server {
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// The address the server itself listens on.
+    pub fn direct_url(&self) -> String {
+        format!("http://{}", self.addr)
     }
 
     /// Kills the server and starts it again on the same state and address.
@@ -385,7 +395,7 @@ impl Server {
         std::thread::sleep(outage);
         let (child, url, admin) = spawn_server(&self.dir.path().join("server"), &self.addr, &self.extra);
         assert!(admin.is_none(), "a restart makes no new admin token");
-        assert_eq!(url, self.url);
+        assert_eq!(url, self.direct_url());
         self.child = child;
     }
 
@@ -399,15 +409,18 @@ impl Server {
 
     /// Runs the CLI against this server with a token.
     pub fn cli_as(&self, token: &str, args: &[&str]) -> Output {
-        Command::new(BIN)
-            .args(args)
+        let mut cmd = Command::new(BIN);
+        cmd.args(args)
             .env("KIWI_NEST_SERVER", &self.url)
             .env("KIWI_NEST_TOKEN", token)
             .env("KIWI_NEST_CONFIG_DIR", self.config.path())
             .env_remove("KIWI_NEST_NODE_API")
             .env_remove("KIWI_NEST_CLUSTER")
-            .output()
-            .unwrap()
+            .env_remove("KIWI_NEST_CA_CERT");
+        if let Some(ca) = &self.ca_cert {
+            cmd.env("KIWI_NEST_CA_CERT", ca);
+        }
+        cmd.output().unwrap()
     }
 
     pub fn ok_as(&self, token: &str, args: &[&str]) -> String {
@@ -478,7 +491,11 @@ pub struct ClusterNode {
     child: Option<Child>,
     pub name: String,
     server: String,
+    ca_cert: Option<PathBuf>,
+    extra: Vec<String>,
     pub gateway: u16,
+    /// The port its gateway listens on for the ingress (with `--ingress-listen`).
+    pub ingress: Option<u16>,
     pub prefix: String,
     pub dir: tempfile::TempDir,
     pub volumes: tempfile::TempDir,
@@ -486,11 +503,19 @@ pub struct ClusterNode {
 
 impl ClusterNode {
     pub fn join(server: &Server, name: &str, prefix: &str) -> ClusterNode {
+        ClusterNode::join_with(server, name, prefix, &[])
+    }
+
+    /// Joins with more flags.
+    pub fn join_with(server: &Server, name: &str, prefix: &str, extra: &[&str]) -> ClusterNode {
         let mut n = ClusterNode {
             child: None,
             name: name.into(),
             server: server.url.clone(),
+            ca_cert: server.ca_cert.clone(),
+            extra: extra.iter().map(|s| s.to_string()).collect(),
             gateway: 0,
+            ingress: None,
             prefix: prefix.into(),
             dir: tempfile::tempdir().unwrap(),
             volumes: tempfile::tempdir_in(btrfs_dir().expect("KIWI_NEST_TEST_BTRFS_DIR")).unwrap(),
@@ -509,6 +534,8 @@ impl ClusterNode {
             .arg("--volumes-dir")
             .arg(self.volumes.path())
             .args(["--project-prefix", &self.prefix])
+            .args(&self.extra)
+            .env_remove("KIWI_NEST_CA_CERT")
             .env(
                 "KIWI_NEST_LOG",
                 std::env::var("KIWI_NEST_LOG").unwrap_or_else(|_| "warn".into()),
@@ -518,19 +545,31 @@ impl ClusterNode {
         if let Some(t) = join_token {
             cmd.args(["--join-token", &t]);
         }
+        if let Some(ca) = &self.ca_cert {
+            cmd.arg("--ca-cert").arg(ca);
+        }
         cmd
     }
 
     fn spawn(&mut self, join_token: Option<String>) {
         let mut child = self.command(join_token).stdout(Stdio::piped()).spawn().unwrap();
-        let lines = first_lines(&mut child, 2, "the node");
-        self.gateway = lines[0]
-            .strip_prefix("gateway on http://")
-            .and_then(|a| a.rsplit(':').next())
-            .and_then(|p| p.parse().ok())
-            .expect("the node should print its gateway's address");
+        let ingress = self.extra.iter().any(|a| a == "--ingress-listen");
+        let lines = first_lines(&mut child, if ingress { 3 } else { 2 }, "the node");
+        let port = |line: &str, prefix: &str| -> u16 {
+            line.strip_prefix(prefix)
+                .and_then(|a| a.rsplit(':').next())
+                .and_then(|p| p.parse().ok())
+                .unwrap_or_else(|| panic!("the node should print `{prefix}ADDR`: {lines:?}"))
+        };
+        self.gateway = port(&lines[0], "gateway on http://");
+        if ingress {
+            self.ingress = Some(port(&lines[1], "ingress gateway on http://"));
+        }
         assert!(
-            lines[1].starts_with(&format!("node {} polling", self.name)),
+            lines
+                .last()
+                .unwrap()
+                .starts_with(&format!("node {} polling", self.name)),
             "{lines:?}"
         );
         self.child = Some(child);
@@ -598,4 +637,69 @@ impl Drop for ClusterNode {
         // Read-only snapshots (kept for backups) aren't removed with the directory.
         let _ = kn_btrfs::remove_tree(self.volumes.path());
     }
+}
+
+/// A Python web app that takes two seconds to start listening, answers `/` with `hello`, and echoes bytes on a
+/// WebSocket at `/ws`, at `domain`, with more of `x-kiwi-nest` in `extra` (such as `, auth: [...]`).
+pub fn write_python_bundle(dir: &Path, domain: &str, idle_timeout: &str, extra: &str) {
+    std::fs::create_dir_all(dir.join("app")).unwrap();
+    std::fs::write(
+        dir.join("app/server.py"),
+        r#"import base64, hashlib, http.server, time
+
+time.sleep(2)
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/ws":
+            key = self.headers["Sec-WebSocket-Key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+            self.send_response(101)
+            self.send_header("Upgrade", "websocket")
+            self.send_header("Connection", "Upgrade")
+            self.send_header("Sec-WebSocket-Accept", base64.b64encode(hashlib.sha1(key.encode()).digest()).decode())
+            self.end_headers()
+            self.wfile.flush()
+            self.close_connection = True
+            while True:
+                data = self.connection.recv(4096)
+                if not data:
+                    return
+                self.connection.sendall(data)
+        body = b"hello"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+http.server.ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("compose.yaml"),
+        format!(
+            r#"x-kiwi-nest: {{ domain: {domain}, service: web, port: 8080, idle_timeout: {idle_timeout}{extra} }}
+services:
+  web:
+    image: python:3.13-alpine
+    command: ["python", "-u", "/app/server.py"]
+    user: "{}"
+    init: true
+    volumes: ["./app:/app"]
+    restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/')"]
+      interval: 1s
+      retries: 60
+"#,
+            uid_gid(),
+        ),
+    )
+    .unwrap();
 }

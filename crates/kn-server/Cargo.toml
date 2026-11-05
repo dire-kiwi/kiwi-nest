@@ -16,7 +16,9 @@ humantime.workspace = true
 kn-backup.workspace = true
 kn-bundle.workspace = true
 kn-proto.workspace = true
+reqwest.workspace = true
 rusqlite.workspace = true
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
@@ -27,6 +29,3 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
-[dev-dependencies]
-reqwest.workspace = true
-rustls.workspace = true
