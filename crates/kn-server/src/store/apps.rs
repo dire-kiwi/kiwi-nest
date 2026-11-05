@@ -307,7 +307,12 @@ pub fn deploy(
         .host_paths
         .iter()
         .filter(|p| !facts.allowed_host_paths.iter().any(|a| Path::new(p).starts_with(a)))
-        .map(|p| format!("host path `{p}` isn't allowed on node `{}` (see `--allow-host-path`)", node.name))
+        .map(|p| {
+            format!(
+                "host path `{p}` isn't allowed on node `{}` (see `--allow-host-path`)",
+                node.name
+            )
+        })
         .collect();
     if !disallowed.is_empty() {
         return Err(Error::Refused {
@@ -573,9 +578,7 @@ pub fn desired_since(c: &Connection, node_id: u64, since: u64) -> Result<(u64, V
         .map(|r| {
             let a = r?;
             let want = match a.state {
-                State::Deleting => AppWant::Delete {
-                    keep_data: a.keep_data,
-                },
+                State::Deleting => AppWant::Delete { keep_data: a.keep_data },
                 _ => AppWant::Deploy {
                     bundle_digest: a.bundle_digest.clone().unwrap_or_default(),
                     from: a.from_app.clone(),

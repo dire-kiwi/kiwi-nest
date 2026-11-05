@@ -97,8 +97,7 @@ impl Server {
     /// Opens the server's state, creating it if needed. On the first start (no admin token yet) it makes an admin
     /// token and returns it: the only time it's shown.
     pub async fn open(cfg: ServerConfig) -> anyhow::Result<(Server, Option<String>)> {
-        std::fs::create_dir_all(&cfg.state_dir)
-            .with_context(|| format!("creating {}", cfg.state_dir.display()))?;
+        std::fs::create_dir_all(&cfg.state_dir).with_context(|| format!("creating {}", cfg.state_dir.display()))?;
         let store = Store::open(&cfg.state_dir.join("server.sqlite"))?;
         let bundles = Arc::new(Bundles::open(cfg.state_dir.join("bundles"))?);
         let hub = Arc::new(Hub::new(cfg.offline_after));

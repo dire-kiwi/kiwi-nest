@@ -50,7 +50,10 @@ pub fn router() -> Router<Server> {
             get(volume_inspect).put(volume_create).delete(volume_delete),
         )
         .route(&format!("{p}/volumes/{{name}}/data"), put(volume_load))
-        .route(&format!("{p}/volumes/{{name}}/changes/{{generation}}"), get(volume_change))
+        .route(
+            &format!("{p}/volumes/{{name}}/changes/{{generation}}"),
+            get(volume_change),
+        )
         .route(
             &format!("{p}/volumes/{{name}}/snapshots/{{app}}"),
             delete_route(volume_delete_snapshot),
@@ -107,7 +110,9 @@ fn check_zip(headers: &HeaderMap) -> Result<()> {
         "application/json" => Err(Error::BadRequest(
             "the server can't read a directory on a node; upload the bundle as a ZIP".into(),
         )),
-        other => Err(Error::BadRequest(format!("send a ZIP as application/zip, not {other:?}"))),
+        other => Err(Error::BadRequest(format!(
+            "send a ZIP as application/zip, not {other:?}"
+        ))),
     }
 }
 
@@ -228,7 +233,10 @@ fn result<T: DeserializeOwned>(o: Outcome) -> Result<T> {
 
 /// Asks an app's node for it, adding what the server knows.
 async fn inspect_on_node(s: &Server, v: &View) -> Result<AppInfo> {
-    let node = v.node.as_ref().ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
+    let node = v
+        .node
+        .as_ref()
+        .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
     let mut info: AppInfo = result(
         s.command(
             node.id,
@@ -245,10 +253,7 @@ async fn inspect_on_node(s: &Server, v: &View) -> Result<AppInfo> {
 }
 
 async fn list(State(s): State<Server>, caller: Caller) -> Result<axum::Json<Vec<AppSummary>>> {
-    let (rows, nodes) = s
-        .store
-        .call(|c| Ok((apps::apps(c)?, nodes::list(c)?)))
-        .await?;
+    let (rows, nodes) = s.store.call(|c| Ok((apps::apps(c)?, nodes::list(c)?))).await?;
     let nodes: HashMap<u64, Node> = nodes.into_iter().map(|n| (n.id, n)).collect();
     Ok(axum::Json(
         rows.into_iter()
@@ -355,14 +360,17 @@ async fn wait_change(s: &Server, kind: Kind, name: String, generation: u64, wait
     };
     let (_, node_id) = status(name.clone()).await?;
     let mut reports = s.hub.node(node_id).reports.subscribe();
+    let was_online = s.hub.is_online(node_id);
     loop {
         let (mut st, node_id) = status(name.clone()).await?;
         st.node_online = s.hub.is_online(node_id);
-        if st.done || tokio::time::Instant::now() >= deadline {
+        // Answer early when the node goes offline, so the caller can say so.
+        if st.done || tokio::time::Instant::now() >= deadline || (was_online && !st.node_online) {
             return Ok(st);
         }
         tokio::select! {
             r = reports.changed() => { if r.is_err() { return Ok(st); } }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             _ = tokio::time::sleep_until(deadline) => {}
             _ = s.stop.cancelled() => return Ok(st),
         }
@@ -387,8 +395,13 @@ async fn logs(
 ) -> Result<Response> {
     caller.manage(&name)?;
     let v = view(&s, &name).await?;
-    let node = v.node.as_ref().ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
-    let outcome = s.command(node.id, &node.name, Action::Logs { app: name, query }).await?;
+    let node = v
+        .node
+        .as_ref()
+        .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
+    let outcome = s
+        .command(node.id, &node.name, Action::Logs { app: name, query })
+        .await?;
     let text = [(header::CONTENT_TYPE, "text/plain; charset=utf-8")];
     match outcome {
         Outcome::Stream(rx) => {
@@ -405,7 +418,10 @@ async fn logs(
 async fn app_command(s: &Server, caller: &Caller, name: String, action: Action) -> Result<axum::Json<AppInfo>> {
     caller.manage(&name)?;
     let v = view(s, &name).await?;
-    let node = v.node.as_ref().ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
+    let node = v
+        .node
+        .as_ref()
+        .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
     let mut info: AppInfo = result(s.command(node.id, &node.name, action).await?)?;
     info.node = Some(node.name.clone());
     info.pending = v.pending();
@@ -452,10 +468,7 @@ fn volume_view(v: &VolumeRow, node: Option<&Node>) -> VolumeInfo {
 }
 
 async fn volume_list(State(s): State<Server>, _caller: Caller) -> Result<axum::Json<Vec<VolumeInfo>>> {
-    let (rows, nodes) = s
-        .store
-        .call(|c| Ok((apps::volumes(c)?, nodes::list(c)?)))
-        .await?;
+    let (rows, nodes) = s.store.call(|c| Ok((apps::volumes(c)?, nodes::list(c)?))).await?;
     let nodes: HashMap<u64, Node> = nodes.into_iter().map(|n| (n.id, n)).collect();
     Ok(axum::Json(
         rows.iter()
@@ -568,7 +581,9 @@ async fn volume_change(
     Path((name, generation)): Path<(String, u64)>,
     Query(q): Query<WaitQuery>,
 ) -> Result<axum::Json<ChangeStatus>> {
-    Ok(axum::Json(wait_change(&s, Kind::Volume, name, generation, q.wait).await?))
+    Ok(axum::Json(
+        wait_change(&s, Kind::Volume, name, generation, q.wait).await?,
+    ))
 }
 
 async fn volume_delete_snapshot(
@@ -596,10 +611,7 @@ async fn volume_delete_snapshot(
 
 async fn node_list(State(s): State<Server>, caller: Caller) -> Result<axum::Json<Vec<NodeInfo>>> {
     caller.admin()?;
-    let (nodes, placed) = s
-        .store
-        .call(|c| Ok((nodes::list(c)?, apps::placed(c)?)))
-        .await?;
+    let (nodes, placed) = s.store.call(|c| Ok((nodes::list(c)?, apps::placed(c)?))).await?;
     let placed: HashMap<u64, (u64, u64)> = placed.into_iter().map(|(n, m, c)| (n, (m, c))).collect();
     Ok(axum::Json(
         nodes

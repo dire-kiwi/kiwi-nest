@@ -160,7 +160,10 @@ fn reports_space() {
     let (total, free) = disk_space(Path::new("/")).unwrap();
     assert!(total > 0 && free <= total);
     if let Some(p) = plain_dir() {
-        assert!(matches!(unallocated(&std::fs::canonicalize(p.path()).unwrap()), Err(Error::NotBtrfs(_))));
+        assert!(matches!(
+            unallocated(&std::fs::canonicalize(p.path()).unwrap()),
+            Err(Error::NotBtrfs(_))
+        ));
     }
     let Some(dir) = btrfs_dir() else { return };
     let root = std::fs::canonicalize(dir.path()).unwrap();

@@ -491,7 +491,12 @@ impl Inner {
                     self.record(&key, outcome).await;
                 }
                 Step::Retry(why) => {
-                    tracing::warn!(?key, generation = want.generation(), why, "can't apply this yet; retrying");
+                    tracing::warn!(
+                        ?key,
+                        generation = want.generation(),
+                        why,
+                        "can't apply this yet; retrying"
+                    );
                     tokio::select! {
                         _ = tokio::time::sleep(backoff) => {}
                         _ = rx.changed() => {}

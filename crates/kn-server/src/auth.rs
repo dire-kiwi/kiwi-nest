@@ -153,10 +153,7 @@ impl FromRequestParts<Server> for Caller {
 
     async fn from_request_parts(parts: &mut Parts, server: &Server) -> Result<Self> {
         let h = hash(bearer(parts)?);
-        let token = server
-            .store
-            .call(move |c| crate::store::tokens::lookup(c, &h))
-            .await?;
+        let token = server.store.call(move |c| crate::store::tokens::lookup(c, &h)).await?;
         match token {
             Some(t) if matches!(t.kind, TokenKind::Admin | TokenKind::Deploy) => Ok(Caller {
                 id: t.id,
@@ -183,10 +180,7 @@ impl FromRequestParts<Server> for NodeCaller {
 
     async fn from_request_parts(parts: &mut Parts, server: &Server) -> Result<Self> {
         let h = hash(bearer(parts)?);
-        let found = server
-            .store
-            .call(move |c| crate::store::nodes::by_token(c, &h))
-            .await?;
+        let found = server.store.call(move |c| crate::store::nodes::by_token(c, &h)).await?;
         match found {
             Some((node_id, name)) => Ok(NodeCaller { node_id, name }),
             None => Err(Error::Unauthorized("the node token isn't valid".into())),

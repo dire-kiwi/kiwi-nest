@@ -275,10 +275,9 @@ impl Action {
     /// The app or volume it acts on.
     pub fn target(&self) -> &str {
         match self {
-            Action::Inspect { app }
-            | Action::Logs { app, .. }
-            | Action::Suspend { app }
-            | Action::Resume { app } => app,
+            Action::Inspect { app } | Action::Logs { app, .. } | Action::Suspend { app } | Action::Resume { app } => {
+                app
+            }
             Action::VolumeInfo { name } | Action::DeleteSnapshot { name, .. } => name,
         }
     }

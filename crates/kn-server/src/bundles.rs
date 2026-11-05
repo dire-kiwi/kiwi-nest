@@ -212,7 +212,7 @@ pub fn parse_bytes(s: &str) -> Option<u64> {
         "g" | "gb" => 1 << 30,
         _ => return None,
     };
-    (n >= 0.0).then(|| (n * mult as f64) as u64)
+    (n >= 0.0).then_some((n * mult as f64) as u64)
 }
 
 #[cfg(test)]

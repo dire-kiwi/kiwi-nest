@@ -78,7 +78,12 @@ impl Env {
     }
 
     async fn token(&self, body: serde_json::Value) -> String {
-        let r = self.req(reqwest::Method::POST, "/tokens", &self.admin).json(&body).send().await.unwrap();
+        let r = self
+            .req(reqwest::Method::POST, "/tokens", &self.admin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
         r.json::<CreatedToken>().await.unwrap().token
     }
@@ -162,7 +167,11 @@ impl Env {
 
     async fn status(&self, name: &str, generation: u64) -> ChangeStatus {
         let r = self
-            .req(reqwest::Method::GET, &format!("/apps/{name}/changes/{generation}"), &self.admin)
+            .req(
+                reqwest::Method::GET,
+                &format!("/apps/{name}/changes/{generation}"),
+                &self.admin,
+            )
             .send()
             .await
             .unwrap();
@@ -344,9 +353,19 @@ async fn deploys_go_to_the_most_free_memory_and_reach_their_node() {
     assert_eq!(apps[0].status, AppStatus::Running);
 
     // The next app goes to b too: 8 GiB less blog's 128 MiB still beats 4 GiB.
-    let acc: Accepted = env.deploy(&env.admin, "shop", "shop.test", "").await.json().await.unwrap();
+    let acc: Accepted = env
+        .deploy(&env.admin, "shop", "shop.test", "")
+        .await
+        .json()
+        .await
+        .unwrap();
     assert_eq!(acc.node, "b");
-    let acc: Accepted = env.deploy(&env.admin, "notes", "notes.test", "node=a").await.json().await.unwrap();
+    let acc: Accepted = env
+        .deploy(&env.admin, "notes", "notes.test", "node=a")
+        .await
+        .json()
+        .await
+        .unwrap();
     assert_eq!(acc.node, "a");
     // A redeploy stays on its node, and `--node` can't move it.
     let r = env.deploy(&env.admin, "notes", "notes.test", "node=b").await;
@@ -381,7 +400,10 @@ async fn a_domain_is_refused_across_nodes_and_nothing_is_saved() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(msg.contains("already used by app `blog` on node `a`"), "{msg}");
     assert_eq!(env.apps().await.len(), 1);
-    assert!(env.poll(&mut b).await.apps.is_empty(), "b's desired state didn't change");
+    assert!(
+        env.poll(&mut b).await.apps.is_empty(),
+        "b's desired state didn't change"
+    );
     assert_eq!(env.bundle_files(), files);
     // create-only refuses an existing app.
     let r = env.deploy(&env.admin, "blog", "blog.test", "create_only=true").await;
@@ -406,7 +428,9 @@ async fn a_change_for_an_offline_node_is_refused_unless_queued() {
     assert!(env.apps().await.is_empty());
     assert_eq!(env.bundle_files(), 0);
     assert_eq!(
-        std::fs::read_dir(env.dir.path().join("server/bundles/tmp")).unwrap().count(),
+        std::fs::read_dir(env.dir.path().join("server/bundles/tmp"))
+            .unwrap()
+            .count(),
         0,
         "no upload is left behind"
     );
@@ -471,7 +495,11 @@ async fn a_deploy_token_only_touches_its_own_apps() {
         env.deploy(&ci, "blog-pr1", "pr1.test", "from=blog").await.status(),
         StatusCode::ACCEPTED
     );
-    let r = env.req(reqwest::Method::DELETE, "/apps/blog-pr1", &ci).send().await.unwrap();
+    let r = env
+        .req(reqwest::Method::DELETE, "/apps/blog-pr1", &ci)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), StatusCode::ACCEPTED);
     // blog's desired state never changed.
     let resp = env.poll(&mut a).await;
@@ -512,7 +540,12 @@ async fn deletes_release_the_name_and_domain_once_the_node_is_done() {
         StatusCode::ACCEPTED
     );
     // The name starts again with a higher generation, so the node can't mistake it for the old app.
-    let acc: Accepted = env.deploy(&env.admin, "blog", "blog2.test", "").await.json().await.unwrap();
+    let acc: Accepted = env
+        .deploy(&env.admin, "blog", "blog2.test", "")
+        .await
+        .json()
+        .await
+        .unwrap();
     assert_eq!(acc.generation, 3);
 }
 
@@ -566,7 +599,11 @@ async fn commands_are_delivered_once_and_lost_ones_fail() {
     })
     .unwrap();
     let r = env
-        .req(reqwest::Method::POST, &format!("/agent/commands/{}/result", command.id), &a.token)
+        .req(
+            reqwest::Method::POST,
+            &format!("/agent/commands/{}/result", command.id),
+            &a.token,
+        )
         .json(&CommandResult::Ok { value: info })
         .send()
         .await
@@ -604,17 +641,21 @@ async fn commands_are_delivered_once_and_lost_ones_fail() {
             break c;
         }
     };
-    env.req(reqwest::Method::POST, &format!("/agent/commands/{}/result", command.id), &a.token)
-        .json(&CommandResult::Err {
-            status: 409,
-            error: ErrorBody {
-                error: "busy".into(),
-                problems: vec![],
-            },
-        })
-        .send()
-        .await
-        .unwrap();
+    env.req(
+        reqwest::Method::POST,
+        &format!("/agent/commands/{}/result", command.id),
+        &a.token,
+    )
+    .json(&CommandResult::Err {
+        status: 409,
+        error: ErrorBody {
+            error: "busy".into(),
+            problems: vec![],
+        },
+    })
+    .send()
+    .await
+    .unwrap();
     let (status, msg) = error(inspect.await.unwrap()).await;
     assert_eq!((status, msg.as_str()), (StatusCode::CONFLICT, "busy"));
 }
@@ -653,7 +694,7 @@ async fn a_restart_loses_nothing() {
         .unwrap();
     assert_eq!(apps.len(), 1);
     assert_eq!(apps[0].status, AppStatus::Running);
-    assert_eq!(env.status("blog", 1).await.done, true);
+    assert!(env.status("blog", 1).await.done);
     assert_eq!(env.bundle_files(), 2);
 }
 
@@ -684,7 +725,11 @@ async fn only_admins_make_tokens_and_the_last_admin_token_stays() {
         .unwrap();
     assert_eq!(tokens.len(), 1);
     let r = env
-        .req(reqwest::Method::DELETE, &format!("/tokens/{}", tokens[0].id), &env.admin)
+        .req(
+            reqwest::Method::DELETE,
+            &format!("/tokens/{}", tokens[0].id),
+            &env.admin,
+        )
         .send()
         .await
         .unwrap();

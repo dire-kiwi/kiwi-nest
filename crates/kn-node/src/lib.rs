@@ -161,7 +161,11 @@ pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen:
 ///
 /// Prints `gateway on http://ADDR`, then `node NAME polling URL` once it has joined (on its first start, with
 /// `agent.join_token`). Apps keep running after the node exits, and the next node agent adopts them.
-pub async fn run_agent(cfg: NodeConfig, mut agent: agent::AgentConfig, gateway_listen: SocketAddr) -> anyhow::Result<()> {
+pub async fn run_agent(
+    cfg: NodeConfig,
+    mut agent: agent::AgentConfig,
+    gateway_listen: SocketAddr,
+) -> anyhow::Result<()> {
     check_loopback(&gateway_listen)?;
     let apps = apps::Apps::open(cfg).await?;
     let gw_listener = tokio::net::TcpListener::bind(gateway_listen)

@@ -40,7 +40,13 @@ pub struct GlobalArgs {
     #[arg(long, global = true, env = "KIWI_NEST_SERVER", value_name = "URL")]
     pub server: Option<String>,
     /// The token for --server, or for `cluster add`.
-    #[arg(long, global = true, env = "KIWI_NEST_TOKEN", hide_env_values = true, value_name = "TOKEN")]
+    #[arg(
+        long,
+        global = true,
+        env = "KIWI_NEST_TOKEN",
+        hide_env_values = true,
+        value_name = "TOKEN"
+    )]
     pub token: Option<String>,
     /// Where the CLI keeps its clusters [default: ~/.config/kiwi-nest].
     #[arg(long, global = true, env = "KIWI_NEST_CONFIG_DIR", value_name = "DIR")]
@@ -265,7 +271,10 @@ impl Target {
             (None, None) => bail!("no cluster is current: pick one with `kiwi-nest cluster use NAME`"),
         };
         let c = cfg.clusters.get(&name).with_context(|| {
-            format!("there's no cluster `{name}` in {}", config::Config::path(&dir).display())
+            format!(
+                "there's no cluster `{name}` in {}",
+                config::Config::path(&dir).display()
+            )
         })?;
         Ok(Target::Server {
             url: c.url.clone(),
@@ -386,7 +395,12 @@ impl Client {
             .await
     }
 
-    pub async fn volume_load_zip(&self, name: &str, zip: Vec<u8>, q: &VolumeQuery) -> anyhow::Result<reqwest::Response> {
+    pub async fn volume_load_zip(
+        &self,
+        name: &str,
+        zip: Vec<u8>,
+        q: &VolumeQuery,
+    ) -> anyhow::Result<reqwest::Response> {
         let req = self
             .req(reqwest::Method::PUT, &format!("/volumes/{name}/data"))
             .query(q)
@@ -493,7 +507,10 @@ async fn wait_for(client: &Client, kind: &str, acc: &Accepted, timeout: Duration
                 acc.name
             );
         }
-        let st = match client.change(kind, &acc.name, acc.generation, left.as_secs().clamp(1, 25)).await {
+        let st = match client
+            .change(kind, &acc.name, acc.generation, left.as_secs().clamp(1, 25))
+            .await
+        {
             Ok(st) => {
                 unreachable_since = None;
                 st
@@ -580,11 +597,17 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            eprintln!("deploying {} (generation {}) on node {}", acc.name, acc.generation, acc.node);
+            eprintln!(
+                "deploying {} (generation {}) on node {}",
+                acc.name, acc.generation, acc.node
+            );
             let st = wait_for(&client, "apps", &acc, timeout).await?;
             match client.inspect(&name).await {
                 Ok(info) => print_deployed(&info, Some(&st.notes)),
-                Err(_) => println!("deployed {} (generation {}) on node {}", acc.name, acc.generation, acc.node),
+                Err(_) => println!(
+                    "deployed {} (generation {}) on node {}",
+                    acc.name, acc.generation, acc.node
+                ),
             }
         }
         Command::List { json } => {
@@ -919,7 +942,11 @@ async fn cluster(global: &GlobalArgs, cmd: ClusterCommand) -> anyhow::Result<()>
                 } else {
                     format!(" for {}", who.patterns.join(", "))
                 },
-                if cfg.current.as_deref() == Some(&name) { "; it's current" } else { "" }
+                if cfg.current.as_deref() == Some(&name) {
+                    "; it's current"
+                } else {
+                    ""
+                }
             );
         }
         ClusterCommand::Use { name } => {
@@ -967,7 +994,18 @@ pub async fn node_list(global: &GlobalArgs, json: bool) -> anyhow::Result<()> {
     }
     let gib = |b: u64| format!("{:.1}G", b as f64 / f64::from(1u32 << 30));
     print_table(
-        &["NAME", "ONLINE", "ARCH", "MEMORY", "APPS", "APP MEMORY", "BTRFS FREE", "UNALLOCATED", "VERSION", "LAST SEEN"],
+        &[
+            "NAME",
+            "ONLINE",
+            "ARCH",
+            "MEMORY",
+            "APPS",
+            "APP MEMORY",
+            "BTRFS FREE",
+            "UNALLOCATED",
+            "VERSION",
+            "LAST SEEN",
+        ],
         nodes
             .iter()
             .map(|n| {

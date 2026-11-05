@@ -131,14 +131,12 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&mut conn).with_context(|| format!("migrating {}", path.display()))?;
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        std::thread::Builder::new()
-            .name("kn-store".into())
-            .spawn(move || {
-                for job in rx {
-                    // A panicking query fails its own call (its reply is dropped), not the store.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut conn)));
-                }
-            })?;
+        std::thread::Builder::new().name("kn-store".into()).spawn(move || {
+            for job in rx {
+                // A panicking query fails its own call (its reply is dropped), not the store.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut conn)));
+            }
+        })?;
         Ok(Store { tx })
     }
 
@@ -170,8 +168,7 @@ pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     }
     for (i, sql) in MIGRATIONS.iter().enumerate().skip(have) {
         let tx = conn.transaction()?;
-        tx.execute_batch(sql)
-            .with_context(|| format!("migration {}", i + 1))?;
+        tx.execute_batch(sql).with_context(|| format!("migration {}", i + 1))?;
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         tx.commit()?;
         tracing::info!(version = i + 1, "migrated the database");

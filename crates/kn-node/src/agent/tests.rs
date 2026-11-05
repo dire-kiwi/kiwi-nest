@@ -51,7 +51,12 @@ impl Cluster {
     }
 
     async fn join_token(&self) -> String {
-        let r = self.req(Method::POST, "/tokens").json(&json!({"kind": "join"})).send().await.unwrap();
+        let r = self
+            .req(Method::POST, "/tokens")
+            .json(&json!({"kind": "join"}))
+            .send()
+            .await
+            .unwrap();
         r.json::<CreatedToken>().await.unwrap().token
     }
 
@@ -72,7 +77,13 @@ impl Cluster {
     }
 
     async fn nodes(&self) -> Vec<NodeInfo> {
-        self.req(Method::GET, "/nodes").send().await.unwrap().json().await.unwrap()
+        self.req(Method::GET, "/nodes")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
 
     /// Waits until `pred` holds for the nodes.
@@ -128,12 +139,21 @@ impl Cluster {
             if st.done {
                 return st;
             }
-            assert!(Instant::now() < deadline, "timed out waiting for {name} {generation}: {st:?}");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {name} {generation}: {st:?}"
+            );
         }
     }
 
     async fn apps(&self) -> Vec<AppSummary> {
-        self.req(Method::GET, "/apps").send().await.unwrap().json().await.unwrap()
+        self.req(Method::GET, "/apps")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
 
     async fn info(&self, name: &str) -> AppInfo {
@@ -259,7 +279,10 @@ async fn two_nodes_join_report_and_run_apps_through_the_server() {
     b.start(Some(c.join_token().await)).await;
     let nodes = c
         .until_nodes("both nodes to report", |ns| {
-            ns.len() == 2 && ns.iter().all(|n| n.online && n.facts.as_ref().is_some_and(|f| f.memory_bytes > 0))
+            ns.len() == 2
+                && ns
+                    .iter()
+                    .all(|n| n.online && n.facts.as_ref().is_some_and(|f| f.memory_bytes > 0))
         })
         .await;
     let f = nodes[0].facts.as_ref().unwrap();
@@ -277,7 +300,12 @@ async fn two_nodes_join_report_and_run_apps_through_the_server() {
     let apps = c.apps().await;
     assert_eq!(apps.len(), 1);
     assert_eq!(
-        (apps[0].status, apps[0].generation, apps[0].node.as_deref(), apps[0].pending),
+        (
+            apps[0].status,
+            apps[0].generation,
+            apps[0].node.as_deref(),
+            apps[0].pending
+        ),
         (AppStatus::Running, 1, Some("a"), None)
     );
 
@@ -307,7 +335,12 @@ async fn two_nodes_join_report_and_run_apps_through_the_server() {
     assert_eq!(acc.node, "a");
     let st = c.wait("blog-pr1", 1).await;
     assert!(st.ok, "{st:?}");
-    assert!(st.notes.iter().any(|n| n.contains("snapshotted volume `data` from `blog`")), "{st:?}");
+    assert!(
+        st.notes
+            .iter()
+            .any(|n| n.contains("snapshotted volume `data` from `blog`")),
+        "{st:?}"
+    );
 
     // A redeploy, then a delete.
     c.deployed("blog", &yaml("blog.test", &["data"]), "").await;
@@ -320,7 +353,11 @@ async fn two_nodes_join_report_and_run_apps_through_the_server() {
         assert!(st.ok, "{st:?}");
     }
     assert!(c.apps().await.is_empty());
-    assert_eq!(a.fake.calls("down", &a.project("blog")), 2, "the redeploy, and the delete");
+    assert_eq!(
+        a.fake.calls("down", &a.project("blog")),
+        2,
+        "the redeploy, and the delete"
+    );
     assert_eq!(c.bundle_files(), 0);
     // The domain is free again, on either node.
     let acc = c.deployed("other", &yaml("blog.test", &[]), "node=b").await;
@@ -355,14 +392,21 @@ async fn a_node_killed_mid_deploy_finishes_it_once_when_it_comes_back() {
         .await
         .unwrap();
     assert!(!st.done && !st.node_online, "{st:?}");
-    assert!(a.agent_file().applied.apps.is_empty(), "the cut-off deploy wasn't recorded");
+    assert!(
+        a.agent_file().applied.apps.is_empty(),
+        "the cut-off deploy wasn't recorded"
+    );
 
     // Back again: it finishes the deploy, once.
     a.fake.set_behaviour(Behaviour::default());
     a.start(None).await;
     let st = c.wait("blog", 1).await;
     assert!(st.ok, "{st:?}");
-    assert_eq!(a.fake.calls("up", &project), 2, "the cut-off attempt and the one that finished");
+    assert_eq!(
+        a.fake.calls("up", &project),
+        2,
+        "the cut-off attempt and the one that finished"
+    );
     let info = c.info("blog").await;
     assert_eq!((info.status, info.generation), (AppStatus::Running, 1));
     assert_eq!(a.agent_file().applied.apps["blog"].generation, 1);
@@ -428,7 +472,10 @@ async fn the_poll_loop_carries_on_while_a_long_deploy_and_commands_run() {
     assert_eq!(r.status(), StatusCode::OK);
     let info = c.info("notes").await;
     assert_eq!(info.status, AppStatus::Suspended);
-    assert!(started.elapsed() < Duration::from_secs(3), "commands waited for the deploy");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "commands waited for the deploy"
+    );
     assert!(c.nodes().await[0].online);
     assert!(c.wait("blog", 1).await.ok);
 }

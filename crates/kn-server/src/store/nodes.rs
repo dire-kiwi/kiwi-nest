@@ -22,7 +22,10 @@ pub struct Node {
 
 const COLUMNS: &str = "id, name, seq, facts, report, joined_at, last_seen";
 
-fn row(r: &rusqlite::Row) -> rusqlite::Result<(u64, String, u64, Option<String>, Option<String>, u64, Option<u64>)> {
+/// A row of `nodes`, as read.
+type Raw = (u64, String, u64, Option<String>, Option<String>, u64, Option<u64>);
+
+fn row(r: &rusqlite::Row) -> rusqlite::Result<Raw> {
     Ok((
         r.get(0)?,
         r.get(1)?,
@@ -34,17 +37,7 @@ fn row(r: &rusqlite::Row) -> rusqlite::Result<(u64, String, u64, Option<String>,
     ))
 }
 
-fn node(
-    (id, name, seq, facts, report, joined_at, last_seen): (
-        u64,
-        String,
-        u64,
-        Option<String>,
-        Option<String>,
-        u64,
-        Option<u64>,
-    ),
-) -> Result<Node> {
+fn node((id, name, seq, facts, report, joined_at, last_seen): Raw) -> Result<Node> {
     Ok(Node {
         id,
         name,
@@ -87,11 +80,10 @@ pub fn by_token(c: &Connection, hash: &str) -> Result<Option<(u64, String)>> {
         return Ok(None);
     }
     let Some(id) = t.node_id else { return Ok(None) };
-    Ok(c
-        .query_row("SELECT id, name FROM nodes WHERE id = ?1", [id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .optional()?)
+    Ok(c.query_row("SELECT id, name FROM nodes WHERE id = ?1", [id], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+    .optional()?)
 }
 
 /// Swaps a join token for a node: records the node and its token's hash, and uses up the join token, in one

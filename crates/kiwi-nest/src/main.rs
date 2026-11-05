@@ -36,7 +36,11 @@ struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:7400")]
     listen: SocketAddr,
     /// Where the server keeps its database and bundles.
-    #[arg(long, env = "KIWI_NEST_SERVER_STATE_DIR", default_value = "/var/lib/kiwi-nest-server")]
+    #[arg(
+        long,
+        env = "KIWI_NEST_SERVER_STATE_DIR",
+        default_value = "/var/lib/kiwi-nest-server"
+    )]
     state_dir: PathBuf,
     /// The longest a node's poll is held open, such as 25s.
     #[arg(long, default_value = "25s")]
@@ -151,7 +155,10 @@ async fn server(args: ServerArgs) -> anyhow::Result<()> {
     cfg.poll_timeout = duration("--poll-timeout", &args.poll_timeout)?;
     cfg.offline_after = duration("--offline-after", &args.offline_after)?;
     if cfg.poll_timeout.is_zero() || cfg.poll_timeout.as_secs() > kn_proto::agent::MAX_POLL_SECS {
-        bail!("--poll-timeout must be between 1s and {}s", kn_proto::agent::MAX_POLL_SECS);
+        bail!(
+            "--poll-timeout must be between 1s and {}s",
+            kn_proto::agent::MAX_POLL_SECS
+        );
     }
     kn_server::run(cfg, args.listen).await
 }
@@ -190,7 +197,9 @@ async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result<()>
     let mut agent = kn_node::agent::AgentConfig::new(server, args.name.unwrap_or_else(host_name));
     agent.join_token = args.join_token;
     for l in &args.labels {
-        let (k, v) = l.split_once('=').with_context(|| format!("a label is KEY=VALUE, not {l}"))?;
+        let (k, v) = l
+            .split_once('=')
+            .with_context(|| format!("a label is KEY=VALUE, not {l}"))?;
         agent.labels.insert(k.trim().to_string(), v.trim().to_string());
     }
     kn_node::run_agent(cfg, agent, args.gateway_listen).await
@@ -198,11 +207,12 @@ async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result<()>
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    let default_level = if matches!(&cli.command, Cmd::Node(n) if n.cmd.is_none()) || matches!(cli.command, Cmd::Server(_)) {
-        "info"
-    } else {
-        "warn"
-    };
+    let default_level =
+        if matches!(&cli.command, Cmd::Node(n) if n.cmd.is_none()) || matches!(cli.command, Cmd::Server(_)) {
+            "info"
+        } else {
+            "warn"
+        };
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_env("KIWI_NEST_LOG").unwrap_or_else(|_| EnvFilter::new(default_level)))
         .with_writer(std::io::stderr)

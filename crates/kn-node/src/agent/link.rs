@@ -53,7 +53,9 @@ fn client() -> Result<reqwest::Client, LinkError> {
 fn base(server: &str) -> Result<String, LinkError> {
     let s = server.trim_end_matches('/');
     if !s.starts_with("http://") && !s.starts_with("https://") {
-        return Err(LinkError::Other(format!("the server must be an http:// or https:// URL, not {s}")));
+        return Err(LinkError::Other(format!(
+            "the server must be an http:// or https:// URL, not {s}"
+        )));
     }
     Ok(format!("{s}{}", kn_proto::API_PREFIX))
 }
@@ -120,7 +122,9 @@ impl Link {
             let chunk = chunk?;
             n += chunk.len() as u64;
             if n > limit {
-                return Err(LinkError::Other(format!("bundle {digest} is larger than {limit} bytes")));
+                return Err(LinkError::Other(format!(
+                    "bundle {digest} is larger than {limit} bytes"
+                )));
             }
             file.write_all(&chunk)
                 .await

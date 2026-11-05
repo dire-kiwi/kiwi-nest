@@ -56,8 +56,7 @@ impl Config {
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         let path = Self::path(dir);
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        tmp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
         tmp.write_all(&serde_json::to_vec_pretty(self)?)?;
         tmp.as_file().sync_all()?;
         tmp.persist(&path)

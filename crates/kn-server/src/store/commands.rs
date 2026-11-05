@@ -24,7 +24,8 @@ pub fn take(c: &mut Connection, node_id: u64, running: &[u64], now: u64) -> Resu
     let tx = c.transaction()?;
     let delivered: Vec<u64> = {
         let mut st = tx.prepare("SELECT id FROM commands WHERE node_id = ?1 AND state = 'delivered'")?;
-        st.query_map([node_id], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        st.query_map([node_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
     };
     let lost: Vec<u64> = delivered.into_iter().filter(|id| !running.contains(id)).collect();
     for id in &lost {
@@ -48,7 +49,8 @@ pub fn take_pending(c: &mut Connection, node_id: u64, now: u64) -> Result<Vec<Co
 
 fn hand_out(tx: &rusqlite::Transaction, node_id: u64, now: u64) -> Result<Vec<Command>> {
     let pending: Vec<(u64, String)> = {
-        let mut st = tx.prepare("SELECT id, action FROM commands WHERE node_id = ?1 AND state = 'pending' ORDER BY id")?;
+        let mut st =
+            tx.prepare("SELECT id, action FROM commands WHERE node_id = ?1 AND state = 'pending' ORDER BY id")?;
         st.query_map([node_id], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?
     };

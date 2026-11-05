@@ -28,6 +28,7 @@ pub fn kind_from_str(s: &str) -> Result<TokenKind> {
 }
 
 /// Saves a token's hash; returns its ID.
+#[allow(clippy::too_many_arguments)]
 pub fn create(
     c: &Connection,
     kind: TokenKind,
@@ -145,7 +146,9 @@ pub fn revoke(c: &mut Connection, id: u64, now: u64) -> Result<()> {
     match kind.as_deref() {
         None => return Err(Error::NotFound(format!("there's no token {id}"))),
         Some("admin") if admin_count(&tx)? <= 1 => {
-            return Err(Error::Conflict("that's the last admin token, so it can't be revoked".into()));
+            return Err(Error::Conflict(
+                "that's the last admin token, so it can't be revoked".into(),
+            ));
         }
         Some(_) => {}
     }

@@ -10,9 +10,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::StreamExt;
-use kn_proto::agent::{
-    CommandResult, JoinRequest, JoinResponse, OLDEST_PROTOCOL, PROTOCOL, PollRequest, PollResponse,
-};
+use kn_proto::agent::{CommandResult, JoinRequest, JoinResponse, OLDEST_PROTOCOL, PROTOCOL, PollRequest, PollResponse};
 use kn_proto::api::TokenKind;
 use tokio::sync::mpsc;
 use tokio_util::io::ReaderStream;
@@ -149,7 +147,12 @@ async fn bundle(State(s): State<Server>, node: NodeCaller, Path(digest): Path<St
             )?)
         })
         .await?;
-    let missing = || Error::NotFound(format!("no app or volume of node `{}` uses bundle `{digest}`", node.name));
+    let missing = || {
+        Error::NotFound(format!(
+            "no app or volume of node `{}` uses bundle `{digest}`",
+            node.name
+        ))
+    };
     if !wanted {
         return Err(missing());
     }
@@ -212,7 +215,15 @@ async fn command_output(
     if !s.hub.settle(id, Outcome::Stream(rx)) {
         let _ = s
             .store
-            .call(move |c| commands::finish(c, id, node_id, r#"{"kind":"err","status":410,"error":{"error":"nobody was waiting"}}"#, store::now()))
+            .call(move |c| {
+                commands::finish(
+                    c,
+                    id,
+                    node_id,
+                    r#"{"kind":"err","status":410,"error":{"error":"nobody was waiting"}}"#,
+                    store::now(),
+                )
+            })
             .await;
         return Ok(StatusCode::GONE);
     }
