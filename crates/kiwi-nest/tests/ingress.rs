@@ -194,6 +194,8 @@ fn requests_through_the_ingress_wake_apps_and_need_their_credentials_and_the_nod
     });
 
     let rt = tokio::runtime::Runtime::new().unwrap();
+    // reqwest makes its timers when a request is sent, so the futures are made inside the runtime too.
+    let _in_runtime = rt.enter();
     let http_client = client(&ca, https);
     let url = format!("https://wake.localhost:{https}/");
     let get = |user: Option<(&str, &str)>| {
