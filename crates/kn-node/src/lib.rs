@@ -1,14 +1,16 @@
 //! The kiwi-nest node.
 //!
+//! - [`volumes`] is the layout of the node's btrfs subvolumes, and the checks before every start.
 //! - [`runtime`] runs `docker compose` for each app's project.
-//! - [`apps`] handles each app's lifecycle, one task per app, and the node's state file.
+//! - [`apps`] handles each app's lifecycle, one task per app, its volumes, shared volumes, and the node's state file.
 //! - [`api`] is the standalone node's loopback HTTP API.
 //!
-//! Later steps add btrfs volumes, the gateway and the link to the server.
+//! Later steps add the gateway and the link to the server.
 
 pub mod api;
 pub mod apps;
 pub mod runtime;
+pub mod volumes;
 
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
@@ -23,7 +25,7 @@ use kn_bundle::Limits;
 pub struct NodeConfig {
     /// Where the node keeps its state, bundles and generated files (absolute).
     pub state_dir: PathBuf,
-    /// Where apps' volumes live (absolute).
+    /// Where apps' volumes live (absolute): a directory on btrfs.
     pub volumes_dir: PathBuf,
     /// Put before every app's name to make its Compose project name, so several nodes can share a Docker Engine.
     pub project_prefix: String,
@@ -32,6 +34,8 @@ pub struct NodeConfig {
     /// Host directories that bundles may mount.
     pub allowed_host_paths: Vec<PathBuf>,
     pub limits: Limits,
+    /// The limits on what `volume load` reads.
+    pub load_limits: Limits,
     /// The Docker CLI.
     pub docker: PathBuf,
     /// How long `docker compose up` may wait for an app's containers to be running and healthy.
@@ -48,6 +52,7 @@ impl NodeConfig {
             ports: 30000..=39999,
             allowed_host_paths: Vec::new(),
             limits: Limits::default(),
+            load_limits: Limits::for_volumes(),
             docker: "docker".into(),
             up_timeout: Duration::from_secs(300),
         }

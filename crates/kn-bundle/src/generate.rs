@@ -1,7 +1,8 @@
 //! The Compose file a node actually runs, written from a checked bundle.
 //!
-//! - Every named volume becomes a bind mount of a directory of the app's, and bundle paths become read-only bind
-//!   mounts of the extracted bundle. Neither creates a missing source on the host.
+//! - Every named volume becomes a bind mount of a directory of the app's (its subvolume), each shared volume a bind
+//!   mount of the shared subvolume or of the app's snapshot of it, and bundle paths read-only bind mounts of the
+//!   extracted bundle. None of them creates a missing source on the host.
 //! - Only the routed service gets a port, published on `127.0.0.1`.
 //! - `restart: always` becomes `unless-stopped`, so Docker doesn't restart an app that kiwi-nest stopped.
 //! - Env files are referred to by absolute path, and every path is absolute, so the file doesn't depend on where
@@ -23,6 +24,9 @@ pub struct Params<'a> {
     pub bundle_dir: &'a Path,
     /// The host directory for each named volume (absolute).
     pub volume_dirs: &'a BTreeMap<String, PathBuf>,
+    /// The host directory for each shared volume in `x-kiwi-nest.shared` (absolute): the volume itself for `ro`
+    /// and `rw`, or the app's own snapshot of it.
+    pub shared_dirs: &'a BTreeMap<String, PathBuf>,
     /// The loopback port to publish the routed service on.
     pub host_port: u16,
     /// Labels added to every service, such as the app's name.
@@ -37,6 +41,8 @@ pub enum GenerateError {
     BadPath(String),
     #[error("no directory was given for volume `{0}`")]
     MissingVolume(String),
+    #[error("no directory was given for shared volume `{0}`")]
+    MissingShared(String),
     #[error("writing YAML: {0}")]
     Yaml(#[from] serde_yaml_ng::Error),
 }
@@ -93,7 +99,13 @@ fn service(svc: &Service, bundle: &CheckedBundle, p: &Params) -> Result<Value, G
             .collect::<Result<Vec<_>, _>>()?;
         out.insert(s("env_file"), Value::Sequence(files));
     }
-    if !svc.mounts.is_empty() {
+    let shared: Vec<_> = bundle
+        .manifest
+        .shared
+        .iter()
+        .filter(|(_, m)| m.mounted_into(&svc.name))
+        .collect();
+    if !svc.mounts.is_empty() || !shared.is_empty() {
         let mut mounts = Vec::new();
         for m in &svc.mounts {
             mounts.push(match m {
@@ -133,6 +145,13 @@ fn service(svc: &Service, bundle: &CheckedBundle, p: &Params) -> Result<Value, G
                     Value::Mapping(t)
                 }
             });
+        }
+        for (name, m) in shared {
+            let dir = p
+                .shared_dirs
+                .get(name)
+                .ok_or_else(|| GenerateError::MissingShared(name.clone()))?;
+            mounts.push(bind(path_value(dir)?, &m.target, m.mode.read_only(), &None));
         }
         out.insert(s("volumes"), Value::Sequence(mounts));
     }

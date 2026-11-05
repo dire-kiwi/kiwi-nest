@@ -1,0 +1,13 @@
+[package]
+name = "kn-btrfs"
+description = "btrfs subvolumes through the kernel's ioctls: create, snapshot, destroy and checks"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

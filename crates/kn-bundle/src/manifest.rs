@@ -9,7 +9,7 @@
 //!   auth:                   # optional basic auth, checked at the ingress
 //!     - { user: preview, hash: "$2y$..." }
 //!   shared:                 # optional shared volumes; mode is snapshot, ro (the default) or rw
-//!     corpus: { target: /corpus, mode: snapshot }
+//!     corpus: { target: /corpus, mode: snapshot }   # into every service, or only `services: [web]`
 //!   nest: blog              # optional
 //!   arch: arm64             # optional: amd64 or arm64
 //!   node_labels: { disk: ssd }
@@ -48,6 +48,15 @@ pub struct BasicAuth {
 pub struct SharedMount {
     pub target: String,
     pub mode: SharedMode,
+    /// The services it's mounted into; every service if `None`.
+    pub services: Option<Vec<String>>,
+}
+
+impl SharedMount {
+    /// Whether it's mounted into `service`.
+    pub fn mounted_into(&self, service: &str) -> bool {
+        self.services.as_ref().is_none_or(|s| s.iter().any(|s| s == service))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +73,21 @@ pub enum SharedMode {
 pub enum Arch {
     Amd64,
     Arm64,
+}
+
+impl SharedMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SharedMode::Snapshot => "snapshot",
+            SharedMode::Ro => "ro",
+            SharedMode::Rw => "rw",
+        }
+    }
+
+    /// Whether the app's containers mount it read-only.
+    pub fn read_only(self) -> bool {
+        self == SharedMode::Ro
+    }
 }
 
 impl Arch {
@@ -261,16 +285,34 @@ pub fn parse(value: &Value) -> Result<Manifest, Vec<Problem>> {
                         Some(Some("snapshot")) => Some(SharedMode::Snapshot),
                         Some(_) => None,
                     };
-                    let extra = item
-                        .as_mapping()
-                        .is_some_and(|m| m.keys().any(|k| !matches!(k.as_str(), Some("target" | "mode"))));
-                    match (target, mode) {
-                        (Some(t), Some(mode)) if t.starts_with('/') && !extra => {
-                            m.shared.insert(name.to_string(), SharedMount { target: t.to_string(), mode });
+                    let services = match item.get("services") {
+                        None => Some(None),
+                        Some(Value::Sequence(list)) if !list.is_empty() => list
+                            .iter()
+                            .map(|s| s.as_str().filter(|s| !s.is_empty()).map(str::to_string))
+                            .collect::<Option<Vec<_>>>()
+                            .map(Some),
+                        Some(_) => None,
+                    };
+                    let extra = item.as_mapping().is_some_and(|m| {
+                        m.keys()
+                            .any(|k| !matches!(k.as_str(), Some("target" | "mode" | "services")))
+                    });
+                    match (target, mode, services) {
+                        (Some(t), Some(mode), Some(services)) if t.starts_with('/') && !extra => {
+                            m.shared.insert(
+                                name.to_string(),
+                                SharedMount {
+                                    target: t.to_string(),
+                                    mode,
+                                    services,
+                                },
+                            );
                         }
                         _ => refuse(
                             &at,
-                            "must be `{ target, mode }`, with an absolute target and a mode of `snapshot`, `ro` or `rw`"
+                            "must be `{ target, mode, services }`, with an absolute target, a mode of `snapshot`, \
+                             `ro` or `rw`, and optionally a list of services"
                                 .into(),
                         ),
                     }
@@ -366,7 +408,7 @@ idle_timeout: 1h30m
 auth: [{{ user: preview, hash: "{HASH}" }}]
 shared:
   corpus: {{ target: /corpus, mode: snapshot }}
-  maps: {{ target: /maps }}
+  maps: {{ target: /maps, services: [web] }}
 nest: blog
 arch: arm64
 node_labels: {{ disk: ssd, gen: 3 }}
@@ -386,6 +428,10 @@ node_labels: {{ disk: ssd, gen: 3 }}
         );
         assert_eq!(m.shared["corpus"].mode, SharedMode::Snapshot);
         assert_eq!(m.shared["maps"].mode, SharedMode::Ro);
+        assert_eq!(m.shared["corpus"].services, None);
+        assert!(m.shared["corpus"].mounted_into("db"));
+        assert_eq!(m.shared["maps"].services, Some(vec!["web".to_string()]));
+        assert!(!m.shared["maps"].mounted_into("db"));
         assert_eq!(m.nest.as_deref(), Some("blog"));
         assert_eq!(m.arch, Some(Arch::Arm64));
         assert_eq!(m.node_labels["gen"], "3");
@@ -430,6 +476,18 @@ node_labels: {{ disk: ssd, gen: 3 }}
                 "x-kiwi-nest.shared.corpus",
             ),
             ("shared: { '../x': { target: /c } }", "x-kiwi-nest.shared"),
+            (
+                "shared: { corpus: { target: /c, services: web } }",
+                "x-kiwi-nest.shared.corpus",
+            ),
+            (
+                "shared: { corpus: { target: /c, services: [] } }",
+                "x-kiwi-nest.shared.corpus",
+            ),
+            (
+                "shared: { corpus: { target: /c, size: 1 } }",
+                "x-kiwi-nest.shared.corpus",
+            ),
             ("nest: Blog", "x-kiwi-nest.nest"),
             ("arch: x86_64", "x-kiwi-nest.arch"),
             ("node_labels: [ssd]", "x-kiwi-nest.node_labels"),
