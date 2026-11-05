@@ -990,6 +990,14 @@ async fn send_backups_continue_chains_from_what_both_sides_have() {
     }
     let dir = tempfile::tempdir_in(std::fs::canonicalize(btrfs).unwrap()).unwrap();
     let root = dir.path().to_path_buf();
+    // Whatever happens, its subvolumes (read-only snapshots too) go with it.
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = kn_btrfs::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
     let docker = root.join("docker");
     std::fs::write(&docker, FAKE_DOCKER).unwrap();
     std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();

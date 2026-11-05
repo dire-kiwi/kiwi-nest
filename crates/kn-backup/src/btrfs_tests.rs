@@ -10,8 +10,25 @@ use kn_proto::backup::{DirConfig, Format, Keep, Kind, TargetConfig};
 use crate::receive::{Btrfs, Chain};
 use crate::{Key, RestoreTo, Stamp, Target};
 
+/// A fresh directory on btrfs, removed with its subvolumes (read-only ones too) when dropped.
+pub(crate) struct BtrfsDir(tempfile::TempDir);
+
+impl BtrfsDir {
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+impl Drop for BtrfsDir {
+    fn drop(&mut self) {
+        if let Err(e) = kn_btrfs::remove_tree(self.0.path()) {
+            eprintln!("couldn't remove {}: {e}", self.0.path().display());
+        }
+    }
+}
+
 /// A fresh directory on btrfs, if this runs as root with one.
-pub(crate) fn root_btrfs() -> Option<tempfile::TempDir> {
+pub(crate) fn root_btrfs() -> Option<BtrfsDir> {
     let Ok(dir) = std::env::var("KIWI_NEST_TEST_BTRFS_DIR") else {
         eprintln!("skipped: set KIWI_NEST_TEST_BTRFS_DIR to a directory on btrfs, and run as root");
         return None;
@@ -21,7 +38,7 @@ pub(crate) fn root_btrfs() -> Option<tempfile::TempDir> {
         return None;
     }
     let dir = std::fs::canonicalize(dir).unwrap();
-    Some(tempfile::tempdir_in(dir).unwrap())
+    Some(BtrfsDir(tempfile::tempdir_in(dir).unwrap()))
 }
 
 /// Every file under a directory, with what a restore must keep: type, mode, owner, size, times, link target,
@@ -183,21 +200,7 @@ fn a_chain_of_kernel_streams_restores_exactly() {
 }
 
 fn crate_remove(p: &Path) -> anyhow::Result<()> {
-    fn go(p: &Path) -> anyhow::Result<()> {
-        if kn_btrfs::inspect(p).is_ok() {
-            return Ok(kn_btrfs::destroy(p)?);
-        }
-        if p.is_dir() {
-            for e in std::fs::read_dir(p)? {
-                go(&e?.path())?;
-            }
-            std::fs::remove_dir(p)?;
-        } else {
-            std::fs::remove_file(p)?;
-        }
-        Ok(())
-    }
-    go(p)
+    Ok(kn_btrfs::remove_tree(p)?)
 }
 
 fn target(dir: &Path, format: Format) -> Target {
@@ -265,7 +268,37 @@ async fn backups_of_a_set_restore_through_a_target() {
     let have: Vec<Vec<String>> = ["data", "logs"].iter().map(|v| describe(&got[*v])).collect();
     assert_eq!(have, want);
 
-    // Plain `btrfs receive` reads the same object, where btrfs-progs is installed.
+    // Plain `btrfs receive` reads the same objects, where btrfs-progs is installed.
+    let progs = base.join("btrfs-receive");
+    std::fs::create_dir(&progs).unwrap();
+    let mut received = true;
+    for k in [&k1, &k2] {
+        let file = store.join(k.to_string());
+        std::fs::create_dir_all(progs.join(k.stamp.to_string())).unwrap();
+        let ok = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("zstd -dc \"$1\" | btrfs receive \"$2\"")
+            .args([
+                "sh",
+                &file.to_string_lossy(),
+                &progs.join(k.stamp.to_string()).to_string_lossy(),
+            ])
+            .status();
+        match ok {
+            Ok(s) if s.success() => {}
+            other => {
+                eprintln!("btrfs receive not checked: {other:?}");
+                received = false;
+                break;
+            }
+        }
+    }
+    if received {
+        let at = progs.join(k2.stamp.to_string());
+        let have: Vec<Vec<String>> = ["data", "logs"].iter().map(|v| describe(&at.join(v))).collect();
+        assert_eq!(have, want);
+    }
+
     let tt = target(&base.join("store-tar"), Format::Tar);
     let kt = Key::new(Kind::App, "blog", Stamp(1_800_000_100), None, Format::Tar);
     let notes = Arc::new(std::sync::Mutex::new(Vec::new()));

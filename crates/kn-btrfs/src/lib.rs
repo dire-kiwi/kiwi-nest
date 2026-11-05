@@ -641,6 +641,26 @@ pub fn send(path: &Path, parent: Option<&Path>, out: &mut dyn io::Write) -> Resu
     }
 }
 
+/// Removes everything at `path`, without following symlinks: subvolumes (read-only ones too) are destroyed, and
+/// directories emptied first. Nothing there is fine. For cleaning up after tests and failed operations.
+pub fn remove_tree(path: &Path) -> io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !meta.is_dir() {
+        return std::fs::remove_file(path);
+    }
+    if std::os::unix::fs::MetadataExt::ino(&meta) == SUBVOLUME_ROOT_INODE && inspect(path).is_ok() {
+        return destroy(path).map_err(io::Error::other);
+    }
+    for e in std::fs::read_dir(path)? {
+        remove_tree(&e?.path())?;
+    }
+    std::fs::remove_dir(path)
+}
+
 /// Whether this process can send subvolumes: whether it runs as root.
 pub fn can_send() -> bool {
     // SAFETY: `geteuid` has no preconditions.
