@@ -18,7 +18,11 @@
 //!   for that app's or volume's earlier changes first; deletes and volume changes wait for every earlier change.
 //! - **Commands** each run in a task of their own, and their results (or, for logs, their output, streamed) are
 //!   sent back on the link.
+//! - **Forgotten.** When the server answers that it forgot the node (`node forget`, and only that: see
+//!   [`LinkError::Forgotten`]), the agent stops applying anything, takes every app down, sets the node's data aside
+//!   and stops; see [`forgotten`]. It refuses to start again until it's given a fresh join token.
 
+pub mod forgotten;
 mod link;
 #[cfg(test)]
 mod tests;
@@ -38,13 +42,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use tokio_util::sync::CancellationToken;
 
+pub use forgotten::Forgotten;
 pub use link::{Link, LinkError, install_tls};
 
+use crate::NodeConfig;
 use crate::api::ApiError;
 use crate::apps::{Apps, AppsError, DeployOptions, LoadSource, Logs, write_atomic};
+use crate::runtime::Runtime;
 
-/// Version 1: the server, the node's ID, name and token, and what it has applied.
-const FILE_VERSION: u32 = 1;
+/// Version 1: the server, the node's ID, name and token, and what it has applied. Version 2 added `forgotten`.
+const FILE_VERSION: u32 = 2;
 
 /// How the agent is set up.
 #[derive(Debug, Clone)]
@@ -91,12 +98,53 @@ struct AgentFile {
     server: String,
     node_id: u64,
     name: String,
+    /// Empty once the node is forgotten.
     token: String,
     /// The token the ingress adds to its requests to the gateway.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ingress_token: Option<String>,
     #[serde(default)]
     applied: Applied,
+    /// Set once the server said it forgot this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forgotten: Option<Forgotten>,
+}
+
+/// Reads `STATE/agent.json`, if it's there.
+fn read_file(path: &Path) -> anyhow::Result<Option<AgentFile>> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let f: AgentFile = serde_json::from_slice(&bytes).with_context(|| format!("reading {}", path.display()))?;
+            if f.version > FILE_VERSION {
+                anyhow::bail!("{} was written by a newer kiwi-nest", path.display());
+            }
+            Ok(Some(f))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+    }
+}
+
+/// Run before the node opens its apps. If the server forgot this node: finishes taking its apps down and setting its
+/// data aside if that was cut off, so an app that should be down is never adopted (and started) again; then refuses,
+/// unless the node is given a fresh join token (`joining`) to start again as a new node.
+pub async fn prepare(cfg: &NodeConfig, runtime: &dyn Runtime, joining: bool) -> anyhow::Result<()> {
+    let path = cfg.state_dir.join("agent.json");
+    let Some(mut f) = read_file(&path)? else { return Ok(()) };
+    let Some(mut rec) = f.forgotten.clone() else {
+        return Ok(());
+    };
+    if !rec.done {
+        tracing::warn!("the server forgot this node; finishing taking its apps down and setting its data aside");
+        rec = forgotten::set_aside(cfg, runtime, rec).await?;
+        f.forgotten = Some(rec.clone());
+        let bytes = serde_json::to_vec_pretty(&f)?;
+        tokio::task::spawn_blocking(move || write_atomic(&path, &bytes)).await??;
+    }
+    if !joining {
+        anyhow::bail!("{}", rec.describe());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -177,6 +225,11 @@ struct Inner {
     /// The serial of the next report: milliseconds since the epoch when the agent started, so it keeps growing
     /// across restarts too.
     serial: std::sync::atomic::AtomicU64,
+    /// Set once the server says it forgot this node: nothing more is applied or run.
+    forgotten: std::sync::atomic::AtomicBool,
+    /// Held (shared) while a change is applied or a command that changes something runs, and exclusively once the
+    /// node is forgotten, to wait for those in flight.
+    applying: tokio::sync::RwLock<()>,
 }
 
 fn now() -> u64 {
@@ -216,13 +269,8 @@ impl Agent {
     /// Starts the agent's state: reads `agent.json`, or joins the server with the join token and writes it.
     pub async fn start(apps: Apps, cfg: AgentConfig) -> anyhow::Result<Agent> {
         let path = apps.config().state_dir.join("agent.json");
-        let file = match std::fs::read(&path) {
-            Ok(bytes) => {
-                let f: AgentFile =
-                    serde_json::from_slice(&bytes).with_context(|| format!("reading {}", path.display()))?;
-                if f.version > FILE_VERSION {
-                    anyhow::bail!("{} was written by a newer kiwi-nest", path.display());
-                }
+        let file = match read_file(&path)? {
+            Some(f) if f.forgotten.is_none() => {
                 if f.server.trim_end_matches('/') != cfg.server.trim_end_matches('/') {
                     anyhow::bail!(
                         "this node joined the server at {}, not {}; its state is in {}",
@@ -233,7 +281,21 @@ impl Agent {
                 }
                 f
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            existing => {
+                if let Some(rec) = existing.and_then(|f| f.forgotten) {
+                    if !rec.done {
+                        anyhow::bail!(
+                            "the server forgot this node, and its apps aren't all down yet; start it again to finish"
+                        );
+                    }
+                    if cfg.join_token.is_none() {
+                        anyhow::bail!("{}", rec.describe());
+                    }
+                    tracing::info!(
+                        old = rec.name,
+                        "this node was forgotten; joining again as a new node with the join token"
+                    );
+                }
                 let token = cfg
                     .join_token
                     .clone()
@@ -258,6 +320,7 @@ impl Agent {
                     token: joined.token,
                     ingress_token: Some(joined.ingress_token).filter(|t| !t.is_empty()),
                     applied: Applied::default(),
+                    forgotten: None,
                 };
                 let bytes = serde_json::to_vec_pretty(&f)?;
                 let p = path.clone();
@@ -265,7 +328,6 @@ impl Agent {
                 tracing::info!(server = cfg.server, node = f.name, "joined the server");
                 f
             }
-            Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", path.display())),
         };
         let link = Link::new(&cfg.server, &file.token, cfg.ca_certs.as_deref())?;
         let mut file = file;
@@ -301,6 +363,8 @@ impl Agent {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map_or(0, |d| d.as_millis() as u64),
                 ),
+                forgotten: std::sync::atomic::AtomicBool::new(false),
+                applying: tokio::sync::RwLock::new(()),
             }),
         })
     }
@@ -319,12 +383,22 @@ impl Agent {
         self.inner.file.lock().expect("agent file").ingress_token.clone()
     }
 
-    /// Polls the server, and reports finished changes, until `stop` is cancelled.
-    pub async fn run(&self, stop: CancellationToken) {
-        tokio::join!(
-            self.inner.clone().poll_loop(stop.clone()),
-            self.inner.clone().report_loop(stop)
+    /// Polls the server, and reports finished changes, until `stop` is cancelled. If the server says it forgot this
+    /// node, takes every app down, sets the node's data aside, and fails with why.
+    pub async fn run(&self, stop: CancellationToken) -> anyhow::Result<()> {
+        let mine = stop.child_token();
+        let (forgotten, ()) = tokio::join!(
+            async {
+                let f = self.inner.clone().poll_loop(mine.clone()).await;
+                mine.cancel();
+                f
+            },
+            self.inner.clone().report_loop(mine.clone())
         );
+        match forgotten {
+            Some(body) => Err(self.inner.forget(body).await),
+            None => Ok(()),
+        }
     }
 }
 
@@ -420,7 +494,8 @@ impl Inner {
         }
     }
 
-    async fn poll_loop(self: Arc<Self>, stop: CancellationToken) {
+    /// Returns when `stop` is cancelled, or with what the server said if it forgot this node.
+    async fn poll_loop(self: Arc<Self>, stop: CancellationToken) -> Option<kn_proto::agent::ForgottenBody> {
         let mut since = 0;
         let mut backoff = Duration::from_millis(250);
         let mut failing = false;
@@ -434,7 +509,7 @@ impl Inner {
                 report,
             };
             let result = tokio::select! {
-                _ = stop.cancelled() => return,
+                _ = stop.cancelled() => return None,
                 r = self.link.poll(&req, self.cfg.poll_wait) => r,
             };
             match result {
@@ -448,6 +523,7 @@ impl Inner {
                     self.prune(&applied).await;
                     self.dispatch(resp);
                 }
+                Err(LinkError::Forgotten(body)) if body.node_id == self.node_id => return Some(body),
                 Err(e) => {
                     if !failing {
                         tracing::warn!(server = self.cfg.server, error = %e, "polling the server failed; retrying");
@@ -456,13 +532,60 @@ impl Inner {
                         tracing::debug!(error = %e, "polling the server failed");
                     }
                     tokio::select! {
-                        _ = stop.cancelled() => return,
+                        _ = stop.cancelled() => return None,
                         _ = tokio::time::sleep(backoff) => {}
                     }
                     backoff = (backoff * 2).min(self.cfg.max_backoff);
                 }
             }
         }
+    }
+
+    /// The server forgot this node: stop applying, record it, take every app down and set the data aside. Returns
+    /// why the agent stops (or what went wrong, in which case the next start finishes the job).
+    async fn forget(&self, body: kn_proto::agent::ForgottenBody) -> anyhow::Error {
+        tracing::error!(
+            node = self.name,
+            "the server says it forgot this node: taking its apps down and setting its data aside"
+        );
+        self.forgotten.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Whatever is being applied finishes first; nothing starts after this.
+        let _all = self.applying.write().await;
+        let cfg = self.apps.config().clone();
+        let rec = Forgotten::new(
+            &cfg,
+            &self.cfg.server,
+            self.node_id,
+            &self.name,
+            body.forgotten_at,
+            now(),
+        );
+        if let Err(e) = self.mark_forgotten(rec.clone()).await {
+            return e.context("recording that the server forgot this node");
+        }
+        self.apps.close().await;
+        match forgotten::set_aside(&cfg, self.apps.runtime(), rec).await {
+            Ok(rec) => match self.mark_forgotten(rec.clone()).await {
+                Ok(()) => anyhow::anyhow!("{}", rec.describe()),
+                Err(e) => e.context("recording that the node's data is set aside"),
+            },
+            Err(e) => e,
+        }
+    }
+
+    /// Records in `agent.json` that the node was forgotten, and drops its token.
+    async fn mark_forgotten(&self, rec: Forgotten) -> anyhow::Result<()> {
+        let _guard = self.persist.lock().await;
+        let bytes = {
+            let mut f = self.file.lock().expect("agent file");
+            f.forgotten = Some(rec);
+            f.token.clear();
+            f.version = FILE_VERSION;
+            serde_json::to_vec_pretty(&*f)?
+        };
+        let p = self.path.clone();
+        tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await??;
+        Ok(())
     }
 
     fn dispatch(self: &Arc<Self>, resp: PollResponse) {
@@ -546,7 +669,13 @@ impl Inner {
                     _ = rx.changed() => continue 'next,
                 }
             }
-            match self.apply(&want).await {
+            let applying = self.applying.read().await;
+            if self.forgotten.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            let step = self.apply(&want).await;
+            drop(applying);
+            match step {
                 Step::Done(outcome) => {
                     backoff = Duration::from_millis(500);
                     if outcome.ok {
@@ -729,6 +858,20 @@ impl Inner {
                     }
                 }
             }
+        }
+        // Those that change something wait for a forgotten node to finish forgetting, and then don't run.
+        let changes = matches!(
+            c.action,
+            Action::Suspend { .. } | Action::Resume { .. } | Action::DeleteSnapshot { .. }
+        );
+        let _applying = if changes {
+            Some(self.applying.read().await)
+        } else {
+            None
+        };
+        if changes && self.forgotten.load(std::sync::atomic::Ordering::SeqCst) {
+            self.running.lock().expect("running").remove(&c.id);
+            return;
         }
         let result = match c.action {
             Action::Inspect { app } => Some(json(self.apps.inspect(&app).await)),

@@ -45,9 +45,11 @@ listening for it on :7491 and :7492. Switching between the two needs `clean`, si
 scripts/dev-cluster.sh up
 export KIWI_NEST_CONFIG_DIR=$PWD/.dev-cluster/config
 cargo run -q -- node list
-cargo run -q -- deploy blog ./path/to/bundle      # waits for the node; --node a picks one
+cargo run -q -- deploy blog ./path/to/bundle      # waits for the node; --node a picks a new nest's node
 curl -H 'Host: blog.example.com' http://127.0.0.1:7481/
 curl --cacert .dev-cluster/server/ingress-ca.crt https://blog.localhost:7443/   # through the ingress, with Caddy
+cargo run -q -- nest list
+scripts/dev-cluster.sh stop a                     # then `node forget a`; `start a` or `rejoin a` brings it back
 scripts/dev-cluster.sh down                       # or `clean`, which also removes the cluster's state
 ```
 
@@ -67,13 +69,15 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
   tests), `runtime` (the `Runtime` trait, and `Docker`, which runs `docker compose`), `apps` (one task per app, the
   state file, `--from`; `apps/shared.rs` for shared volumes; `apps/lifecycle.rs` starts, stops and adopts apps),
   `gateway` (the proxy, each app's `gate` of phases and leases, the starting page, the ingress listener's token
-  check), `agent` (the link to the server:
-  joining, the poll loop, the per-app applier and commands; `agent/link.rs` is its HTTP client), `api` (standalone
-  API). `testing` is a fake runtime for unit tests.
-- `crates/kn-server`: `store` (SQLite on its own thread, numbered migrations; `tokens`, `nodes`, `apps` for apps,
-  volumes, desired state and change status, `commands`), `bundles` (the store by digest, checking uploads), `auth`,
-  `scheduler`, `hub` (in memory: online nodes, waking polls, callers waiting on commands), `api` (for the CLI),
-  `agent` (for nodes) and `ingress` (Caddy's generated configuration, kept loaded through its admin API).
+  check), `agent` (the link to the server: joining, the poll loop, the per-app applier and commands; `agent/link.rs`
+  is its HTTP client; `agent/forgotten.rs` takes a forgotten node's apps down and sets its data aside), `api`
+  (standalone API). `testing` is a fake runtime for unit tests.
+- `crates/kn-server`: `store` (SQLite on its own thread, numbered migrations; `tokens`, `nodes` (cordons, labels,
+  forgetting and tombstones), `apps` for apps, volumes, their nests, desired state and change status, `nests`,
+  `commands`), `bundles` (the store by digest, checking uploads), `auth`, `scheduler` (placing new nests: a pure
+  filter and score, with table tests), `hub` (in memory: online nodes, waking polls, callers waiting on commands),
+  `api` (for the CLI), `agent` (for nodes) and `ingress` (Caddy's generated configuration, kept loaded through its
+  admin API).
 - `crates/kn-cli`: the CLI commands, and `config` (clusters in `~/.config/kiwi-nest/clusters.json`).
 
 ## Conventions

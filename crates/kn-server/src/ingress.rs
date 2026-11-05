@@ -199,7 +199,7 @@ pub fn routes(c: &Connection) -> Result<(Vec<Route>, Vec<String>)> {
     let mut st = c.prepare(
         "SELECT a.name, a.domain, a.auth, n.name, n.ingress_token, json_extract(n.facts, '$.ingress')
          FROM apps a JOIN nodes n ON n.id = a.node_id
-         WHERE a.state = 'active' AND a.domain IS NOT NULL
+         WHERE a.state = 'active' AND a.domain IS NOT NULL AND n.forgotten_at IS NULL
          ORDER BY a.domain",
     )?;
     type Row = (String, String, Option<String>, String, Option<String>, Option<String>);

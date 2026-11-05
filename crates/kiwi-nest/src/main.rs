@@ -24,7 +24,7 @@ enum Cmd {
     Version,
     /// Run the server: the cluster's inventory, its API, and the link its nodes poll.
     Server(ServerArgs),
-    /// Run a node, joined to a server (--server) or standalone; or `node list` the cluster's nodes.
+    /// Run a node, joined to a server (--server) or standalone; or manage the cluster's nodes (`node list`, …).
     Node(Box<NodeArgs>),
     #[command(flatten)]
     Client(kn_cli::Command),
@@ -59,6 +59,12 @@ struct ServerArgs {
     /// The longest a node's poll is held open, such as 25s.
     #[arg(long, default_value = "25s")]
     poll_timeout: String,
+    /// Memory kept back on every node when placing nests, for the system and Docker, such as 512m or 1g.
+    #[arg(long, default_value = "512m")]
+    memory_reserve: String,
+    /// The share of an idling app's `mem_limit` that placement counts against its node, from 0 to 1.
+    #[arg(long, default_value = "0.5")]
+    idle_memory_factor: f64,
     /// A node that hasn't polled for this long is offline.
     #[arg(long, default_value = "15s")]
     offline_after: String,
@@ -94,21 +100,11 @@ struct ServerArgs {
     ingress_sync: String,
 }
 
-#[derive(clap::Subcommand)]
-enum NodeCmd {
-    /// List the cluster's nodes: online or not, what they reported, and what's placed on them.
-    List {
-        /// Print JSON.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 #[derive(clap::Args)]
 #[command(args_conflicts_with_subcommands = true)]
 struct NodeArgs {
     #[command(subcommand)]
-    cmd: Option<NodeCmd>,
+    cmd: Option<kn_cli::NodeCommand>,
     /// Run on its own, with a local API on loopback (rather than joined to a server).
     #[arg(long)]
     standalone: bool,
@@ -202,6 +198,12 @@ async fn server(args: ServerArgs) -> anyhow::Result<()> {
     let mut cfg = kn_server::ServerConfig::new(absolute(args.state_dir)?);
     cfg.poll_timeout = duration("--poll-timeout", &args.poll_timeout)?;
     cfg.offline_after = duration("--offline-after", &args.offline_after)?;
+    cfg.scheduler.memory_reserve = kn_server::bundles::parse_bytes(&args.memory_reserve)
+        .with_context(|| format!("bad --memory-reserve {}", args.memory_reserve))?;
+    if !(0.0..=1.0).contains(&args.idle_memory_factor) {
+        bail!("--idle-memory-factor must be between 0 and 1");
+    }
+    cfg.scheduler.idle_factor = args.idle_memory_factor;
     if cfg.poll_timeout.is_zero() || cfg.poll_timeout.as_secs() > kn_proto::agent::MAX_POLL_SECS {
         bail!(
             "--poll-timeout must be between 1s and {}s",
@@ -245,8 +247,8 @@ async fn server(args: ServerArgs) -> anyhow::Result<()> {
 }
 
 async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result<()> {
-    if let Some(NodeCmd::List { json }) = args.cmd {
-        return kn_cli::node_list(global, json).await;
+    if let Some(cmd) = args.cmd {
+        return kn_cli::node(global, cmd).await;
     }
     let server = match (&global.server, args.standalone) {
         (Some(_), true) => bail!("a node is either --standalone or joined to a --server, not both"),

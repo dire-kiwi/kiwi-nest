@@ -173,7 +173,7 @@ pub fn check_ingress_listen(addr: &SocketAddr) -> anyhow::Result<()> {
 /// Prints `gateway on http://ADDR`, then `ingress gateway on http://ADDR` if it listens for the ingress
 /// (`ingress_listen`, on the node's private address), then `node NAME polling URL` once it has joined (on its
 /// first start, with `agent.join_token`). Apps keep running after the node exits, and the next node agent adopts
-/// them.
+/// them, unless the server forgot the node: then it takes them down, sets its data aside and fails.
 pub async fn run_agent(
     cfg: NodeConfig,
     mut agent: agent::AgentConfig,
@@ -184,6 +184,9 @@ pub async fn run_agent(
     if let Some(a) = &ingress_listen {
         check_ingress_listen(a)?;
     }
+    // A node the server forgot finishes taking its apps down before it opens (and adopts) them.
+    cfg.validate()?;
+    agent::prepare(&cfg, &runtime::Docker::new(&cfg.docker), agent.join_token.is_some()).await?;
     let apps = apps::Apps::open(cfg).await?;
     let gw_listener = tokio::net::TcpListener::bind(gateway_listen)
         .await
@@ -230,7 +233,12 @@ pub async fn run_agent(
             stop.cancel();
         }
     });
-    let polling = agent.run(stop.clone());
+    let polling = async {
+        let r = agent.run(stop.clone()).await;
+        // Forgotten: the gateways stop too, and the node exits with why.
+        stop.cancel();
+        r
+    };
     let gateway = gateway::serve(
         gw_listener,
         apps.clone(),
@@ -243,7 +251,8 @@ pub async fn run_agent(
             None => Ok(()),
         }
     };
-    let ((), served, served_ingress) = tokio::join!(polling, gateway, for_ingress);
+    let (polled, served, served_ingress) = tokio::join!(polling, gateway, for_ingress);
+    polled?;
     served?;
     served_ingress?;
     tracing::info!("stopped; apps keep running");

@@ -358,8 +358,14 @@ impl Server {
 
     /// Kills the server and starts it again on the same state and address.
     pub fn restart(&mut self) {
+        self.down_for(Duration::ZERO);
+    }
+
+    /// Kills the server, waits a while (an outage, as the nodes see it), and starts it again as it was.
+    pub fn down_for(&mut self, outage: Duration) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        std::thread::sleep(outage);
         let (child, url, admin) = spawn_server(&self.dir.path().join("server"), &self.addr, &self.extra);
         assert!(admin.is_none(), "a restart makes no new admin token");
         assert_eq!(url, self.direct_url());
@@ -491,7 +497,8 @@ impl ClusterNode {
         n
     }
 
-    fn spawn(&mut self, join_token: Option<String>) {
+    /// The command that runs this node.
+    fn command(&self, join_token: Option<String>) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.args(["node", "--server", &self.server, "--name", &self.name])
             .args(["--gateway-listen", "127.0.0.1:0", "--up-timeout", "2m"])
@@ -507,14 +514,18 @@ impl ClusterNode {
                 std::env::var("KIWI_NEST_LOG").unwrap_or_else(|_| "warn".into()),
             )
             .env_remove("KIWI_NEST_TOKEN")
-            .stdout(Stdio::piped());
+            .env_remove("KIWI_NEST_JOIN_TOKEN");
         if let Some(t) = join_token {
             cmd.args(["--join-token", &t]);
         }
         if let Some(ca) = &self.ca_cert {
             cmd.arg("--ca-cert").arg(ca);
         }
-        let mut child = cmd.spawn().unwrap();
+        cmd
+    }
+
+    fn spawn(&mut self, join_token: Option<String>) {
+        let mut child = self.command(join_token).stdout(Stdio::piped()).spawn().unwrap();
         let ingress = self.extra.iter().any(|a| a == "--ingress-listen");
         let lines = first_lines(&mut child, if ingress { 3 } else { 2 }, "the node");
         let port = |line: &str, prefix: &str| -> u16 {
@@ -535,6 +546,38 @@ impl ClusterNode {
             "{lines:?}"
         );
         self.child = Some(child);
+    }
+
+    /// Runs the node until it exits by itself (it refuses to start, say), and returns what it printed.
+    pub fn run_once(&self, join_token: Option<String>) -> Output {
+        assert!(self.child.is_none());
+        self.command(join_token).output().unwrap()
+    }
+
+    /// Waits for the running node to exit by itself.
+    pub fn exits(&mut self) -> std::process::ExitStatus {
+        let mut c = self.child.take().expect("a running node");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = c.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() > deadline {
+                let _ = c.kill();
+                panic!("node {} should have exited", self.name);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Starts the node with a fresh join token.
+    pub fn join_again(&mut self, server: &Server) {
+        assert!(self.child.is_none());
+        self.spawn(Some(server.join_token()));
+    }
+
+    pub fn volumes_dir(&self) -> &Path {
+        self.volumes.path()
     }
 
     /// Kills the node agent (SIGKILL), wherever it was. Its apps keep running.

@@ -4,7 +4,7 @@
 //!   state of each node, and commands.
 //! - [`bundles`] keeps bundles as files named by digest, and checks uploads.
 //! - [`auth`] makes and checks tokens.
-//! - [`scheduler`] picks a node for a new app or volume.
+//! - [`scheduler`] places new nests on nodes.
 //! - [`hub`] is what's only in memory: which nodes are online, waking polls, and callers waiting for results.
 //! - [`api`] is the API for the CLI, and [`agent`] the link for nodes.
 //! - [`ingress`] configures the cluster's Caddy.
@@ -65,6 +65,8 @@ pub struct ServerConfig {
     pub load_limits: Limits,
     /// The ingress Caddy to configure, if any.
     pub ingress: Option<ingress::IngressConfig>,
+    /// How placement counts memory.
+    pub scheduler: scheduler::Settings,
 }
 
 impl ServerConfig {
@@ -77,6 +79,7 @@ impl ServerConfig {
             limits: Limits::default(),
             load_limits: Limits::for_volumes(),
             ingress: None,
+            scheduler: scheduler::Settings::default(),
         }
     }
 }

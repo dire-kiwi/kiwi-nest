@@ -11,7 +11,9 @@
 //!   previews of `blog` without being able to change it. They can't create, load or delete volumes, nor mount one
 //!   read-write (`ro` and `snapshot` mounts can't change it), and they can't touch nodes or tokens.
 //! - **Join** tokens are used once, by a node, to get its node token.
-//! - **Node** tokens are a node's own, for the agent link only.
+//! - **Node** tokens are a node's own, for the agent link only. `node forget` revokes one but keeps it, so the node
+//!   is told it was forgotten (`410 Gone`) rather than that its token is wrong (`401`), which a token that was
+//!   never issued gets.
 //!
 //! Each node also has an ingress token (`kni_…`), given to it when it joins, which the ingress adds to every request
 //! it passes to the node's gateway; see [`crate::ingress`].
@@ -24,6 +26,7 @@ use sha2::{Digest, Sha256};
 
 use crate::Server;
 use crate::error::{Error, Result};
+use crate::store::nodes::TokenOwner;
 
 /// Makes a new token of a kind.
 pub fn generate(kind: TokenKind) -> String {
@@ -194,7 +197,8 @@ impl FromRequestParts<Server> for NodeCaller {
         let h = hash(bearer(parts)?);
         let found = server.store.call(move |c| crate::store::nodes::by_token(c, &h)).await?;
         match found {
-            Some((node_id, name)) => Ok(NodeCaller { node_id, name }),
+            Some(TokenOwner::Node { id, name }) => Ok(NodeCaller { node_id: id, name }),
+            Some(TokenOwner::Forgotten { id, name, at }) => Err(Error::Forgotten { node_id: id, name, at }),
             None => Err(Error::Unauthorized("the node token isn't valid".into())),
         }
     }
