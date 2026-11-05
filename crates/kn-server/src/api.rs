@@ -17,7 +17,8 @@ use kn_proto::agent::{Action, CommandResult};
 use kn_proto::api::{
     AppInfo, AppSummary, ChangeStatus, CommandInfo, CommandsQuery, CreateToken, CreatedToken, DeleteQuery, DeployQuery,
     ForgetQuery, Forgot, GcQuery, GcReport, LabelRequest, LogsQuery, NestInfo, NodeInfo, NodeUsage, PruneQuery,
-    PruneReport, RegistryInfo, TokenInfo, TokenKind, UpgradeStatus, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery, WhoAmI,
+    PruneReport, RegistryInfo, TokenInfo, TokenKind, UpgradeStatus, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery,
+    WhoAmI,
 };
 use kn_proto::backup::{BackupInfo, BackupQuery, BackupResult, Kind as BackupKind, ListQuery, Restore};
 use kn_proto::state::AppStatus;

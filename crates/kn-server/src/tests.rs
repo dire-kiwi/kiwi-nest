@@ -23,6 +23,8 @@ pub(crate) struct Env {
     ingress: Option<ingress::IngressConfig>,
     /// The registry, and a fake for its container.
     registry: Option<(registry::RegistryConfig, Arc<dyn registry::container::Container>)>,
+    /// The releases the server offers nodes.
+    releases: Vec<upgrades::Offer>,
     pub(crate) url: String,
     pub(crate) admin: String,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -37,6 +39,8 @@ fn config(dir: &std::path::Path, targets: &[kn_proto::backup::TargetConfig]) -> 
     cfg.command_timeout = Duration::from_secs(10);
     cfg.backup_targets = targets.to_vec();
     cfg.backup_check_interval = Duration::from_millis(200);
+    cfg.upgrade_check_interval = Duration::from_millis(100);
+    cfg.upgrade_restart_timeout = Duration::from_secs(2);
     cfg
 }
 
@@ -74,6 +78,7 @@ impl Env {
             server: None,
             ingress,
             registry,
+            releases: Vec::new(),
             url: String::new(),
             admin: String::new(),
             stop: None,
@@ -89,6 +94,7 @@ impl Env {
         let mut cfg = config(self.dir.path(), &self.targets);
         cfg.ingress = self.ingress.clone();
         cfg.registry = self.registry.as_ref().map(|r| r.0.clone());
+        cfg.releases = self.releases.clone();
         let (server, first) = Server::open_with(cfg, self.registry.as_ref().map(|r| r.1.clone()))
             .await
             .unwrap();
@@ -2607,4 +2613,248 @@ async fn nodes_report_their_space_and_their_apps_activity() {
     assert_eq!(usage.data_bytes, 14 << 20);
     assert_eq!(usage.backup_snapshots, space);
     assert_eq!(usage.measured_at, "2027-01-15T08:01:40Z");
+}
+
+#[tokio::test]
+async fn older_clis_are_refused_with_a_clear_error() {
+    let env = Env::new().await;
+    let with_ua = |ua: &str, path: &str| {
+        env.req(reqwest::Method::GET, path, &env.admin)
+            .header(reqwest::header::USER_AGENT, ua)
+    };
+    let r = with_ua("kiwi-nest/0.0.1", "/apps").send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::UPGRADE_REQUIRED);
+    let body: ErrorBody = r.json().await.unwrap();
+    assert!(
+        body.error.contains("the CLI must be at least as new as the server"),
+        "{}",
+        body.error
+    );
+    assert!(
+        body.error.contains(&format!("kiwi-nest {}", kn_proto::VERSION)),
+        "{}",
+        body.error
+    );
+    // The users' routes too; but an old CLI can still ask the server's version.
+    let r = with_ua("kiwi-nest/0.0.1", "/users").send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::UPGRADE_REQUIRED);
+    let r = with_ua("kiwi-nest/0.0.1", "/version").send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    // The same version, a newer one, and other clients are served.
+    let newer = format!("kiwi-nest/{}.0.0", Version::current().major + 1);
+    for ua in [format!("kiwi-nest/{}", kn_proto::VERSION), newer, "curl/8.0".into()] {
+        let r = with_ua(&ua, "/apps").send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "{ua}");
+    }
+    let r = env.req(reqwest::Method::GET, "/apps", &env.admin).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+}
+
+use kn_proto::version::Version;
+
+impl Env {
+    async fn upgrade_status(&self) -> kn_proto::api::UpgradeStatus {
+        let r = self
+            .req(reqwest::Method::GET, "/upgrade", &self.admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        r.json().await.unwrap()
+    }
+
+    /// Polls `n` until it's given a command, which it then lists as running.
+    async fn next_command(&self, n: &mut FakeNode) -> kn_proto::agent::Command {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut resp = self.poll(n).await;
+            if let Some(c) = resp.commands.pop() {
+                n.report.running_commands = vec![c.id];
+                return c;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no command came");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Polls `n` for a while, checking it's given no command.
+    async fn no_command(&self, n: &mut FakeNode) {
+        for _ in 0..6 {
+            assert!(self.poll(n).await.commands.is_empty(), "a command came");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn answer(&self, n: &mut FakeNode, id: u64, result: CommandResult) {
+        let r = self
+            .req(reqwest::Method::POST, &format!("/agent/commands/{id}/result"), &n.token)
+            .json(&result)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        n.report.running_commands.clear();
+    }
+
+    async fn until_rollout(&self, what: &str, pred: impl Fn(&kn_proto::api::UpgradeStatus) -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = self.upgrade_status().await;
+            if pred(&st) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}: {st:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+fn state_of(st: &kn_proto::api::UpgradeStatus, node: &str) -> kn_proto::api::UpgradeState {
+    st.nodes.iter().find(|n| n.node == node).unwrap().state
+}
+
+#[tokio::test]
+async fn the_server_upgrades_older_nodes_one_at_a_time_and_a_failure_halts_it() {
+    use kn_proto::api::UpgradeState::*;
+    let mut env = Env::new().await;
+    let release = env.dir.path().join("release");
+    std::fs::write(&release, b"the new kiwi-nest").unwrap();
+    let sha256 = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"the new kiwi-nest"));
+    env.releases = vec![upgrades::Offer {
+        arch: "amd64".into(),
+        path: release,
+        sha256: sha256.clone(),
+        size: 17,
+    }];
+    env.restart().await;
+
+    let old = |protocol: u32, self_upgrade: bool| NodeFacts {
+        version: "0.0.1".into(),
+        protocol,
+        self_upgrade,
+        ..facts(4 << 30)
+    };
+    let mut a = env.join_with("a", old(kn_proto::agent::PROTOCOL, true)).await;
+    let mut b = env.join_with("b", old(kn_proto::agent::PROTOCOL, true)).await;
+    let mut c = env
+        .join_with("c", old(kn_proto::agent::UPGRADE_PROTOCOL - 1, true))
+        .await;
+    let mut d = env.join_with("d", old(kn_proto::agent::PROTOCOL, false)).await;
+    let mut e = env.join("e", 4 << 30).await;
+    for n in [&mut c, &mut d, &mut e] {
+        env.poll(n).await;
+    }
+
+    // `a` first, and `b` waits its turn.
+    let cmd = env.next_command(&mut a).await;
+    let Action::Upgrade {
+        version,
+        sha256: sum,
+        size,
+    } = cmd.action.clone()
+    else {
+        panic!("{cmd:?}")
+    };
+    assert_eq!(
+        (version.as_str(), sum.as_str(), size),
+        (kn_proto::VERSION, sha256.as_str(), 17)
+    );
+    env.no_command(&mut b).await;
+    let st = env.upgrade_status().await;
+    assert_eq!(st.version, kn_proto::VERSION);
+    assert_eq!(st.arches, ["amd64"]);
+    assert_eq!(
+        ["a", "b", "c", "d", "e"].map(|n| state_of(&st, n)),
+        [Upgrading, Pending, Manual, Manual, Current]
+    );
+    // It downloads the release (only the server's own version), and answers.
+    let r = env
+        .req(
+            reqwest::Method::GET,
+            &format!("/agent/releases/{version}/amd64"),
+            &a.token,
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.bytes().await.unwrap().as_ref(), b"the new kiwi-nest");
+    for path in [
+        "/agent/releases/0.0.1/amd64".to_string(),
+        format!("/agent/releases/{version}/arm64"),
+    ] {
+        let r = env.req(reqwest::Method::GET, &path, &a.token).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    let ok = CommandResult::Ok {
+        value: json!({ "version": kn_proto::VERSION, "restarting": true }),
+    };
+    env.answer(&mut a, cmd.id, ok.clone()).await;
+    // It comes back running the server's version: then it's `b`'s turn.
+    a.facts.version = kn_proto::VERSION.into();
+    env.poll(&mut a).await;
+    let cmd = env.next_command(&mut b).await;
+    assert_eq!(state_of(&env.upgrade_status().await, "a"), Current);
+
+    // `b` refuses: the rollout halts.
+    let refused = CommandResult::Err {
+        status: 500,
+        error: ErrorBody {
+            error: "release 9 doesn't match its checksum".into(),
+            problems: vec![],
+        },
+    };
+    env.answer(&mut b, cmd.id, refused).await;
+    env.until_rollout("b to fail", |st| st.halted && state_of(st, "b") == Failed)
+        .await;
+    let st = env.upgrade_status().await;
+    let detail = st.nodes.iter().find(|n| n.node == "b").unwrap().detail.clone().unwrap();
+    assert!(detail.contains("doesn't match its checksum"), "{detail}");
+    env.no_command(&mut b).await;
+
+    // Carrying on tries it again; this time it says it restarts, but never comes back running the new release.
+    let r = env
+        .req(reqwest::Method::POST, "/upgrade", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let cmd = env.next_command(&mut b).await;
+    env.answer(&mut b, cmd.id, ok.clone()).await;
+    for _ in 0..30 {
+        env.poll(&mut b).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    env.until_rollout("b not to come back", |st| st.halted).await;
+    let st = env.upgrade_status().await;
+    let detail = st.nodes.iter().find(|n| n.node == "b").unwrap().detail.clone().unwrap();
+    assert!(detail.contains("didn't come back"), "{detail}");
+
+    // Again, and it does.
+    env.req(reqwest::Method::POST, "/upgrade", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    let cmd = env.next_command(&mut b).await;
+    env.answer(&mut b, cmd.id, ok).await;
+    b.facts.version = kn_proto::VERSION.into();
+    env.poll(&mut b).await;
+    env.until_rollout("b to be upgraded", |st| !st.halted && state_of(st, "b") == Current)
+        .await;
+    // Those that can't be upgraded by the server get nothing.
+    env.no_command(&mut c).await;
+    env.no_command(&mut d).await;
+    let st = env.upgrade_status().await;
+    let detail = |n: &str| st.nodes.iter().find(|x| x.node == n).unwrap().detail.clone().unwrap();
+    assert!(detail("c").contains("before upgrades"), "{}", detail("c"));
+    assert!(detail("d").contains("installed release"), "{}", detail("d"));
+
+    // Deploy tokens can't see or start the rollout.
+    let deploy = env.token(json!({"kind": "deploy", "patterns": ["x*"]})).await;
+    for m in [reqwest::Method::GET, reqwest::Method::POST] {
+        let r = env.req(m, "/upgrade", &deploy).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
 }

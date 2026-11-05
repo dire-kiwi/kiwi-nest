@@ -2136,121 +2136,6 @@ fn print_info(i: &AppInfo) {
     );
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn global(dir: &Path) -> GlobalArgs {
-        GlobalArgs {
-            node_api: None,
-            cluster: None,
-            server: None,
-            token: None,
-            config_dir: Some(dir.to_path_buf()),
-            ca_cert: None,
-        }
-    }
-
-    #[test]
-    fn a_clusters_ca_certificate_is_used_unless_another_is_given() {
-        let d = tempfile::tempdir().unwrap();
-        let mut cfg = config::Config::default();
-        cfg.clusters.insert(
-            "home".into(),
-            config::Cluster {
-                url: "https://kn.home.example".into(),
-                token: "kna_home".into(),
-                ca_cert: Some("-----BEGIN CERTIFICATE-----".into()),
-            },
-        );
-        cfg.current = Some("home".into());
-        cfg.save(d.path()).unwrap();
-        let Target::Server { ca, .. } = Target::resolve(&global(d.path())).unwrap() else {
-            panic!("a server")
-        };
-        assert_eq!(ca.as_deref(), Some(&b"-----BEGIN CERTIFICATE-----"[..]));
-        // A --ca-cert that isn't a certificate is refused, rather than ignored.
-        let bad = d.path().join("bad.pem");
-        std::fs::write(&bad, "not a certificate").unwrap();
-        let g = GlobalArgs {
-            ca_cert: Some(bad.clone()),
-            ..global(d.path())
-        };
-        let err = format!("{:#}", Target::resolve(&g).unwrap_err());
-        assert!(err.contains("no PEM certificate"), "{err}");
-        let g = GlobalArgs {
-            ca_cert: Some(d.path().join("missing.pem")),
-            ..global(d.path())
-        };
-        assert!(Target::resolve(&g).is_err());
-    }
-
-    #[test]
-    fn only_a_server_briefly_away_is_retried() {
-        let gateway: anyhow::Error = StatusError {
-            status: 502,
-            message: "bad gateway".into(),
-        }
-        .into();
-        assert!(transient(&gateway.context("following the deploy")));
-        let refused: anyhow::Error = StatusError {
-            status: 403,
-            message: "no".into(),
-        }
-        .into();
-        assert!(!transient(&refused));
-        assert!(!transient(&anyhow::anyhow!("couldn't reach the server")));
-    }
-
-    #[test]
-    fn the_target_comes_from_flags_then_the_config() {
-        let d = tempfile::tempdir().unwrap();
-        // Nothing configured: the standalone node on this machine.
-        assert!(matches!(Target::resolve(&global(d.path())).unwrap(), Target::Node(u) if u == DEFAULT_NODE_API));
-        let mut cfg = config::Config::default();
-        for (name, url) in [("home", "https://home.example"), ("work", "https://work.example")] {
-            cfg.clusters.insert(
-                name.into(),
-                config::Cluster {
-                    url: url.into(),
-                    token: format!("kna_{name}"),
-                    ca_cert: None,
-                },
-            );
-        }
-        cfg.save(d.path()).unwrap();
-        let err = Target::resolve(&global(d.path())).unwrap_err().to_string();
-        assert!(err.contains("cluster use"), "{err}");
-        cfg.current = Some("home".into());
-        cfg.save(d.path()).unwrap();
-        let Target::Server { url, token, .. } = Target::resolve(&global(d.path())).unwrap() else {
-            panic!("a server")
-        };
-        assert_eq!((url.as_str(), token.as_str()), ("https://home.example", "kna_home"));
-        let g = GlobalArgs {
-            cluster: Some("work".into()),
-            ..global(d.path())
-        };
-        assert!(matches!(Target::resolve(&g).unwrap(), Target::Server { url, .. } if url == "https://work.example"));
-        let g = GlobalArgs {
-            server: Some("http://ci.example".into()),
-            token: Some("knd_ci".into()),
-            ..global(d.path())
-        };
-        assert!(matches!(Target::resolve(&g).unwrap(), Target::Server { token, .. } if token == "knd_ci"));
-        let g = GlobalArgs {
-            node_api: Some("http://127.0.0.1:1".into()),
-            ..g
-        };
-        assert!(matches!(Target::resolve(&g).unwrap(), Target::Node(_)));
-        let g = GlobalArgs {
-            server: Some("http://ci.example".into()),
-            ..global(d.path())
-        };
-        assert!(Target::resolve(&g).is_err(), "--server needs a token");
-    }
-}
-
 /// `kiwi-nest upgrade status|nodes`.
 pub async fn upgrade(global: &GlobalArgs, cmd: UpgradeCommand) -> anyhow::Result<()> {
     let client = Client::new(&Target::resolve(global)?)?;
@@ -2376,5 +2261,120 @@ pub async fn follow_rollout(client: &Client, settle: Duration, timeout: Duration
             bail!("gave up waiting for the rollout; `kiwi-nest upgrade status` shows where it is");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn global(dir: &Path) -> GlobalArgs {
+        GlobalArgs {
+            node_api: None,
+            cluster: None,
+            server: None,
+            token: None,
+            config_dir: Some(dir.to_path_buf()),
+            ca_cert: None,
+        }
+    }
+
+    #[test]
+    fn a_clusters_ca_certificate_is_used_unless_another_is_given() {
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = config::Config::default();
+        cfg.clusters.insert(
+            "home".into(),
+            config::Cluster {
+                url: "https://kn.home.example".into(),
+                token: "kna_home".into(),
+                ca_cert: Some("-----BEGIN CERTIFICATE-----".into()),
+            },
+        );
+        cfg.current = Some("home".into());
+        cfg.save(d.path()).unwrap();
+        let Target::Server { ca, .. } = Target::resolve(&global(d.path())).unwrap() else {
+            panic!("a server")
+        };
+        assert_eq!(ca.as_deref(), Some(&b"-----BEGIN CERTIFICATE-----"[..]));
+        // A --ca-cert that isn't a certificate is refused, rather than ignored.
+        let bad = d.path().join("bad.pem");
+        std::fs::write(&bad, "not a certificate").unwrap();
+        let g = GlobalArgs {
+            ca_cert: Some(bad.clone()),
+            ..global(d.path())
+        };
+        let err = format!("{:#}", Target::resolve(&g).unwrap_err());
+        assert!(err.contains("no PEM certificate"), "{err}");
+        let g = GlobalArgs {
+            ca_cert: Some(d.path().join("missing.pem")),
+            ..global(d.path())
+        };
+        assert!(Target::resolve(&g).is_err());
+    }
+
+    #[test]
+    fn only_a_server_briefly_away_is_retried() {
+        let gateway: anyhow::Error = StatusError {
+            status: 502,
+            message: "bad gateway".into(),
+        }
+        .into();
+        assert!(transient(&gateway.context("following the deploy")));
+        let refused: anyhow::Error = StatusError {
+            status: 403,
+            message: "no".into(),
+        }
+        .into();
+        assert!(!transient(&refused));
+        assert!(!transient(&anyhow::anyhow!("couldn't reach the server")));
+    }
+
+    #[test]
+    fn the_target_comes_from_flags_then_the_config() {
+        let d = tempfile::tempdir().unwrap();
+        // Nothing configured: the standalone node on this machine.
+        assert!(matches!(Target::resolve(&global(d.path())).unwrap(), Target::Node(u) if u == DEFAULT_NODE_API));
+        let mut cfg = config::Config::default();
+        for (name, url) in [("home", "https://home.example"), ("work", "https://work.example")] {
+            cfg.clusters.insert(
+                name.into(),
+                config::Cluster {
+                    url: url.into(),
+                    token: format!("kna_{name}"),
+                    ca_cert: None,
+                },
+            );
+        }
+        cfg.save(d.path()).unwrap();
+        let err = Target::resolve(&global(d.path())).unwrap_err().to_string();
+        assert!(err.contains("cluster use"), "{err}");
+        cfg.current = Some("home".into());
+        cfg.save(d.path()).unwrap();
+        let Target::Server { url, token, .. } = Target::resolve(&global(d.path())).unwrap() else {
+            panic!("a server")
+        };
+        assert_eq!((url.as_str(), token.as_str()), ("https://home.example", "kna_home"));
+        let g = GlobalArgs {
+            cluster: Some("work".into()),
+            ..global(d.path())
+        };
+        assert!(matches!(Target::resolve(&g).unwrap(), Target::Server { url, .. } if url == "https://work.example"));
+        let g = GlobalArgs {
+            server: Some("http://ci.example".into()),
+            token: Some("knd_ci".into()),
+            ..global(d.path())
+        };
+        assert!(matches!(Target::resolve(&g).unwrap(), Target::Server { token, .. } if token == "knd_ci"));
+        let g = GlobalArgs {
+            node_api: Some("http://127.0.0.1:1".into()),
+            ..g
+        };
+        assert!(matches!(Target::resolve(&g).unwrap(), Target::Node(_)));
+        let g = GlobalArgs {
+            server: Some("http://ci.example".into()),
+            ..global(d.path())
+        };
+        assert!(Target::resolve(&g).is_err(), "--server needs a token");
     }
 }

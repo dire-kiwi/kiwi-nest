@@ -75,7 +75,7 @@ mod tests {
         assert_eq!(sums["SHA"], "b".repeat(64));
         for bad in [
             "abc  file".to_string(),
-            format!("{a}"),
+            a.clone(),
             format!("{a}  ../etc/passwd"),
             format!("{a}  dir/file"),
             format!("{a}  x\n{a}  x"),

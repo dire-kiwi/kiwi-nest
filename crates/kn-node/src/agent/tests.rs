@@ -1042,7 +1042,10 @@ async fn an_installed_node_upgrades_itself_once_its_changes_are_done_and_restart
     plain.start(Some(c.join_token().await)).await;
     c.online("plain", true).await;
     let id = c.nodes().await[0].id;
-    let r = c.server.command(id, "plain", upgrade(offer.sha256.clone()), "test").await;
+    let r = c
+        .server
+        .command(id, "plain", upgrade(offer.sha256.clone()), "test")
+        .await;
     let err = kn_server::api::result::<kn_proto::agent::UpgradeAnswer>(r.unwrap())
         .unwrap_err()
         .to_string();
@@ -1058,7 +1061,11 @@ async fn an_installed_node_upgrades_itself_once_its_changes_are_done_and_restart
     assert!(n.facts.as_ref().unwrap().self_upgrade);
 
     // A release that doesn't match its checksum is refused, and nothing is put in place.
-    let r = c.server.command(n.id, "a", upgrade("0".repeat(64)), "test").await.unwrap();
+    let r = c
+        .server
+        .command(n.id, "a", upgrade("0".repeat(64)), "test")
+        .await
+        .unwrap();
     let err = kn_server::api::result::<kn_proto::agent::UpgradeAnswer>(r)
         .unwrap_err()
         .to_string();
