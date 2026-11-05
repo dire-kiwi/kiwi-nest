@@ -742,9 +742,17 @@ impl App<'_> {
             }
             let from = match (&opts.from, first) {
                 (Some(from), true) => {
-                    if !state.apps.contains_key(from) {
+                    let Some(source) = state.apps.get(from) else {
                         return Err(AppsError::NotFoundOther(format!(
                             "app `{from}` (given as --from) doesn't exist"
+                        )));
+                    };
+                    // A first deploy may itself be waiting on another app's snapshots (its `--from`), so waiting on
+                    // it could deadlock: two apps' first deploys `--from` each other. A redeploy never waits.
+                    if source.status == AppStatus::Deploying && !Volumes::exists(&self.inner.volumes.app_dir(from))? {
+                        return Err(AppsError::Conflict(format!(
+                            "app `{from}` (given as --from) is being deployed for the first time; try again once \
+                             it's done"
                         )));
                     }
                     Some(from.clone())

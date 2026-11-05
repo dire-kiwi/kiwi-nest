@@ -140,6 +140,7 @@ impl Volumes {
         for d in ["apps", "shared"] {
             let d = root.join(d);
             std::fs::create_dir_all(&d).map_err(|e| anyhow::anyhow!("creating {}: {e}", d.display()))?;
+            kn_btrfs::open_dir(&d).map_err(|e| anyhow::anyhow!("the volumes directory: {e}"))?;
         }
         Ok(Volumes { root, fs, backend })
     }
@@ -224,6 +225,9 @@ impl Volumes {
     /// there is fine.
     pub fn remove(&self, path: &Path) -> Result<()> {
         let what = || format!("removing {}", path.display());
+        // Never through a symlink: that could reach far outside the volumes.
+        let parent = path.parent().ok_or_else(|| ctx(what())(anyhow::anyhow!("no parent")))?;
+        kn_btrfs::open_dir(parent).map_err(ctx(what()))?;
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -600,5 +604,26 @@ mod tests {
         // Removing an app's directory destroys its subvolumes.
         v.remove(&v.app_dir("blog")).unwrap();
         assert!(!Volumes::exists(&v.app_dir("blog")).unwrap());
+    }
+
+    #[test]
+    fn never_removes_through_a_symlink() {
+        let (d, v, _) = volumes();
+        let outside = std::fs::canonicalize(d.path()).unwrap().join("outside");
+        std::fs::create_dir_all(outside.join("blog/data")).unwrap();
+        std::fs::write(outside.join("blog/data/precious"), "x").unwrap();
+        let apps = v.root().join("apps");
+        std::fs::remove_dir(&apps).unwrap();
+        std::os::unix::fs::symlink(&outside, &apps).unwrap();
+        let e = v.remove(&v.app_dir("blog")).unwrap_err().to_string();
+        assert!(e.contains("is a symlink"), "{e}");
+        assert!(v.sweep().is_err() || outside.join("blog/data/precious").exists());
+        assert!(outside.join("blog/data/precious").exists());
+        // A symlink itself is removed, not what it points to.
+        std::fs::remove_file(&apps).unwrap();
+        std::fs::create_dir(&apps).unwrap();
+        std::os::unix::fs::symlink(outside.join("blog"), v.app_dir("blog")).unwrap();
+        v.remove(&v.app_dir("blog")).unwrap();
+        assert!(outside.join("blog/data/precious").exists());
     }
 }

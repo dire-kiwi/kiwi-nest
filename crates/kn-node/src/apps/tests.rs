@@ -659,3 +659,31 @@ async fn a_shared_volume_moved_into_place_but_not_recorded_is_adopted() {
     let info = env.apps.volume_info("maps").await.unwrap();
     assert!(info.problem.is_none());
 }
+
+#[tokio::test]
+async fn from_an_app_in_its_own_first_deploy_is_refused() {
+    let env = Env::new().await;
+    env.flag("fail-up", true);
+    env.deploy("prod", &["data"], None).await.unwrap_err();
+    env.flag("fail-up", false);
+    // As if `prod`'s first deploy were still running (and so might be waiting on another app's snapshots).
+    {
+        let mut state = env.apps.inner.state.lock().await;
+        state.apps.get_mut("prod").unwrap().status = AppStatus::Deploying;
+    }
+    env.vols().remove(&env.vols().app_dir("prod")).unwrap();
+    let e = env
+        .deploy("preview", &["data"], Some("prod"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("is being deployed for the first time"), "{e}");
+    // Once its volumes are in place (a redeploy), waiting on it is fine.
+    std::fs::create_dir_all(env.vols().app_dir("prod")).unwrap();
+    let e = env
+        .deploy("preview", &["data"], Some("prod"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("first time") && e.contains("`prod`'s volume `data`"), "{e}");
+}

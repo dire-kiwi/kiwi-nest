@@ -13,6 +13,10 @@ jobs:
       - name: Install the toolchain from rust-toolchain.toml
         run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
+      - name: Mount a btrfs filesystem for the tests
+        run: |
+          command -v mkfs.btrfs || { sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs; }
+          scripts/test-btrfs.sh
       - run: make check
 
   integration:
@@ -23,4 +27,8 @@ jobs:
         run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
       - run: docker version && docker compose version
+      - name: Mount a btrfs filesystem for the tests
+        run: |
+          command -v mkfs.btrfs || { sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs; }
+          scripts/test-btrfs.sh
       - run: make integration
