@@ -148,6 +148,10 @@ impl Apps {
             Ok((snapshots, problem))
         })
         .await??;
+        let (space, snapshot_space) = self
+            .usage()
+            .and_then(|u| u.shared.get(name).cloned())
+            .map_or((None, BTreeMap::new()), |(d, s)| (Some(d), s));
         Ok(VolumeInfo {
             name: rec.name,
             created_at: rfc3339(rec.created_at),
@@ -155,6 +159,8 @@ impl Apps {
             mounts,
             snapshots,
             problem,
+            space,
+            snapshot_space,
             node: None,
             nest: None,
             pending: None,

@@ -15,9 +15,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete as delete_route, get, post, put};
 use kn_proto::agent::{Action, CommandResult};
 use kn_proto::api::{
-    AppInfo, AppSummary, ChangeStatus, CreateToken, CreatedToken, DeleteQuery, DeployQuery, ForgetQuery, Forgot,
-    GcQuery, GcReport, LabelRequest, LogsQuery, NestInfo, NodeInfo, PruneQuery, PruneReport, RegistryInfo, TokenInfo,
-    TokenKind, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery, WhoAmI,
+    AppInfo, AppSummary, ChangeStatus, CommandInfo, CommandsQuery, CreateToken, CreatedToken, DeleteQuery, DeployQuery,
+    ForgetQuery, Forgot, GcQuery, GcReport, LabelRequest, LogsQuery, NestInfo, NodeInfo, NodeUsage, PruneQuery,
+    PruneReport, RegistryInfo, TokenInfo, TokenKind, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery, WhoAmI,
 };
 use kn_proto::backup::{BackupInfo, BackupQuery, BackupResult, Kind as BackupKind, ListQuery, Restore};
 use kn_proto::state::AppStatus;
@@ -48,6 +48,7 @@ pub fn router() -> Router<Server> {
         .route(&format!("{p}/apps/{{name}}/logs"), get(logs))
         .route(&format!("{p}/apps/{{name}}/suspend"), post(suspend))
         .route(&format!("{p}/apps/{{name}}/resume"), post(resume))
+        .route(&format!("{p}/apps/{{name}}/commands"), get(app_commands))
         .route(&format!("{p}/volumes"), get(volume_list))
         .route(
             &format!("{p}/volumes/{{name}}"),
@@ -197,6 +198,12 @@ impl View {
             name: self.app.name.clone(),
             status: r.map_or(AppStatus::Deploying, |r| r.status),
             generation: r.map_or(0, |r| r.generation),
+            error: r.and_then(|r| r.error.clone()),
+            idle_timeout_secs: self.app.idle_timeout_secs,
+            last_request_at: r.and_then(|r| r.last_request_at).map(rfc3339),
+            // What it last reported; an offline node's requests can't be known.
+            open_requests: r.filter(|_| self.online).map_or(0, |r| r.open_requests),
+            space: r.map(|r| r.space.clone()).unwrap_or_default(),
             domain: self
                 .app
                 .domain
@@ -224,7 +231,7 @@ impl View {
             service: String::new(),
             container_port: 0,
             port: r.map_or(0, |r| r.port),
-            idle_timeout_secs: 0,
+            idle_timeout_secs: self.app.idle_timeout_secs,
             project: String::new(),
             bundle_digest: r
                 .map(|r| r.bundle_digest.clone())
@@ -239,6 +246,8 @@ impl View {
             updated_at: rfc3339(self.app.updated_at),
             containers: Vec::new(),
             open_requests: 0,
+            last_request_at: r.and_then(|r| r.last_request_at).map(rfc3339),
+            space: r.map(|r| r.space.clone()).unwrap_or_default(),
             node: self.node.as_ref().map(|n| n.name.clone()),
             nest: self.app.nest.clone(),
             placement: self.placement(),
@@ -286,7 +295,7 @@ pub(crate) fn result<T: DeserializeOwned>(o: Outcome) -> Result<T> {
 }
 
 /// Asks an app's node for it, adding what the server knows.
-async fn inspect_on_node(s: &Server, v: &View) -> Result<AppInfo> {
+async fn inspect_on_node(s: &Server, v: &View, caller: &Caller) -> Result<AppInfo> {
     let node = v
         .node
         .as_ref()
@@ -298,6 +307,7 @@ async fn inspect_on_node(s: &Server, v: &View) -> Result<AppInfo> {
             Action::Inspect {
                 app: v.app.name.clone(),
             },
+            &caller.by(),
         )
         .await?,
     )?;
@@ -330,7 +340,7 @@ async fn inspect(State(s): State<Server>, caller: Caller, Path(name): Path<Strin
     caller.manage(&name)?;
     let v = view(&s, &name).await?;
     if v.online && v.report().is_some() {
-        match inspect_on_node(&s, &v).await {
+        match inspect_on_node(&s, &v, &caller).await {
             Ok(info) => return Ok(axum::Json(info)),
             Err(Error::Offline(_)) => {}
             Err(e) => return Err(e),
@@ -497,7 +507,7 @@ async fn logs(
         .as_ref()
         .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
     let outcome = s
-        .command(node.id, &node.name, Action::Logs { app: name, query })
+        .command(node.id, &node.name, Action::Logs { app: name, query }, &caller.by())
         .await?;
     let text = [(header::CONTENT_TYPE, "text/plain; charset=utf-8")];
     match outcome {
@@ -519,7 +529,7 @@ async fn app_command(s: &Server, caller: &Caller, name: String, action: Action) 
         .node
         .as_ref()
         .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
-    let mut info: AppInfo = result(s.command(node.id, &node.name, action).await?)?;
+    let mut info: AppInfo = result(s.command(node.id, &node.name, action, &caller.by()).await?)?;
     v.annotate(&mut info);
     Ok(axum::Json(info))
 }
@@ -532,6 +542,26 @@ async fn suspend(State(s): State<Server>, caller: Caller, Path(name): Path<Strin
 async fn resume(State(s): State<Server>, caller: Caller, Path(name): Path<String>) -> Result<axum::Json<AppInfo>> {
     let action = Action::Resume { app: name.clone() };
     app_command(&s, &caller, name, action).await
+}
+
+/// The app's recent commands, newest first.
+async fn app_commands(
+    State(s): State<Server>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Query(q): Query<CommandsQuery>,
+) -> Result<axum::Json<Vec<CommandInfo>>> {
+    check_app_name(&name)?;
+    caller.manage(&name)?;
+    let limit = q.limit.unwrap_or(20).clamp(1, 200);
+    Ok(axum::Json(
+        s.store
+            .call(move |c| {
+                let app = apps::live_app(c, &name)?;
+                store::commands::history(c, &name, app.created_at, limit)
+            })
+            .await?,
+    ))
 }
 
 /// A shared volume as the server sees it: what its node last reported, plus where it is.
@@ -552,6 +582,8 @@ fn volume_view(v: &VolumeRow, node: Option<&Node>) -> VolumeInfo {
         mounts: Vec::new(),
         snapshots: Vec::new(),
         problem: None,
+        space: None,
+        snapshot_space: Default::default(),
         node: None,
         nest: None,
         pending: None,
@@ -577,7 +609,7 @@ async fn volume_list(State(s): State<Server>, _caller: Caller) -> Result<axum::J
 
 async fn volume_inspect(
     State(s): State<Server>,
-    _caller: Caller,
+    caller: Caller,
     Path(name): Path<String>,
 ) -> Result<axum::Json<VolumeInfo>> {
     check_volume_name(&name)?;
@@ -595,7 +627,10 @@ async fn volume_inspect(
         && s.hub.is_online(node.id)
         && view.pending.is_none()
     {
-        match s.command(node.id, &node.name, Action::VolumeInfo { name }).await {
+        match s
+            .command(node.id, &node.name, Action::VolumeInfo { name }, &caller.by())
+            .await
+        {
             Ok(o) => {
                 let mut live: VolumeInfo = result(o)?;
                 live.node = view.node.take();
@@ -718,7 +753,7 @@ async fn volume_delete_snapshot(
         .await?
         .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
     let _: serde_json::Value = result(
-        s.command(node.id, &node.name, Action::DeleteSnapshot { name, app })
+        s.command(node.id, &node.name, Action::DeleteSnapshot { name, app }, &caller.by())
             .await?,
     )?;
     Ok(StatusCode::NO_CONTENT)
@@ -729,14 +764,20 @@ async fn nodes_info(s: &Server) -> Result<Vec<NodeInfo>> {
     let settings = s.cfg.scheduler;
     let (nodes, loads, nests) = s
         .store
-        .call(|c| Ok((nodes::list_facts(c)?, scheduler::loads(c, None)?, nests::list(c)?)))
+        .call(|c| Ok((nodes::list(c)?, scheduler::loads(c, None)?, nests::list(c)?)))
         .await?;
     Ok(nodes
         .into_iter()
         .map(|n| {
             let load = loads.get(&n.id).copied().unwrap_or_default();
             let facts = nodes::facts_of(&n);
+            let usage = n.report.as_ref().and_then(|r| r.usage.as_ref()).map(|u| NodeUsage {
+                measured_at: rfc3339(u.measured_at),
+                data_bytes: u.groups.iter().map(|g| g.bytes).sum(),
+                backup_snapshots: u.backups,
+            });
             NodeInfo {
+                usage,
                 id: n.id,
                 online: s.hub.is_online(n.id),
                 joined_at: rfc3339(n.joined_at),
@@ -875,6 +916,7 @@ async fn node_prune(
             Action::PruneImages {
                 grace_secs: q.grace_secs,
             },
+            &caller.by(),
         )
         .await?,
     )?;
@@ -916,11 +958,16 @@ async fn registry_gc(
 
 async fn nest_list(State(s): State<Server>, caller: Caller) -> Result<axum::Json<Vec<NestInfo>>> {
     caller.admin()?;
-    let (list, all) = s.store.call(|c| Ok((nests::list(c)?, nodes::list_facts(c)?))).await?;
-    let names: HashMap<u64, String> = all.into_iter().map(|n| (n.id, n.name)).collect();
+    let (list, all) = s.store.call(|c| Ok((nests::list(c)?, nodes::list(c)?))).await?;
+    let names: HashMap<u64, String> = all.iter().map(|n| (n.id, n.name.clone())).collect();
+    let usage: HashMap<u64, &kn_proto::agent::Usage> = all
+        .iter()
+        .filter_map(|n| Some((n.id, n.report.as_ref()?.usage.as_ref()?)))
+        .collect();
     Ok(axum::Json(
         list.into_iter()
             .map(|m| NestInfo {
+                disk_bytes: usage.get(&m.nest.node_id).map(|u| nest_disk(u, &m.apps, &m.volumes)),
                 node: names.get(&m.nest.node_id).cloned().unwrap_or_default(),
                 node_online: s.hub.is_online(m.nest.node_id),
                 memory_bytes: m.apps.iter().map(|(_, b)| b).sum(),
@@ -932,6 +979,18 @@ async fn nest_list(State(s): State<Server>, caller: Caller) -> Result<axum::Json
             })
             .collect(),
     ))
+}
+
+/// The space a nest's members take: the sum of the node's groups of subvolumes that hold any of them (a group is
+/// always within one nest).
+fn nest_disk(u: &kn_proto::agent::Usage, apps: &[(String, u64)], volumes: &[String]) -> u64 {
+    u.groups
+        .iter()
+        .filter(|g| {
+            g.apps.iter().any(|a| apps.iter().any(|(n, _)| n == a)) || g.volumes.iter().any(|v| volumes.contains(v))
+        })
+        .map(|g| g.bytes)
+        .sum()
 }
 
 async fn token_list(State(s): State<Server>, caller: Caller) -> Result<axum::Json<Vec<TokenInfo>>> {
@@ -1077,7 +1136,7 @@ async fn backup_app(
         full: q.full,
     };
     let o = s
-        .command_with(node.id, &node.name, action, s.cfg.backup_timeout)
+        .command_with(node.id, &node.name, action, &caller.by(), s.cfg.backup_timeout)
         .await?;
     Ok(axum::Json(result(o)?))
 }
@@ -1109,7 +1168,7 @@ async fn backup_volume(
         full: q.full,
     };
     let o = s
-        .command_with(node.id, &node.name, action, s.cfg.backup_timeout)
+        .command_with(node.id, &node.name, action, &caller.by(), s.cfg.backup_timeout)
         .await?;
     Ok(axum::Json(result(o)?))
 }

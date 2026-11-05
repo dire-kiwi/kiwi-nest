@@ -7,6 +7,7 @@
 //! - [`rename_noreplace`] and [`exchange`] move subvolumes (or anything else) into place atomically.
 //! - [`send`] writes a read-only subvolume as a `btrfs send` stream, whole or against a parent (receiving one is
 //!   plain file operations, in `kn-backup`).
+//! - [`usage`] measures the space a subvolume's files take, and how much of it they share with others.
 //!
 //! Every path is opened one component at a time with `O_NOFOLLOW`, starting from `/`, so a symlink anywhere on the
 //! way is refused rather than followed, and the ioctls act on those file descriptors rather than on paths. Paths
@@ -666,6 +667,9 @@ pub fn can_send() -> bool {
     // SAFETY: `geteuid` has no preconditions.
     unsafe { libc::geteuid() == 0 }
 }
+
+mod usage;
+pub use usage::{TreeUsage, union_bytes, usage};
 
 #[cfg(test)]
 mod tests;

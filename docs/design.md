@@ -244,6 +244,17 @@ VOLUMES/                         one btrfs filesystem per node
   refused while APP is deployed and mounts that snapshot.
 - Docker named volumes aren't used at all, so every byte of app data is a subvolume that can be snapshotted, backed up
   and moved. Files keep the owners the containers gave them; snapshots, backups and restores keep owners and modes.
+- **Space.** Every few minutes (`--usage-interval`, 5 minutes by default) and soon after its state changes (at most
+  once a minute), a node measures what each app volume, shared volume and snapshot takes: each regular file's extents
+  (`FS_IOC_FIEMAP`, as `btrfs filesystem du` counts them), and which of them the kernel marks shared. So a preview
+  made `--from` production shows the size of its data and the little it holds on its own. The walk reads only
+  metadata, opens nothing it hasn't checked is a regular file (non-blocking, without following symlinks), stays
+  within the subvolume and counts hard links once. Subvolumes that can share data are also measured together,
+  counting shared extents once: an app, the apps made `--from` it, the shared volumes any of them mount, and those
+  volumes' snapshots. Data is only shared through those snapshots (and the backups' read-only sets, counted on
+  their own), so each such group lies within one nest, and a nest's disk use is the sum of its groups'. Sizes are
+  before compression, and metadata isn't counted. Quota groups would give exact numbers, but they slow btrfs down
+  and have to be enabled on the filesystem (see D27).
 - **Without root** (tests, a development node), creating subvolumes and snapshotting your own still work, but the
   kernel only lets other users destroy a subvolume on a filesystem mounted with `user_subvol_rm_allowed`. Otherwise
   the node empties the subvolume and removes it with `rmdir`, which the kernel allows for an empty one.
@@ -309,7 +320,8 @@ VOLUMES/                         one btrfs filesystem per node
   a shared volume waits for that app's or volume's earlier changes; deletes and volume changes wait for every
   earlier change. A change whose bundle can't be downloaded yet is retried. Each poll reports the node's facts
   (architecture, memory, btrfs space including unallocated, disk space, labels, version), each app's generation,
-  state and error, and the changes it has finished. A node that finishes a change also sends a report at once on a route of its
+  state and error, its last request and open requests through the gateway, the space its volumes take (see
+  [Volumes and snapshots](#volumes-and-snapshots)), and the changes it has finished. A node that finishes a change also sends a report at once on a route of its
   own, beside its open poll (never cancelling it, so a command on its way can't be lost), and reports carry a
   serial, so one that arrives late never replaces a newer one. A node that has applied generations beyond what the
   server records (its database restored from an older backup) moves the server's generations up to them. A node that was offline catches up when it reconnects: nothing
@@ -335,7 +347,8 @@ VOLUMES/                         one btrfs filesystem per node
   reports the delete done, or the node is forgotten.
 - **Choosing a node** is by nest: see [Nests and placement](#nests-and-placement).
 - **Storage.** The server keeps SQLite (`rusqlite` with SQLite bundled, so the static musl build needs no system
-  library) for nodes, nests, apps, volumes, generations, tokens and command history, on a thread of its own, in WAL
+  library) for nodes, nests, apps, volumes, generations, tokens, the web UI's users and sessions, and command history (each
+command with what it acts on and who asked), on a thread of its own, in WAL
   mode with `synchronous = FULL`, so whatever the server has answered for survives a crash. Bundles are files named by
   digest; each app's current bundle is kept until the app is deleted. An upload is checked by the node's rules before
   anything is saved, and only moved into the store by the transaction that saves the change, so a refused deploy
@@ -400,7 +413,9 @@ VOLUMES/                         one btrfs filesystem per node
   Once `idle_timeout` has passed with nothing open, the app gets `docker compose stop`, which frees its memory and
   keeps its containers and data. Only HTTP traffic counts as activity; background work needs `idle_timeout: 0`.
   A reaper checks every second; taking a lease and deciding to stop happen under the gate's lock, so a request can't
-  slip in between. The timeout counts from the last lease's end, or from when the app came up.
+  slip in between. The timeout counts from the last lease's end, or from when the app came up. A lease's start and
+  end are also the app's last activity, which nodes report with its open requests (kept in memory, so it's unknown
+  again after the agent restarts).
 - **Suspend and resume.** `suspend` stops an app and keeps it stopped: requests get 503 rather than starting it. It's
   refused while the app has open requests. `resume` starts an app whatever stopped it (suspended, idle, a failed
   start or a failed deploy) and returns once it's ready. `delete` breaks open leases: their responses and WebSockets
@@ -672,6 +687,44 @@ VOLUMES/                         one btrfs filesystem per node
   database first; the server then starts on it as usual, and nodes, whose tokens are in it, reconnect. A node that
   applied generations beyond the restored database's moves the server's up to them (see Server and nodes).
 
+## Web UI
+
+- **What it is.** A React and TypeScript app (`web/`, built with Vite), built into `web/dist` by `make web` and
+  embedded in the server with `rust-embed` (`kn-server`'s `ui`; a server built without it serves a page saying so).
+  The server serves it at `/` on its own listener, so on `--api-domain` through the ingress, and it uses the same API
+  as the CLI: nothing in it is the UI's own but logging in. Routing is in the URL's fragment (`#/apps/blog`), so the
+  server only serves `index.html` and the files Vite names by their contents (cached for good). Every page has a
+  strict Content-Security-Policy (only the server's own scripts, styles and API; no inline scripts, no framing).
+- **Views.** Nodes: online or not, cordoned, version and link version, architecture, memory and headroom, labels,
+  the btrfs filesystem's free and unallocated space (with a warning below 10%), the space its volumes take, and
+  its nests. Nests: their node, apps, shared volumes, memory and disk use, and why they're where they are. Apps by
+  node: status, containers, domain, nest, idle timeout and last activity, and each app's details: its containers,
+  placement, volumes with their space, and its recent commands (`GET /apps/{name}/commands`: what was run, by whom,
+  and how it ended; inspecting isn't listed). Shared volumes with their snapshots and the space each takes, and
+  every app's volumes. Backups by target. The lists refresh every few seconds; the backups only when asked, since
+  listing reads the targets.
+- **Actions:** suspend, resume (which wakes a suspended or idle app and returns once it's up), logs (followed as
+  they come), back up now, cordon and uncordon. Deploying and deleting stay with the CLI and CI.
+- **Users and logins.** The UI's users are made with an admin token (`kiwi-nest user add NAME`, which asks for the
+  password; `user list|passwd|delete`), and each may do what an admin token may. Passwords (at least 10
+  characters) are kept as Argon2id hashes. Logging in (`POST /session`) gives a session: a random token in a cookie
+  (`__Host-kn-session`) that's `HttpOnly`, `Secure`, `SameSite=Strict` and, through the `__Host-` prefix,
+  host-only, so no script can read it and no app on a sibling domain can set one. The server keeps the token's hash.
+  A session ends after 12 hours unused, after 7 days in any case, on logging out, and when the user's password
+  changes or the user is deleted. After five failed logins for a name, the next is refused for a second, doubling
+  with each failure up to 15 minutes; a name that doesn't exist takes as long to refuse. At most four passwords are
+  checked at once, since each check takes memory on purpose.
+- **Cross-site requests are refused.** The apps' domains are siblings of the server's (`blog.example.com`,
+  `kn.example.com`), which browsers count as the same *site*, so `SameSite=Strict` alone would still let an app's
+  page (a pull request's preview, say) send requests with the cookie. So a request carrying it is refused unless
+  it's from the server's own pages: `Sec-Fetch-Site` must be `same-origin` (or `none`, for an address typed in),
+  and `Origin`, when sent, must match the request's `Host`. A request that changes anything must also say so
+  positively (`Sec-Fetch-Site: same-origin`, or a matching `Origin`) and be JSON (`Content-Type:
+  application/json`, the UI sending `{}` when there's nothing to say): no form or plain request from another page
+  can be, and anything else needs a CORS preflight, which the server never grants. Logging in is checked the same
+  way, so another site can't log a browser in as someone else either. A request with a token in `Authorization`
+  is judged by its token alone; browsers never add one by themselves.
+
 ## Failure and recovery
 
 Nothing fails over. A node that goes away takes its nests down: the server shows it offline, and its apps as
@@ -734,12 +787,12 @@ One Cargo workspace. A few crates keep the server and node apart and build in pa
 | `kiwi-nest` (bin) | | The one binary; `clap` chooses between `server`, `node` and the CLI commands. |
 | `kn-proto` | `api`, `agent`, `state` | Types shared by the CLI, server and nodes: API requests and responses, the agent link's polls, desired state, reports and commands. Versioned, so the server can talk to nodes one version behind. |
 | `kn-bundle` | `zip`, `compose`, `manifest`, `generate` | Safe ZIP reading, validation of the Compose subset and `x-kiwi-nest`, and the generated Compose file. No I/O beyond the bundle, so plain unit tests cover it. |
-| `kn-btrfs` | | btrfs ioctls (create, snapshot, destroy, read-only snapshots, send), subvolume checks, paths opened without following symlinks. |
-| `kn-node` | `volumes`, `runtime`, `apps`, `gateway`, `agent` | The node: the volume layout and rules; `docker compose` through `tokio::process`; each app's lifecycle (one task per app, so its operations are serialized) and the state file; the `hyper` gateway; the link to the server (joining, the poll loop, the per-app applier, commands). |
-| `kn-server` | `api`, `agent`, `store`, `scheduler`, `bundles`, `backups`, `auth`, `hub`, `ingress`, `registry`, `ui` | The server: `axum` APIs for the CLI (`api`) and for agents (`agent`), SQLite (`store`, with `nests` among its tables), placing new nests (`scheduler`), the bundle store, backup targets, the schedule and its own backups (`backups`), tokens, what's only in memory (`hub`: online nodes, waking polls, callers waiting on commands), Caddy sync, the registry, and the embedded UI. |
+| `kn-btrfs` | | btrfs ioctls (create, snapshot, destroy, read-only snapshots, send), subvolume checks, paths opened without following symlinks, and measuring a subvolume's space (`usage`, from its files' extents). |
+| `kn-node` | `volumes`, `runtime`, `apps`, `gateway`, `agent` | The node: the volume layout and rules; `docker compose` through `tokio::process`; each app's lifecycle (one task per app, so its operations are serialized), the state file, and measuring the volumes' space (`apps/usage`); the `hyper` gateway; the link to the server (joining, the poll loop, the per-app applier, commands). |
+| `kn-server` | `api`, `agent`, `store`, `scheduler`, `bundles`, `backups`, `auth`, `hub`, `ingress`, `registry`, `ui` | The server: `axum` APIs for the CLI (`api`) and for agents (`agent`), SQLite (`store`, with `nests` among its tables), placing new nests (`scheduler`), the bundle store, backup targets, the schedule and its own backups (`backups`), tokens, what's only in memory (`hub`: online nodes, waking polls, callers waiting on commands), Caddy sync, the registry, and the embedded UI with its users' logins and sessions (`ui`, and `store`'s `users`). |
 | `kn-backup` | `key`, `target`, `store`, `s3`, `ssh`, `sendstream`, `receive`, `fsops`, `tarball` | Keys, chains, choosing a parent and retention; targets and their stores (S3, SSH, a directory), uploads and downloads through zstd that never leave a failed upload looking complete; the send stream format and receiving it as confined file operations; tar archives and extracting them. Used by nodes, and by the server for its own state. |
 | `kn-cli` | | The CLI: clusters in `~/.config/kiwi-nest`, and the commands. |
-| `web/` | | The web UI (React and Vite), built by `make` and embedded in `kn-server` with `rust-embed`. |
+| `web/` | | The web UI (React, TypeScript and Vite), built by `make web` into `web/dist` and embedded in `kn-server` with `rust-embed`. |
 
 Main dependencies: `tokio`; `hyper` 1 and `hyper-util` (the gateway, WebSocket upgrades included); `axum`; `reqwest`
 with rustls and its `ring` provider (no OpenSSL, and nothing that needs CMake to cross-build); `rusqlite` (bundled); `serde`, `serde_json` and a maintained YAML crate; `zip`, `zstd`,
@@ -776,6 +829,8 @@ for macOS.
 | D23 | kiwi-nest receives `send` streams itself, applying each command as a file operation confined to the new subvolume; sending is the kernel's ioctl. | No `btrfs-progs` on nodes (as for the other ioctls), and a backup from outside the node can't write outside its subvolume: every path is checked and opened without following symlinks. `btrfs receive` would need the binary, `chroot`s rather than checks, and marks received subvolumes for a search kiwi-nest doesn't need, since it knows the chain it's receiving. The objects stay readable by plain `btrfs receive`. |
 | D24 | A backup's key carries what it is, its time and its parent; the target's listing is the only record of backups. | A key alone is enough to restore from, chains and retention need only a listing, and nothing can disagree with the target: a restored server, a new cluster or a person with the bucket sees the same thing. A catalog in the database would go stale with every manual change to the bucket and be lost with the server. |
 | D25 | The server's own backup holds bundle deletion off from just before its database copy until the bundles it names are hard-linked, then sweeps what was held back. | The backup can't name a bundle it lacks, and deletes never wait: they're only deferred, for milliseconds. Locking deletion for the whole backup would hold it up for the upload's length; linking without the hold would still race a delete in the moment between the copy and the link. |
+| D26 | The web UI's users log in with a password, and a session cookie stands for an admin on the CLI's own API, but only on requests from the server's own pages (`Sec-Fetch-Site` and `Origin`), and only JSON for changes. | The UI needs no API of its own, and a browser never holds a token a script could read. `SameSite` alone isn't enough, since apps on sibling domains count as the same site, and a preview runs whoever's pull request it is. Tokens pasted into the UI would sit in the page's storage, readable by any script that got in; a separate UI API would double what has to be kept right. |
+| D27 | Nodes measure their subvolumes' space from their files' extents (`FIEMAP`), now and then, counting extents shared within each group of subvolumes that can share data once. | No quota groups, which slow btrfs down, must be enabled per filesystem, and have had their own bugs; the extents say both what a subvolume holds and what it shares, as `btrfs filesystem du` shows. Grouping by what can share (an app, its previews, its shared volumes and their snapshots) gives each nest's disk use without listing every extent to the server. Measuring on each request would read every file's metadata far too often. |
 
 ## Build plan
 
@@ -920,6 +975,15 @@ flowchart LR
     by node and their state, volumes and snapshots with their space, backups. Actions: suspend, resume, logs, back
     up now, cordon.
     *Verify:* against the dev cluster; logs open for an app on each node; a cordoned node shows as cordoned.
+    *Done:* `web/` (see [Web UI](#web-ui)), served by `kn-server`'s `ui`; users, logins, sessions and the checks on
+    requests with the cookie in `crates/kn-server/src/ui.rs` and `store/users.rs`, and over HTTP in
+    `crates/kn-server/src/tests.rs` (cross-site and non-JSON requests refused, sessions ending, lockouts); each
+    app's command history (commands now record their target and caller, migration 6); nodes measuring their
+    volumes' space (`kn-btrfs`'s `usage`, tested on btrfs against real snapshots, and `kn-node`'s `apps/usage`,
+    grouped as nests need it) and reporting each app's last activity through the gateway. `make check` typechecks
+    the UI, CI builds it, and it was driven in a browser against `scripts/dev-cluster.sh`: logs for an app on each
+    node, a node cordoned from the UI showing as cordoned (and refusing a new nest), a suspended app woken from the
+    UI, and a backup made from it.
 
 ## Later
 
@@ -936,7 +1000,8 @@ flowchart LR
   `inspect` and the UI show each nest's memory and disk, deploy warns, previews can idle out, and moving a nest is the
   eventual fix.
 - **btrfs quirks.** A full btrfs filesystem fails writes unpredictably, and snapshots make free space hard to read.
-  Nodes report unallocated space as well as free space; placement keeps headroom, and the UI warns below a threshold.
+  Nodes report unallocated space as well as free space; placement keeps headroom, and the UI warns below 10% of
+  either.
 - **Single points of failure.** If the server's host is down, so is the ingress: every app is unreachable even though
   apps keep running. Accepted, since this isn't HA. The server's state is backed up (step 8).
 - **The private network, and plain traffic on the LAN.** Traffic between the ingress and the gateways crosses the LAN

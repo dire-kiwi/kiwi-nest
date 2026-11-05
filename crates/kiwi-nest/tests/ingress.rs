@@ -182,3 +182,84 @@ fn requests_through_the_ingress_wake_apps_and_need_their_credentials_and_the_nod
     // And the CLI reaches the server through it again.
     server.ok(&["inspect", "wake"]);
 }
+
+/// The web UI through the ingress, as a browser on another machine reaches it: the page over HTTPS at the API domain,
+/// a login whose cookie then works from the page's origin (as the ingress passes it on), and not from an app's.
+#[test]
+fn the_web_ui_works_through_the_ingress_from_its_own_origin_only() {
+    if !integration() {
+        return;
+    }
+    let Some(bin) = caddy_bin() else { return };
+    let caddy = Caddy::start(bin);
+    let (http, https) = (free_port(), free_port());
+    let server = Server::start_with(&[
+        "--ingress",
+        "internal",
+        "--caddy-admin",
+        &format!("http://127.0.0.1:{}", caddy.admin),
+        "--api-domain",
+        "kn.localhost",
+        "--http-port",
+        &http.to_string(),
+        "--https-port",
+        &https.to_string(),
+        "--ingress-sync",
+        "1s",
+    ]);
+    let ca = server.dir.path().join("server/ingress-ca.crt");
+    wait_for("the ingress CA is saved", Duration::from_secs(30), || ca.exists());
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _in_runtime = rt.enter();
+    let c = client(&ca, https);
+    let base = format!("https://kn.localhost:{https}");
+    let page = rt.block_on(c.get(format!("{base}/")).send()).unwrap();
+    assert_eq!(page.status(), 200);
+    assert!(
+        page.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("script-src 'self'")
+    );
+
+    let api = format!("{base}{}", kn_proto::API_PREFIX);
+    let r = rt
+        .block_on(
+            c.post(format!("{api}/users"))
+                .bearer_auth(&server.admin)
+                .json(&serde_json::json!({"name": "ivan", "password": "long enough pw"}))
+                .send(),
+        )
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let r = rt
+        .block_on(
+            c.post(format!("{api}/session"))
+                .header("origin", &base)
+                .json(&serde_json::json!({"user": "ivan", "password": "long enough pw"}))
+                .send(),
+        )
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let set = r.headers()["set-cookie"].to_str().unwrap().to_string();
+    let cookie = set.split(';').next().unwrap().to_string();
+    assert!(cookie.starts_with("__Host-kn-session=kns_"), "{set}");
+
+    // From the page's origin, as the ingress passes the request on, the session works, changes included.
+    let from = |origin: &str, site: &str| {
+        c.post(format!("{api}/users"))
+            .header("cookie", &cookie)
+            .header("origin", origin)
+            .header("sec-fetch-site", site)
+            .json(&serde_json::json!({"name": format!("u{}", origin.len() + site.len()), "password": "long enough pw"}))
+    };
+    let r = rt.block_on(from(&base, "same-origin").send()).unwrap();
+    assert_eq!(r.status(), 201, "{}", rt.block_on(r.text()).unwrap());
+    // From an app's page on a sibling domain, it doesn't.
+    let r = rt
+        .block_on(from(&format!("https://wake.localhost:{https}"), "same-site").send())
+        .unwrap();
+    assert_eq!(r.status(), 403);
+    drop(caddy);
+}

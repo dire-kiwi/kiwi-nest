@@ -199,6 +199,7 @@ up() {
     echo "no ingress: put caddy on the PATH (or set KIWI_NEST_DEV_CADDY) for one"
   fi
   echo "use it with: export KIWI_NEST_CONFIG_DIR=$dir/config"
+  echo "web UI at $url/ (\`make web\` builds it; \`kiwi-nest user add NAME\` makes a user to log in as)"
 }
 
 # Starts a node's agent: with a join token the first time, or with a fresh one if asked (`rejoin`).

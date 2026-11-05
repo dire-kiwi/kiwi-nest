@@ -279,6 +279,9 @@ impl FakeNode {
                 bundle_digest: String::new(),
                 containers: "running(1)".into(),
                 starting: false,
+                last_request_at: None,
+                open_requests: 0,
+                space: Default::default(),
             });
         }
     }
@@ -662,6 +665,8 @@ async fn commands_are_delivered_once_and_lost_ones_fail() {
         updated_at: String::new(),
         containers: vec![],
         open_requests: 0,
+        last_request_at: None,
+        space: Default::default(),
         node: None,
         nest: None,
         placement: None,
@@ -2072,4 +2077,534 @@ async fn apps_deployed_before_the_server_kept_auth_get_it_from_their_bundles() {
     let blog = auth("blog").expect("read from blog's bundle");
     assert!(blog.contains(HASH), "{blog}");
     assert_eq!(auth("shop"), None, "unknown, so the ingress won't route it");
+}
+
+/// The server's own origin, for the web UI's requests.
+fn origin(env: &Env) -> String {
+    env.url.trim_end_matches(kn_proto::API_PREFIX).to_string()
+}
+
+/// A request as the web UI's page makes it: with the session cookie, from the server's own origin, as JSON.
+fn ui_req(env: &Env, method: reqwest::Method, path: &str, cookie: &str) -> reqwest::RequestBuilder {
+    let mut r = env
+        .http
+        .request(method.clone(), format!("{}{path}", env.url))
+        .header("cookie", format!("{}={cookie}", kn_proto::api::SESSION_COOKIE))
+        .header("origin", origin(env))
+        .header("sec-fetch-site", "same-origin");
+    if method != reqwest::Method::GET {
+        r = r.header("content-type", "application/json").body("{}");
+    }
+    r
+}
+
+/// Logs in; returns the session cookie's value.
+async fn login(env: &Env, user: &str, password: &str) -> Result<String, (StatusCode, String)> {
+    let r = env
+        .http
+        .post(format!("{}/session", env.url))
+        .header("origin", origin(env))
+        .json(&json!({"user": user, "password": password}))
+        .send()
+        .await
+        .unwrap();
+    if r.status() != StatusCode::OK {
+        return Err(error(r).await);
+    }
+    let cookie = r.headers()["set-cookie"].to_str().unwrap().to_string();
+    for part in ["HttpOnly", "Secure", "SameSite=Strict", "Path=/"] {
+        assert!(cookie.split("; ").any(|p| p == part), "{part} in {cookie}");
+    }
+    assert!(!cookie.contains("Domain"), "host-only: {cookie}");
+    let value = cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .strip_prefix(&format!("{}=", kn_proto::api::SESSION_COOKIE))
+        .unwrap();
+    assert!(value.starts_with("kns_"));
+    Ok(value.to_string())
+}
+
+#[tokio::test]
+async fn the_web_ui_is_served_and_its_users_log_in() {
+    let env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    env.poll(&mut a).await;
+
+    // The page, with a policy that allows only the server's own scripts, and an unknown API route's error.
+    let r = env.http.get(format!("{}/", origin(&env))).send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+    let csp = r.headers()["content-security-policy"].to_str().unwrap();
+    assert!(
+        csp.contains("script-src 'self'") && csp.contains("frame-ancestors 'none'"),
+        "{csp}"
+    );
+    assert_eq!(r.headers()["x-frame-options"], "DENY");
+    let r = env
+        .req(reqwest::Method::GET, "/nothing-here", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(error(r).await.0, StatusCode::NOT_FOUND);
+
+    // Users are made with an admin token, with passwords long enough.
+    let add = |name: &str, password: &str, token: &str| {
+        env.req(reqwest::Method::POST, "/users", token)
+            .json(&json!({"name": name, "password": password}))
+            .send()
+    };
+    assert_eq!(
+        add("ivan", "short", &env.admin).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        add("Ivan", "long enough pw", &env.admin).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        add("ivan", "long enough pw", &env.admin).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        add("ivan", "another long one", &env.admin).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    let deploy = env.token(json!({"kind": "deploy", "patterns": ["blog-pr*"]})).await;
+    assert_eq!(
+        add("kim", "long enough pw", &deploy).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    // A wrong password, or a user that doesn't exist, is refused alike.
+    assert_eq!(
+        login(&env, "ivan", "long enough px").await.unwrap_err().0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        login(&env, "nobody", "long enough pw").await.unwrap_err().0,
+        StatusCode::UNAUTHORIZED
+    );
+    let cookie = login(&env, "ivan", "long enough pw").await.unwrap();
+
+    // The session stands for an admin, on the same API as the CLI.
+    let r = ui_req(&env, reqwest::Method::GET, "/session", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.json::<kn_proto::api::SessionInfo>().await.unwrap().user, "ivan");
+    let who: kn_proto::api::WhoAmI = ui_req(&env, reqwest::Method::GET, "/whoami", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        (who.kind, who.user.as_deref()),
+        (kn_proto::api::TokenKind::Admin, Some("ivan"))
+    );
+    let r = ui_req(&env, reqwest::Method::POST, "/nodes/a/cordon", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert!(r.json::<NodeInfo>().await.unwrap().cordoned);
+    let users: Vec<kn_proto::api::UserInfo> = ui_req(&env, reqwest::Method::GET, "/users", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(users[0].last_login_at.is_some());
+
+    // With the cookie, nothing from another site or origin is taken, not even reading: an app's page on a sibling
+    // domain is "same-site".
+    let with_cookie = |method: reqwest::Method, path: &str| {
+        env.http
+            .request(method, format!("{}{path}", env.url))
+            .header("cookie", format!("{}={cookie}", kn_proto::api::SESSION_COOKIE))
+    };
+    for site in ["cross-site", "same-site"] {
+        let r = with_cookie(reqwest::Method::GET, "/nodes")
+            .header("sec-fetch-site", site)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "{site}");
+    }
+    let r = with_cookie(reqwest::Method::GET, "/nodes")
+        .header("origin", "http://blog.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    // A change must say it's from the server's own page, and be JSON.
+    let uncordon = || with_cookie(reqwest::Method::POST, "/nodes/a/uncordon");
+    let r = uncordon()
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN, "no Origin or Sec-Fetch-Site");
+    for ct in [
+        None,
+        Some("text/plain"),
+        Some("application/x-www-form-urlencoded"),
+        Some("multipart/form-data"),
+    ] {
+        let mut r = uncordon().header("origin", origin(&env));
+        if let Some(ct) = ct {
+            r = r.header("content-type", ct);
+        }
+        assert_eq!(r.send().await.unwrap().status(), StatusCode::BAD_REQUEST, "{ct:?}");
+    }
+    assert!(
+        env.req(reqwest::Method::GET, "/nodes", &env.admin)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let nodes: Vec<NodeInfo> = env
+        .req(reqwest::Method::GET, "/nodes", &env.admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(nodes[0].cordoned, "none of those uncordoned it");
+    // Nor is a login from elsewhere, or not as JSON.
+    let r = env
+        .http
+        .post(format!("{}/session", env.url))
+        .json(&json!({"user": "ivan", "password": "long enough pw"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let r = env
+        .http
+        .post(format!("{}/session", env.url))
+        .header("origin", origin(&env))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("user=ivan&password=long+enough+pw")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    // A made-up session is refused, and a token still works without one.
+    let r = ui_req(&env, reqwest::Method::GET, "/nodes", "kns_00")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    // Logging out ends the session, and clears the cookie.
+    let other = login(&env, "ivan", "long enough pw").await.unwrap();
+    let r = ui_req(&env, reqwest::Method::DELETE, "/session", &other)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert!(r.headers()["set-cookie"].to_str().unwrap().contains("Max-Age=0"));
+    let r = ui_req(&env, reqwest::Method::GET, "/session", &other)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        ui_req(&env, reqwest::Method::GET, "/session", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK,
+        "only that session ended"
+    );
+
+    // A new password ends the user's sessions.
+    let r = env
+        .req(reqwest::Method::PUT, "/users/ivan/password", &env.admin)
+        .json(&json!({"password": "a new long password"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        ui_req(&env, reqwest::Method::GET, "/session", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(login(&env, "ivan", "long enough pw").await.is_err());
+    let cookie = login(&env, "ivan", "a new long password").await.unwrap();
+
+    // Sessions are kept across restarts.
+    let mut env = env;
+    env.restart().await;
+    assert_eq!(
+        ui_req(&env, reqwest::Method::GET, "/session", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+
+    // After a few failed logins, a name is locked out for a while, even with the right password.
+    for _ in 0..5 {
+        assert_eq!(
+            login(&env, "ivan", "wrong password!").await.unwrap_err().0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        login(&env, "ivan", "a new long password").await.unwrap_err().0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // Deleting the user ends their sessions.
+    let r = env
+        .req(reqwest::Method::DELETE, "/users/ivan", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        ui_req(&env, reqwest::Method::GET, "/session", &cookie)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// Answers the next command the node gets with `result`; returns its action.
+async fn answer(env: &Env, n: &mut FakeNode, result: CommandResult) -> Action {
+    let command = loop {
+        if let Some(c) = env.poll(n).await.commands.into_iter().next() {
+            break c;
+        }
+    };
+    let r = env
+        .req(
+            reqwest::Method::POST,
+            &format!("/agent/commands/{}/result", command.id),
+            &n.token,
+        )
+        .json(&result)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    command.action
+}
+
+#[tokio::test]
+async fn an_apps_commands_are_its_history() {
+    let env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    env.poll(&mut a).await;
+    env.deploy(&env.admin, "blog", "blog.test", "").await;
+    env.poll(&mut a).await;
+    a.applied("blog", 1, true, false);
+    env.poll(&mut a).await;
+    env.req(reqwest::Method::POST, "/users", &env.admin)
+        .json(&json!({"name": "ivan", "password": "long enough pw"}))
+        .send()
+        .await
+        .unwrap();
+    let cookie = login(&env, "ivan", "long enough pw").await.unwrap();
+    let ci = env
+        .token(json!({"kind": "deploy", "name": "ci", "patterns": ["blog*"]}))
+        .await;
+    let mut info = serde_json::to_value(env.apps().await[0].clone()).unwrap();
+    // Enough of an AppInfo for the server to read.
+    for (k, v) in [
+        ("service", json!("web")),
+        ("container_port", json!(80)),
+        ("idle_timeout_secs", json!(0)),
+        ("project", json!("kn-blog")),
+        ("bundle_digest", json!("")),
+        ("volumes", json!([])),
+        ("created_at", json!("")),
+        ("containers", json!([])),
+    ] {
+        info[k] = v;
+    }
+
+    // A suspend from the UI, a resume with a deploy token that fails on the node, and an inspect (not listed).
+    let suspend = tokio::spawn(ui_req(&env, reqwest::Method::POST, "/apps/blog/suspend", &cookie).send());
+    let ok = CommandResult::Ok { value: info.clone() };
+    assert_eq!(
+        answer(&env, &mut a, ok.clone()).await,
+        Action::Suspend { app: "blog".into() }
+    );
+    assert_eq!(suspend.await.unwrap().unwrap().status(), StatusCode::OK);
+    let resume = tokio::spawn(env.req(reqwest::Method::POST, "/apps/blog/resume", &ci).send());
+    let failed = CommandResult::Err {
+        status: 409,
+        error: ErrorBody {
+            error: "it won't start".into(),
+            problems: vec![],
+        },
+    };
+    answer(&env, &mut a, failed).await;
+    assert_eq!(resume.await.unwrap().unwrap().status(), StatusCode::CONFLICT);
+    let inspect = tokio::spawn(env.req(reqwest::Method::GET, "/apps/blog", &env.admin).send());
+    answer(&env, &mut a, ok).await;
+    assert_eq!(inspect.await.unwrap().unwrap().status(), StatusCode::OK);
+
+    let history: Vec<kn_proto::api::CommandInfo> = ui_req(&env, reqwest::Method::GET, "/apps/blog/commands", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let seen: Vec<_> = history
+        .iter()
+        .map(|c| {
+            (
+                c.action.as_str(),
+                c.by.as_str(),
+                c.state.as_str(),
+                c.ok,
+                c.error.as_deref(),
+                c.node.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("resume", "token ci", "done", Some(false), Some("it won't start"), "a"),
+            ("suspend", "user ivan", "done", Some(true), None, "a"),
+        ]
+    );
+    assert!(history.iter().all(|c| c.finished_at.is_some()));
+    // `limit` keeps the newest, a deploy token sees only its own apps' history, and a new app of the same name
+    // starts with none.
+    let one: Vec<kn_proto::api::CommandInfo> = env
+        .req(reqwest::Method::GET, "/apps/blog/commands?limit=1", &env.admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].action, "resume");
+    let other = env.token(json!({"kind": "deploy", "patterns": ["shop*"]})).await;
+    let r = env
+        .req(reqwest::Method::GET, "/apps/blog/commands", &other)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    env.req(reqwest::Method::DELETE, "/apps/blog", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    env.poll(&mut a).await;
+    a.applied("blog", 2, true, true);
+    env.poll(&mut a).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(
+        env.deploy(&env.admin, "blog", "blog.test", "").await.status(),
+        StatusCode::ACCEPTED
+    );
+    let fresh: Vec<kn_proto::api::CommandInfo> = env
+        .req(reqwest::Method::GET, "/apps/blog/commands", &env.admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(fresh.is_empty(), "{fresh:?}");
+}
+
+#[tokio::test]
+async fn nodes_report_their_space_and_their_apps_activity() {
+    let env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    env.poll(&mut a).await;
+    for (name, query) in [("blog", ""), ("blog-pr1", "from=blog"), ("notes", "")] {
+        let r = env.deploy(&env.admin, name, &format!("{name}.test"), query).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED);
+        env.poll(&mut a).await;
+        a.applied(name, 1, true, false);
+        env.poll(&mut a).await;
+    }
+    let space = kn_proto::api::Space {
+        bytes: 10 << 20,
+        exclusive_bytes: 1 << 20,
+    };
+    for app in &mut a.report.apps {
+        if app.name == "blog" {
+            app.last_request_at = Some(1_800_000_000);
+            app.open_requests = 2;
+            app.space.insert("data".into(), space);
+        }
+    }
+    a.report.usage = Some(kn_proto::agent::Usage {
+        measured_at: 1_800_000_100,
+        groups: vec![
+            kn_proto::agent::UsageGroup {
+                apps: vec!["blog".into(), "blog-pr1".into()],
+                volumes: vec![],
+                bytes: 11 << 20,
+            },
+            kn_proto::agent::UsageGroup {
+                apps: vec!["notes".into()],
+                volumes: vec![],
+                bytes: 3 << 20,
+            },
+        ],
+        backups: space,
+    });
+    env.poll(&mut a).await;
+
+    let apps = env.apps().await;
+    let blog = apps.iter().find(|x| x.name == "blog").unwrap();
+    assert_eq!(blog.last_request_at.as_deref(), Some("2027-01-15T08:00:00Z"));
+    assert_eq!(blog.open_requests, 2);
+    assert_eq!(blog.space["data"], space);
+    assert_eq!(blog.idle_timeout_secs, 0);
+    let notes = apps.iter().find(|x| x.name == "notes").unwrap();
+    assert_eq!((notes.last_request_at.as_ref(), notes.open_requests), (None, 0));
+
+    let nests: Vec<kn_proto::api::NestInfo> = env
+        .req(reqwest::Method::GET, "/nests", &env.admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let disk: Vec<_> = nests.iter().map(|n| (n.name.as_str(), n.disk_bytes)).collect();
+    assert_eq!(disk, vec![("blog", Some(11 << 20)), ("notes", Some(3 << 20))]);
+    let nodes: Vec<NodeInfo> = env
+        .req(reqwest::Method::GET, "/nodes", &env.admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let usage = nodes[0].usage.clone().unwrap();
+    assert_eq!(usage.data_bytes, 14 << 20);
+    assert_eq!(usage.backup_snapshots, space);
+    assert_eq!(usage.measured_at, "2027-01-15T08:01:40Z");
 }
