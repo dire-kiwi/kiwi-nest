@@ -195,7 +195,7 @@ VOLUMES/                         one btrfs filesystem per node
   digest; each app's current bundle is kept until the app is deleted. Each node keeps a small state file of what it
   has applied.
 - **Tokens**, all stored only as hashes: admin tokens; deploy tokens limited to name patterns (for example `blog-pr*`
-  for a repository's previews); node tokens; one-time join tokens.
+  for a repository's previews); node tokens, which `node forget` revokes; one-time join tokens.
 
 ## Gateway: wake on request, stop when idle
 
@@ -239,8 +239,8 @@ VOLUMES/                         one btrfs filesystem per node
 
 ## Backups
 
-- **Every backup starts from a read-only snapshot.** The snapshot is instant, so an app pauses for milliseconds, not
-  for the length of the upload, whatever the target's format.
+- **Every backup of app or volume data starts from a read-only snapshot.** The snapshot is instant, so an app pauses
+  for milliseconds, not for the length of the upload, whatever the target's format.
 - **Each target picks a format.** Targets are an S3-compatible bucket (R2, S3, …) or a directory over SSH. There can
   be several, for example daily `send` to R2 and a weekly `tar` copy to a NAS.
   - **`send` (the default)** uploads a `btrfs send` stream compressed with zstd. Backups are incremental against the
@@ -256,14 +256,42 @@ VOLUMES/                         one btrfs filesystem per node
 - **Retention** is per target, and never deletes a backup that a newer incremental one needs. Apps can opt out of
   scheduled backups, which suits previews.
 - **The server's own state** (its SQLite database and bundles) is backed up to the same targets, always as tar, since
-  the server's host may not have btrfs.
+  the server's host may not have btrfs, and so there's no snapshot to start from. A tar of the live database file and
+  its WAL could capture a torn or partial database. Instead:
+  - The server first takes a consistent copy of the database with SQLite's online backup API (rusqlite's `backup`
+    feature) into a temporary file, while it keeps serving.
+  - It then tars that copy together with the bundle files the copy refers to. Bundles are written once, named by their
+    digest, and never changed, so copying them needs no lock.
 
 ## Failure and recovery
 
 Nothing fails over. A node that goes away takes its nests down: the server shows it offline, and its apps as
-unreachable. To bring them back on another node, run `kiwi-nest node forget NODE`, which releases its names and
-domains, then restore each app with `--restore --node`. If the server's host is down, every app is unreachable, even
-though the apps keep running on their nodes.
+unreachable. If the server's host is down, every app is unreachable, even though the apps keep running on their nodes.
+
+To bring a lost node's apps back on another node:
+
+1. **Make sure the old node is really gone**: powered off, or with its apps stopped. While a node runs cut off from
+   the server, its always-on apps keep running. HTTP traffic no longer reaches them once their routes move, but their
+   background work does.
+2. **`kiwi-nest node forget NODE`** revokes the node's token and releases its names and domains. It refuses while the
+   node is online, unless given `--force`.
+3. **Restore each app** with `--restore --node`.
+
+**A forgotten node that comes back never runs its apps again**, so an app can't run twice, with one copy on stale
+data:
+
+- The server answers the node's next poll with an explicit "node forgotten" response. Network errors and ordinary
+  authentication failures never trigger what follows.
+- On that answer, the node runs `docker compose down` for every app, so no container is left for Docker to restart.
+- It then moves its state file and subvolumes aside under `VOLUMES/forgotten/TIMESTAMP/`. That's a rename within the
+  same filesystem, so nothing is copied or deleted.
+- It records that it was forgotten, and its agent stops. The agent refuses to start again until a fresh `node join`,
+  which gives the node a new identity and an empty desired state. The server never re-attaches a forgotten node's old
+  records.
+- The data set aside is deleted only by hand.
+
+The one gap left is the time a forgotten node spends running while it can't reach the server, which is why step 1
+comes first.
 
 ## Code layout
 
@@ -365,10 +393,16 @@ flowchart LR
    restarting the server loses nothing; a deploy token for `blog-pr*` can't touch `blog`.
 5. **Nests and placement.** Working out an app's nest and refusing mixed nests; the scheduler (filter, then score);
    `nest list`; `node list|label|cordon|uncordon|forget`; shared volumes created through the server; `inspect`
-   showing the placement and why.
+   showing the placement and why. `node forget` revokes the node's token, and a forgotten node that reconnects takes
+   its apps down and sets their data aside (see [Failure and recovery](#failure-and-recovery)).
    *Verify:* a shared volume, the production app mounting it and three previews `--from` production all land on the
    volume's node; a bundle naming two nests is refused; new single-app nests spread by memory; a cordoned node gets
-   no new nests; an `arch: arm64` app never lands on amd64.
+   no new nests; an `arch: arm64` app never lands on amd64. And the forget path:
+   - forget an offline node and deploy one of its always-on apps on the other node;
+   - bring the old node back: its apps' containers are removed and its data is set aside, not deleted;
+   - its agent won't start again without a fresh `node join`;
+   - the app only ever runs on the new node;
+   - a plain network outage, or a wrong token, takes nothing down.
 6. **Ingress.** `kn-server`'s `ingress` module generates the Caddy configuration and syncs it through the admin API;
    basic auth; the four TLS modes; the gateway listening on the private address with its ingress token; server flags
    for the ingress.
@@ -387,10 +421,12 @@ flowchart LR
    format with incremental chains and weekly full backups; the `tar` format with full archives (the `tar` crate);
    several targets, each with its own format, schedule and retention; retention that never breaks a chain; opting
    out per app. Adds `backup app|volume|list`, `--restore` on deploy and `volume create` (both formats), and backups
-   of the server's own state.
+   of the server's own state, from a consistent copy made with SQLite's online backup API.
    *Verify:* back up an app, change its data, back up again (incremental), restore on the other node and get the
    second state; a `tar` backup extracted with plain `tar` on a machine without btrfs matches file for file, owners
-   and modes included; kill a node and recover its nest elsewhere; restore the server from its backup.
+   and modes included; kill a node and recover its nest elsewhere; restore the server from its backup; back up the
+   server while deploys are writing to its database, and the restored database passes `PRAGMA integrity_check` and
+   holds every deploy that finished before the backup began.
 9. **Install, join, upgrades and the GitHub Action.** `kiwi-nest server init`; `kiwi-nest node join URL --token`,
    which checks Docker, Compose and the btrfs mount and installs the systemd unit; `kiwi-nest upgrade`, which updates
    the server, which then offers its binary to the nodes (each downloads it, checks its checksum, swaps it in and
