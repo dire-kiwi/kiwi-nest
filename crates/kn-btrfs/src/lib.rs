@@ -5,6 +5,8 @@
 //! - [`inspect`] checks that a path is a subvolume on btrfs, reached without symlinks, and returns its ID and its
 //!   filesystem's UUID.
 //! - [`rename_noreplace`] and [`exchange`] move subvolumes (or anything else) into place atomically.
+//! - [`send`] writes a read-only subvolume as a `btrfs send` stream, whole or against a parent (receiving one is
+//!   plain file operations, in `kn-backup`).
 //!
 //! Every path is opened one component at a time with `O_NOFOLLOW`, starting from `/`, so a symlink anywhere on the
 //! way is refused rather than followed, and the ioctls act on those file descriptors rather than on paths. Paths
@@ -78,6 +80,19 @@ const IOC_SUBVOL_GETFLAGS: u64 = ioc(IOC_READ, 25, size_of::<u64>());
 const IOC_SUBVOL_SETFLAGS: u64 = ioc(IOC_WRITE, 26, size_of::<u64>());
 const IOC_FS_INFO: u64 = ioc(IOC_READ, 31, size_of::<FsInfoArgs>());
 const IOC_DEV_INFO: u64 = ioc(IOC_READ | IOC_WRITE, 30, size_of::<DevInfoArgs>());
+const IOC_SEND: u64 = ioc(IOC_WRITE, 38, size_of::<SendArgs>());
+
+/// `struct btrfs_ioctl_send_args`.
+#[repr(C)]
+struct SendArgs {
+    send_fd: i64,
+    clone_sources_count: u64,
+    clone_sources: *const u64,
+    parent_root: u64,
+    flags: u64,
+    version: u32,
+    reserved: [u8; 28],
+}
 
 /// `struct btrfs_ioctl_dev_info_args`, up to the sizes; the kernel fills the rest.
 #[repr(C)]
@@ -548,6 +563,108 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> Result<()> {
 /// Swaps `a` and `b` atomically: each path names the other's contents afterwards.
 pub fn exchange(a: &Path, b: &Path) -> Result<()> {
     renameat2(a, b, RENAME_EXCHANGE, "exchanging")
+}
+
+/// Writes the read-only subvolume `path` to `out` as a `btrfs send` stream (version 1): all of it, or with
+/// `parent` (another read-only subvolume on the same filesystem, normally an earlier snapshot of the same data) only
+/// what changed since. The stream names the subvolume by its own name (the last component of `path`).
+///
+/// The kernel only lets root send (`CAP_SYS_ADMIN`). It writes the stream into a pipe from a thread of its own while
+/// this reads it; if `out` fails, the pipe is closed, which stops the kernel too.
+pub fn send(path: &Path, parent: Option<&Path>, out: &mut dyn io::Write) -> Result<()> {
+    let fd = open_dir(path)?;
+    let sub = inspect_fd(fd.as_fd(), path)?;
+    if !sub.read_only {
+        return Err(Error::Io {
+            op: "sending",
+            path: path.into(),
+            source: io::Error::other("only a read-only subvolume can be sent"),
+        });
+    }
+    let parent_root = match parent {
+        Some(p) => {
+            let ps = inspect(p)?;
+            if !ps.read_only || ps.fs != sub.fs {
+                return Err(Error::Io {
+                    op: "sending against",
+                    path: p.into(),
+                    source: io::Error::other("the parent must be a read-only subvolume on the same filesystem"),
+                });
+            }
+            ps.id
+        }
+        None => 0,
+    };
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` has room for the two descriptors; the result is checked.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(Error::io("making a pipe for", path, io::Error::last_os_error()));
+    }
+    // SAFETY: both were just opened, and are owned by nothing else.
+    let (reader, writer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let target = path.to_path_buf();
+    let kernel = std::thread::Builder::new()
+        .name("kn-btrfs-send".into())
+        .spawn(move || -> io::Result<()> {
+            let mut args = SendArgs {
+                send_fd: i64::from(writer.as_raw_fd()),
+                clone_sources_count: 0,
+                clone_sources: std::ptr::null(),
+                parent_root,
+                flags: 0,
+                version: 0,
+                reserved: [0; 28],
+            };
+            let r = ioctl(fd.as_fd(), IOC_SEND, &mut args);
+            // The reader sees the end of the stream once this end is closed.
+            drop(writer);
+            r
+        })
+        .map_err(|e| Error::io("starting to send", &target, e))?;
+    let mut pipe = std::fs::File::from(reader);
+    let copied = io::copy(&mut pipe, out);
+    // If writing failed, closing the pipe makes the kernel's next write fail, so it stops.
+    drop(pipe);
+    let sent = kernel
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("the send thread panicked")));
+    match (sent, copied) {
+        (Err(e), _) if e.raw_os_error() == Some(libc::EPERM) => Err(Error::Io {
+            op: "sending",
+            path: path.into(),
+            source: io::Error::new(e.kind(), "btrfs send needs root (CAP_SYS_ADMIN)"),
+        }),
+        // The kernel's EPIPE is only the echo of a failed write.
+        (_, Err(e)) => Err(Error::io("writing the send stream of", path, e)),
+        (Err(e), Ok(_)) => Err(Error::io("sending", path, e)),
+        (Ok(()), Ok(_)) => Ok(()),
+    }
+}
+
+/// Removes everything at `path`, without following symlinks: subvolumes (read-only ones too) are destroyed, and
+/// directories emptied first. Nothing there is fine. For cleaning up after tests and failed operations.
+pub fn remove_tree(path: &Path) -> io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !meta.is_dir() {
+        return std::fs::remove_file(path);
+    }
+    if std::os::unix::fs::MetadataExt::ino(&meta) == SUBVOLUME_ROOT_INODE && inspect(path).is_ok() {
+        return destroy(path).map_err(io::Error::other);
+    }
+    for e in std::fs::read_dir(path)? {
+        remove_tree(&e?.path())?;
+    }
+    std::fs::remove_dir(path)
+}
+
+/// Whether this process can send subvolumes: whether it runs as root.
+pub fn can_send() -> bool {
+    // SAFETY: `geteuid` has no preconditions.
+    unsafe { libc::geteuid() == 0 }
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@ kn-proto = { path = "crates/kn-proto" }
 kn-bundle = { path = "crates/kn-bundle" }
 kn-node = { path = "crates/kn-node" }
 kn-btrfs = { path = "crates/kn-btrfs" }
+kn-backup = { path = "crates/kn-backup" }
 kn-cli = { path = "crates/kn-cli" }
 kn-server = { path = "crates/kn-server" }
 
@@ -31,18 +32,22 @@ getrandom = "0.3"
 # TLS through rustls with ring (installed as the process's provider), so the static musl builds need no C toolchain
 # beyond what ring's own build uses.
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls-no-provider"] }
-rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "0.40", features = ["backup", "bundled", "fallible_uint"] }
+rusty-s3 = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.11"
+tar = { version = "0.4.45", default-features = false }
 tempfile = "3"
+url = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = { version = "0.13", default-features = false }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [profile.release]

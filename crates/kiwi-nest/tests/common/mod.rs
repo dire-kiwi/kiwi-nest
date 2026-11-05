@@ -214,6 +214,8 @@ impl Drop for Node {
         if std::env::var("KIWI_NEST_INTEGRATION").as_deref() == Ok("1") {
             remove_projects(&self.prefix);
         }
+        // Read-only snapshots (kept for backups) aren't removed with the directory.
+        let _ = kn_btrfs::remove_tree(self.volumes.path());
     }
 }
 
@@ -262,9 +264,10 @@ pub struct Server {
     /// A CA certificate for `url`, such as the ingress's internal CA.
     pub ca_cert: Option<PathBuf>,
     addr: String,
-    extra: Vec<String>,
     pub admin: String,
     pub dir: tempfile::TempDir,
+    /// More `kiwi-nest server` flags, kept for restarts.
+    extra: Vec<String>,
     /// The CLI's configuration directory, empty, so the tests never use the user's clusters.
     pub config: tempfile::TempDir,
 }
@@ -334,7 +337,7 @@ impl Server {
         Server::start_with(&[])
     }
 
-    /// Starts a server with more flags.
+    /// A server with more `kiwi-nest server` flags.
     pub fn start_with(extra: &[&str]) -> Server {
         let dir = tempfile::tempdir().unwrap();
         let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
@@ -344,11 +347,35 @@ impl Server {
             addr: url.trim_start_matches("http://").to_string(),
             url,
             ca_cert: None,
-            extra,
             admin: admin.unwrap(),
             dir,
+            extra,
             config: tempfile::tempdir().unwrap(),
         }
+    }
+
+    /// A server on state restored into `dir/server`, listening on `listen`, whose admin token is `admin` (the
+    /// restored database's).
+    pub fn start_restored(dir: tempfile::TempDir, admin: &str, listen: &str, extra: &[&str]) -> Server {
+        let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        let (child, url, first) = spawn_server(&dir.path().join("server"), listen, &extra);
+        assert!(first.is_none(), "a restored server has its admin tokens");
+        Server {
+            child,
+            addr: url.trim_start_matches("http://").to_string(),
+            url,
+            ca_cert: None,
+            admin: admin.into(),
+            dir,
+            extra,
+            config: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    /// Kills the server (SIGKILL).
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     /// The address the server itself listens on.
@@ -607,6 +634,8 @@ impl Drop for ClusterNode {
         if std::env::var("KIWI_NEST_INTEGRATION").as_deref() == Ok("1") {
             remove_projects(&self.prefix);
         }
+        // Read-only snapshots (kept for backups) aren't removed with the directory.
+        let _ = kn_btrfs::remove_tree(self.volumes.path());
     }
 }
 

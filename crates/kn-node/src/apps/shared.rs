@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 use kn_proto::api::{VolumeInfo, VolumeMount};
+use kn_proto::backup::Restore;
 
 use super::*;
 use crate::volumes::LOAD_NAME;
@@ -44,30 +45,51 @@ fn missing(name: &str) -> AppsError {
 impl Apps {
     /// Creates an empty shared volume.
     pub async fn volume_create(&self, name: &str) -> Result<VolumeInfo> {
+        self.volume_create_from(name, None).await
+    }
+
+    /// Creates a shared volume, empty or restored from a backup.
+    pub async fn volume_create_from(&self, name: &str, restore: Option<&Restore>) -> Result<VolumeInfo> {
         check_name(name)?;
         let lock = self.inner.shared_lock(name);
         let _guard = lock.write().await;
         if self.inner.state.lock().await.shared.contains_key(name) {
             return Err(AppsError::Conflict(format!("shared volume `{name}` already exists")));
         }
+        // `data` and `snaps` are made in a staging directory, then moved into place together.
         let (vols, n) = (self.inner.volumes.clone(), name.to_string());
-        let id = blocking(move || -> Result<u64, VolumeError> {
-            // `data` and `snaps` are made in a staging directory, then moved into place together.
-            let dest = vols.shared_dir(&n);
-            let staging = vols.stage_dir(&dest)?;
-            let made = std::fs::create_dir(staging.join("snaps"))
-                .map_err(|e| VolumeError {
-                    context: format!("creating {}", staging.display()),
-                    source: e.into(),
+        let staging = blocking(move || vols.stage_dir(&vols.shared_dir(&n))).await??;
+        let restored = match restore {
+            Some(r) => self.restore_volume_data(r, &staging).await.map(Some),
+            None => Ok(None),
+        };
+        let (vols, n, s) = (self.inner.volumes.clone(), name.to_string(), staging.clone());
+        let made = match restored {
+            Ok(restored) => {
+                blocking(move || -> Result<u64> {
+                    std::fs::create_dir(s.join("snaps")).map_err(|e| VolumeError {
+                        context: format!("creating {}", s.display()),
+                        source: e.into(),
+                    })?;
+                    let id = match restored {
+                        Some(id) => id,
+                        None => vols.create(&s.join("data"))?,
+                    };
+                    vols.commit(&vols.shared_dir(&n))?;
+                    Ok(id)
                 })
-                .and_then(|()| vols.create(&staging.join("data")))
-                .and_then(|id| vols.commit(&dest).map(|()| id));
-            if made.is_err() {
-                let _ = vols.remove(&staging);
+                .await?
             }
-            made
-        })
-        .await??;
+            Err(e) => Err(e),
+        };
+        let id = match made {
+            Ok(id) => id,
+            Err(e) => {
+                let vols = self.inner.volumes.clone();
+                let _ = blocking(move || vols.remove(&staging)).await;
+                return Err(e);
+            }
+        };
         {
             let mut state = self.inner.state.lock().await;
             state.shared.insert(
@@ -281,6 +303,8 @@ impl Apps {
             }
             vols.remove(&vols.shared_data(&n))?;
             vols.remove(&vols.shared_dir(&n))?;
+            // Its backups' snapshots too, which would otherwise never be freed.
+            vols.set_aside_backups(kn_proto::backup::Kind::Volume, &n)?;
             Ok(())
         })
         .await??;

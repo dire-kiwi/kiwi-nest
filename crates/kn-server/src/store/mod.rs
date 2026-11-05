@@ -56,6 +56,11 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: MIGRATION_3,
         then: None,
     },
+    // 4: backups: whether scheduled backups include an app, and the backup an app or volume was restored from.
+    Migration {
+        sql: MIGRATION_4,
+        then: None,
+    },
 ];
 
 const MIGRATION_1: &str = r#"
@@ -177,6 +182,14 @@ const MIGRATION_3: &str = r#"
     -- configuration needs it (unlike the node's own token, kept as a hash).
     ALTER TABLE nodes ADD COLUMN ingress_token TEXT;
     UPDATE nodes SET ingress_token = 'kni_' || lower(hex(randomblob(32)));
+    "#;
+
+// 4: backups: whether scheduled backups include an app, and the backup an app or volume was restored from.
+const MIGRATION_4: &str = r#"
+    ALTER TABLE apps ADD COLUMN backups INTEGER NOT NULL DEFAULT 1;
+    -- `{"target": …, "key": …}`, given with `--restore`; the node only uses it on the app's first deploy.
+    ALTER TABLE apps ADD COLUMN restore TEXT;
+    ALTER TABLE volumes ADD COLUMN restore TEXT;
     "#;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;

@@ -344,6 +344,7 @@ impl Agent {
             let p = path.clone();
             tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await??;
         }
+        apps.set_targets(Arc::new(ServerTargets { link: link.clone() }));
         Ok(Agent {
             inner: Arc::new(Inner {
                 apps,
@@ -724,8 +725,11 @@ impl Inner {
         match want {
             Want::App(c) => match &c.want {
                 AppWant::Deploy {
-                    bundle_digest, from, ..
-                } => self.deploy(c, bundle_digest, from.clone()).await,
+                    bundle_digest,
+                    from,
+                    restore,
+                    ..
+                } => self.deploy(c, bundle_digest, from.clone(), restore.clone()).await,
                 AppWant::Delete { keep_data } => match self.apps.delete(&c.name, *keep_data).await {
                     Ok(()) | Err(AppsError::NotFound(_)) => Step::Done(Outcome {
                         deleted: true,
@@ -749,7 +753,13 @@ impl Inner {
         }
     }
 
-    async fn deploy(&self, c: &AppChange, digest: &str, from: Option<String>) -> Step {
+    async fn deploy(
+        &self,
+        c: &AppChange,
+        digest: &str,
+        from: Option<String>,
+        restore: Option<kn_proto::backup::Restore>,
+    ) -> Step {
         let limit = self.apps.config().limits.max_archive_size;
         let upload = match self.download(digest, limit).await {
             Ok(u) => u,
@@ -774,6 +784,7 @@ impl Inner {
         let opts = DeployOptions {
             create_only: false,
             from,
+            restore,
             generation: Some(c.generation),
         };
         tracing::info!(app = c.name, generation = c.generation, "deploying for the server");
@@ -796,13 +807,17 @@ impl Inner {
                 }),
                 Err(e) => Step::Done(failed(c.generation, e)),
             },
-            VolumeWant::Present { data_digest } => {
+            VolumeWant::Present { data_digest, restore } => {
                 let loaded = self.outcome(&key).and_then(|o| o.data_digest);
+                let mut notes = Vec::new();
                 match self.apps.volume_info(&c.name).await {
                     Ok(_) => {}
                     Err(AppsError::NotFoundOther(_)) => {
-                        if let Err(e) = self.apps.volume_create(&c.name).await {
+                        if let Err(e) = self.apps.volume_create_from(&c.name, restore.as_ref()).await {
                             return Step::Done(failed(c.generation, e));
+                        }
+                        if let Some(r) = restore {
+                            notes.push(format!("restored from `{}` (target `{}`)", r.key, r.target));
                         }
                     }
                     Err(e) => return Step::Retry(e.to_string()),
@@ -810,6 +825,7 @@ impl Inner {
                 let Some(digest) = data_digest.as_ref().filter(|d| Some(*d) != loaded.as_ref()) else {
                     return Step::Done(Outcome {
                         data_digest: loaded,
+                        notes,
                         ..done(c.generation)
                     });
                 };
@@ -859,11 +875,17 @@ impl Inner {
                 }
             }
         }
-        // Those that change something wait for a forgotten node to finish forgetting, and then don't run.
+        // Those that change something wait for a forgotten node to finish forgetting, and then don't run. A backup
+        // only reads its snapshots, so it doesn't hold forgetting up (an upload can take hours), but it doesn't
+        // start once the node is forgotten either.
         let changes = matches!(
             c.action,
             Action::Suspend { .. } | Action::Resume { .. } | Action::DeleteSnapshot { .. }
         );
+        if matches!(c.action, Action::Backup { .. }) && self.forgotten.load(std::sync::atomic::Ordering::SeqCst) {
+            self.running.lock().expect("running").remove(&c.id);
+            return;
+        }
         let _applying = if changes {
             Some(self.applying.read().await)
         } else {
@@ -879,6 +901,12 @@ impl Inner {
             Action::Resume { app } => Some(json(self.apps.resume(&app).await)),
             Action::VolumeInfo { name } => Some(json(self.apps.volume_info(&name).await)),
             Action::DeleteSnapshot { name, app } => Some(json(self.apps.volume_delete_snapshot(&name, &app).await)),
+            Action::Backup {
+                what,
+                name,
+                targets,
+                full,
+            } => Some(json(self.apps.backup(what, &name, &targets, full).await)),
             Action::Logs { app, query } => match self.apps.logs(&app, query).await {
                 Ok(logs) => {
                     if let Err(e) = self.stream_logs(c.id, logs).await {
@@ -925,6 +953,29 @@ impl Inner {
     }
 }
 
+/// The server's backup targets, fetched for each backup and restore (so a change to them on the server needs no
+/// node restart).
+struct ServerTargets {
+    link: Link,
+}
+
+impl crate::apps::TargetSource for ServerTargets {
+    fn targets(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<Arc<crate::apps::Targets>>> {
+        Box::pin(async move {
+            let cfgs = self
+                .link
+                .backup_targets()
+                .await
+                .map_err(|e| anyhow::anyhow!("getting the backup targets from the server: {e}"))?;
+            if cfgs.is_empty() {
+                anyhow::bail!("the server has no backup targets (`kiwi-nest server --backup-targets`)");
+            }
+            // Each on its own: one this node can't use fails alone.
+            Ok(Arc::new(crate::apps::Targets::open(cfgs)))
+        })
+    }
+}
+
 /// What the node is, now.
 async fn facts(apps: &Apps, cfg: &AgentConfig) -> NodeFacts {
     let node = apps.config().clone();
@@ -957,6 +1008,7 @@ async fn facts(apps: &Apps, cfg: &AgentConfig) -> NodeFacts {
                 .collect(),
             project_prefix: node.project_prefix.clone(),
             gateway,
+            protocol: kn_proto::agent::PROTOCOL,
             ingress,
         }
     })

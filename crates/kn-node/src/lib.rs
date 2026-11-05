@@ -52,6 +52,8 @@ pub struct NodeConfig {
     pub starting_page_after: Duration,
     /// How often idle apps are looked for.
     pub idle_check_interval: Duration,
+    /// A standalone node's backup targets (a node joined to a server gets the server's).
+    pub backup_targets: Option<PathBuf>,
 }
 
 impl NodeConfig {
@@ -71,6 +73,7 @@ impl NodeConfig {
             start_cooldown: Duration::from_secs(15),
             starting_page_after: Duration::from_secs(1),
             idle_check_interval: Duration::from_secs(1),
+            backup_targets: None,
         }
     }
 

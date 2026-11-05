@@ -251,6 +251,24 @@ pub fn facts_of(n: &Node) -> NodeFacts {
     n.facts.clone().unwrap_or_default()
 }
 
+/// Whether the node speaks a version of the agent link with backups (see [`kn_proto::agent::BACKUPS_PROTOCOL`]).
+pub fn has_backups(n: &Node) -> bool {
+    n.facts
+        .as_ref()
+        .is_some_and(|f| f.protocol >= kn_proto::agent::BACKUPS_PROTOCOL)
+}
+
+/// Refuses a backup or restore for a node too old for them.
+pub fn require_backups(n: &Node) -> Result<()> {
+    if has_backups(n) {
+        return Ok(());
+    }
+    Err(Error::Conflict(format!(
+        "node `{}` runs a kiwi-nest from before backups; upgrade it first",
+        n.name
+    )))
+}
+
 /// The node's labels: those it reports, with those set by `node label` over them.
 pub fn labels_of(n: &Node) -> BTreeMap<String, String> {
     let mut labels = n.facts.as_ref().map(|f| f.labels.clone()).unwrap_or_default();

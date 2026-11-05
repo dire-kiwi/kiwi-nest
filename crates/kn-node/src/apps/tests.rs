@@ -106,6 +106,7 @@ impl Env {
         let opts = DeployOptions {
             create_only: false,
             from: from.map(str::to_string),
+            restore: None,
             generation: None,
         };
         self.apps.deploy(name, staged, opts).await
@@ -719,4 +720,512 @@ async fn a_missing_volumes_directory_is_refused_not_made_again() {
     // Deleting the app is the way to start again.
     env.apps.delete("prod", false).await.unwrap();
     env.deploy("prod", &["data"], None).await.unwrap();
+}
+
+/// A local directory target, in `format`, keeping the last `keep` backups.
+fn dir_target(dir: &Path, name: &str, format: kn_proto::backup::Format, keep: u32) -> kn_backup::Target {
+    kn_backup::Target::open(kn_proto::backup::TargetConfig {
+        name: name.into(),
+        s3: None,
+        ssh: None,
+        dir: Some(kn_proto::backup::DirConfig {
+            path: dir.to_string_lossy().into_owned(),
+        }),
+        prefix: String::new(),
+        format,
+        every: None,
+        full_every: None,
+        keep: kn_proto::backup::Keep {
+            last: Some(keep),
+            ..Default::default()
+        },
+    })
+    .unwrap()
+}
+
+impl Env {
+    fn use_targets(&self, targets: Vec<kn_backup::Target>) {
+        self.apps.set_targets(Arc::new(StaticTargets::new(targets, "tests")));
+    }
+
+    async fn deploy_restored(&self, name: &str, volumes: &[&str], shared: &str, restore: &str) -> Result<AppInfo> {
+        let b = self.path(&format!("bundle-{name}"));
+        std::fs::create_dir_all(b.join("site")).unwrap();
+        std::fs::write(b.join("site/index.html"), "page").unwrap();
+        std::fs::write(
+            b.join("compose.yaml"),
+            compose(&format!("{name}.localhost"), volumes, shared),
+        )
+        .unwrap();
+        let staged = self.apps.stage_dir(b).await?;
+        let restore = self
+            .apps
+            .resolve_restore(kn_proto::backup::Kind::App, restore, None)
+            .await?;
+        let opts = DeployOptions {
+            restore: Some(restore),
+            ..DeployOptions::default()
+        };
+        self.apps.deploy(name, staged, opts).await
+    }
+
+    /// The snapshot sets kept for an app's backups.
+    fn sets(&self, app: &str) -> Vec<String> {
+        Volumes::names(&self.vols().backups_dir(kn_proto::backup::Kind::App, app)).unwrap()
+    }
+}
+
+#[tokio::test]
+async fn tar_backups_restore_into_a_new_app() {
+    use kn_proto::backup::{Format, Kind};
+    let env = Env::new().await;
+    let store = env.path("backups");
+    env.use_targets(vec![dir_target(&store, "local", Format::Tar, 2)]);
+    env.deploy("blog", &["data", "logs"], None).await.unwrap();
+    std::fs::write(env.volume("blog", "data").join("db"), "one").unwrap();
+    std::fs::write(env.volume("blog", "logs").join("today"), "x").unwrap();
+    env.flag("running", true);
+    env.calls();
+
+    let first = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap();
+    assert!(first.failed.is_empty(), "{first:?}");
+    assert_eq!(first.made.len(), 1);
+    let k1 = first.made[0].key.clone();
+    assert!(k1.starts_with("apps/blog/") && k1.ends_with(".tar.zst"), "{k1}");
+    // Paused only around the snapshots, and unpaused after.
+    let calls = env.calls();
+    let paused = calls.iter().position(|c| c == "blog pause").expect("paused");
+    let unpaused = calls.iter().position(|c| c == "blog unpause").expect("unpaused");
+    assert!(paused < unpaused, "{calls:?}");
+    assert!(!env.record("blog").await.paused);
+    // A tar backup needs no snapshot kept on the node.
+    assert!(env.sets("blog").is_empty());
+
+    std::fs::write(env.volume("blog", "data").join("db"), "two").unwrap();
+    let second = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap();
+    let k2 = second.made[0].key.clone();
+    assert!(k2 > k1, "{k2} after {k1}");
+
+    // Restored into a new app: the second state. A volume the bundle doesn't declare isn't restored.
+    let info = env.deploy_restored("copy", &["data", "cache"], "", &k2).await.unwrap();
+    assert!(
+        info.notes.iter().any(|n| n.contains("restored `data`")),
+        "{:?}",
+        info.notes
+    );
+    assert!(
+        info.notes.iter().any(|n| n.contains("volume `logs`")),
+        "{:?}",
+        info.notes
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.volume("copy", "data").join("db")).unwrap(),
+        "two"
+    );
+    assert!(std::fs::read_dir(env.volume("copy", "cache")).unwrap().next().is_none());
+    assert_eq!(env.record("copy").await.restore.unwrap().key, k2);
+    let ids = env.record("copy").await.volume_ids;
+    assert_eq!(ids.len(), 2);
+    // A redeploy keeps its data, whatever --restore says.
+    std::fs::write(env.volume("copy", "data").join("db"), "mine").unwrap();
+    let info = env.deploy_restored("copy", &["data", "cache"], "", &k1).await.unwrap();
+    assert!(
+        info.notes
+            .iter()
+            .any(|n| n.contains("only applies to an app's first deploy"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.volume("copy", "data").join("db")).unwrap(),
+        "mine"
+    );
+
+    // Retention keeps the last two.
+    std::thread::sleep(Duration::from_millis(1100));
+    let third = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap();
+    assert!(
+        third.notes.iter().any(|n| n.contains("retention removed 1")),
+        "{third:?}"
+    );
+    let left = env.apps.backup_list(&Default::default()).await.unwrap();
+    assert_eq!(left.len(), 2);
+    assert!(!left.iter().any(|b| b.key == k1));
+
+    // A key that isn't there, or of the wrong kind, is refused before anything is made.
+    let e = env
+        .deploy_restored("other", &["data"], "", &k1)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("no backup target has"), "{e}");
+    let e = env
+        .deploy_restored("other", &["data"], "", "volumes/x/20261106T030000Z.tar.zst")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("is a backup of volume"), "{e}");
+    assert!(!Volumes::exists(&env.vols().app_dir("other")).unwrap());
+}
+
+#[tokio::test]
+async fn a_failed_backup_leaves_nothing() {
+    use kn_proto::backup::{Format, Kind};
+    let env = Env::new().await;
+    // A target that can't be written: its directory is a file.
+    let blocked = env.path("blocked");
+    std::fs::write(&blocked, "").unwrap();
+    let good = env.path("good");
+    env.use_targets(vec![
+        dir_target(&blocked, "blocked", Format::Tar, 5),
+        dir_target(&good, "good", Format::Tar, 5),
+    ]);
+    env.deploy("blog", &["data"], None).await.unwrap();
+    let r = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap();
+    assert_eq!(r.made.len(), 1);
+    assert_eq!(r.failed.len(), 1);
+    assert_eq!(r.failed[0].target, "blocked");
+    assert!(env.sets("blog").is_empty());
+    // Only that target, by name; an unknown one is refused.
+    let r = env
+        .apps
+        .backup(Kind::App, "blog", &["good".into()], false)
+        .await
+        .unwrap();
+    assert!(r.failed.is_empty() && r.made.len() == 1);
+    let e = env
+        .apps
+        .backup(Kind::App, "blog", &["nope".into()], false)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("no backup target `nope`"), "{e}");
+    // A target the node can't use (here, one whose key file only the server had) fails on its own.
+    struct Mixed(Arc<Targets>);
+    impl TargetSource for Mixed {
+        fn targets(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<Arc<Targets>>> {
+            Box::pin(async move { Ok(self.0.clone()) })
+        }
+    }
+    let mut broken = kn_proto::backup::TargetConfig {
+        name: "r2".into(),
+        ..dir_target(&good, "x", Format::Tar, 5).config().clone()
+    };
+    broken.dir = None;
+    broken.s3 = Some(kn_proto::backup::S3Config {
+        endpoint: "https://r2.example.com".into(),
+        bucket: "b".into(),
+        region: "auto".into(),
+        access_key: "a".into(),
+        secret_key: None,
+        secret_key_file: Some("/only/on/the/server".into()),
+        virtual_host: false,
+    });
+    let good_cfg = dir_target(&good, "good", Format::Tar, 5).config().clone();
+    env.apps
+        .set_targets(Arc::new(Mixed(Arc::new(Targets::open(vec![broken, good_cfg])))));
+    let r = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap();
+    assert_eq!(r.made.len(), 1, "{r:?}");
+    assert_eq!(r.failed.len(), 1);
+    assert!(
+        r.failed[0].target == "r2" && r.failed[0].error.contains("/only/on/the/server"),
+        "{r:?}"
+    );
+    let r = env.apps.backup(Kind::App, "blog", &["r2".into()], false).await.unwrap();
+    assert!(r.made.is_empty() && r.failed.len() == 1, "{r:?}");
+    let e = env
+        .apps
+        .resolve_restore(Kind::App, "apps/blog/20261106T030000Z.tar.zst", Some("r2"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("backup target `r2` can't be used"), "{e}");
+    // Without targets at all.
+    env.use_targets(vec![]);
+    let e = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap_err();
+    assert!(e.to_string().contains("no backup targets"), "{e}");
+    // A `send` target needs root (for btrfs send).
+    if !kn_btrfs::can_send() {
+        env.use_targets(vec![dir_target(&good, "send", Format::Send, 5)]);
+        let e = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap_err();
+        assert!(e.to_string().contains("needs the node to run as root"), "{e}");
+    }
+}
+
+#[tokio::test]
+async fn shared_volumes_and_an_apps_snapshots_of_them_are_backed_up() {
+    use kn_proto::backup::{Format, Kind};
+    let env = Env::new().await;
+    env.use_targets(vec![dir_target(&env.path("backups"), "local", Format::Tar, 5)]);
+    env.apps.volume_create("corpus").await.unwrap();
+    std::fs::write(env.vols().shared_data("corpus").join("words"), "shared").unwrap();
+    env.deploy_yaml(
+        "blog",
+        &compose(
+            "blog.localhost",
+            &["data"],
+            "{ corpus: { target: /c, mode: snapshot } }",
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+    // The app writes into its own snapshot.
+    std::fs::write(env.vols().snapshot_path("corpus", "blog").join("words"), "the app's").unwrap();
+
+    let vb = env.apps.backup(Kind::Volume, "corpus", &[], false).await.unwrap();
+    let vkey = vb.made[0].key.clone();
+    assert!(vkey.starts_with("volumes/corpus/"), "{vkey}");
+    let ab = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap();
+    assert!(ab.notes.iter().any(|n| n.contains("`@corpus`")), "{ab:?}");
+    let akey = ab.made[0].key.clone();
+
+    // A volume restored under another name.
+    let restore = env.apps.resolve_restore(Kind::Volume, &vkey, None).await.unwrap();
+    let info = env.apps.volume_create_from("corpus2", Some(&restore)).await.unwrap();
+    assert!(info.problem.is_none(), "{info:?}");
+    assert_eq!(
+        std::fs::read_to_string(env.vols().shared_data("corpus2").join("words")).unwrap(),
+        "shared"
+    );
+    // An app restored with its own snapshot, not a new one of the shared volume.
+    env.deploy_restored("blog2", &["data"], "{ corpus: { target: /c, mode: snapshot } }", &akey)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(env.vols().snapshot_path("corpus", "blog2").join("words")).unwrap(),
+        "the app's"
+    );
+    assert!(env.record("blog2").await.shared["corpus"].snapshot_id.is_some());
+    // A bundle that mounts the volume `ro` doesn't get the snapshot.
+    let info = env
+        .deploy_restored("blog3", &["data"], "{ corpus: { target: /c } }", &akey)
+        .await
+        .unwrap();
+    assert!(
+        info.notes
+            .iter()
+            .any(|n| n.contains("snapshot of shared volume `corpus`")),
+        "{:?}",
+        info.notes
+    );
+    assert!(!Volumes::exists(&env.vols().snapshot_path("corpus", "blog3")).unwrap());
+    let staged = Volumes::staging_for(&env.vols().snapshot_path("corpus", "blog3"));
+    assert!(!Volumes::exists(&staged).unwrap());
+
+    let q = kn_proto::backup::ListQuery {
+        kind: Some(Kind::Volume),
+        ..Default::default()
+    };
+    assert_eq!(env.apps.backup_list(&q).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn send_backups_continue_chains_from_what_both_sides_have() {
+    use kn_proto::backup::{Format, Kind};
+    let Ok(btrfs) = std::env::var("KIWI_NEST_TEST_BTRFS_DIR") else {
+        assert!(
+            std::env::var_os("KIWI_NEST_REQUIRE_ROOT").is_none(),
+            "needs KIWI_NEST_TEST_BTRFS_DIR, as root, and KIWI_NEST_REQUIRE_ROOT is set"
+        );
+        eprintln!("skipped: needs KIWI_NEST_TEST_BTRFS_DIR, as root");
+        return;
+    };
+    if !kn_btrfs::can_send() {
+        assert!(
+            std::env::var_os("KIWI_NEST_REQUIRE_ROOT").is_none(),
+            "btrfs send needs root, and KIWI_NEST_REQUIRE_ROOT is set"
+        );
+        eprintln!("skipped: btrfs send needs root");
+        return;
+    }
+    let dir = tempfile::tempdir_in(std::fs::canonicalize(btrfs).unwrap()).unwrap();
+    let root = dir.path().to_path_buf();
+    // Whatever happens, its subvolumes (read-only snapshots too) go with it.
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = kn_btrfs::remove_tree(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    let docker = root.join("docker");
+    std::fs::write(&docker, FAKE_DOCKER).unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = NodeConfig::new(root.join("state"));
+    cfg.docker = docker;
+    let apps = Apps::open_with(cfg, Arc::new(crate::volumes::Btrfs)).await.unwrap();
+    let (a, b) = (root.join("a"), root.join("b"));
+    apps.set_targets(Arc::new(StaticTargets::new(
+        vec![
+            dir_target(&a, "a", Format::Send, 10),
+            dir_target(&b, "b", Format::Send, 10),
+        ],
+        "tests",
+    )));
+    let deploy = |name: &'static str, restore: Option<String>| {
+        let (apps, bundle) = (apps.clone(), root.join(format!("bundle-{name}")));
+        std::fs::create_dir_all(bundle.join("site")).unwrap();
+        std::fs::write(
+            bundle.join("compose.yaml"),
+            compose(&format!("{name}.localhost"), &["data"], ""),
+        )
+        .unwrap();
+        async move {
+            let staged = apps.stage_dir(bundle).await.unwrap();
+            let restore = match restore {
+                Some(k) => Some(apps.resolve_restore(Kind::App, &k, Some("a")).await.unwrap()),
+                None => None,
+            };
+            apps.deploy(
+                name,
+                staged,
+                DeployOptions {
+                    restore,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+    deploy("blog", None).await;
+    let data = apps.volumes().app_volume("blog", "data");
+    std::fs::write(data.join("db"), vec![1u8; 200_000]).unwrap();
+    let sets = || Volumes::names(&apps.volumes().backups_dir(Kind::App, "blog")).unwrap();
+
+    // Both targets: full backups, and one set kept as their parent.
+    let r = apps.backup(Kind::App, "blog", &[], false).await.unwrap();
+    assert_eq!(r.made.len(), 2, "{r:?}");
+    assert!(r.made.iter().all(|m| m.parent.is_none()));
+    let first = sets();
+    assert_eq!(first.len(), 1);
+
+    // Only `a`: incremental against the kept set. `b` still needs the first set, so both are kept.
+    std::thread::sleep(Duration::from_millis(1100));
+    std::fs::write(data.join("new"), "two").unwrap();
+    let r = apps.backup(Kind::App, "blog", &["a".into()], false).await.unwrap();
+    let incr = &r.made[0];
+    assert!(incr.parent.is_some() && incr.key.contains(".after-"), "{incr:?}");
+    assert_eq!(sets().len(), 2);
+
+    // `b` continues its own chain from the first set; then only the newest set is anyone's parent.
+    std::thread::sleep(Duration::from_millis(1100));
+    let r = apps.backup(Kind::App, "blog", &["b".into()], false).await.unwrap();
+    assert!(r.made[0].key.contains(&format!(".after-{}", first[0])), "{r:?}");
+    std::thread::sleep(Duration::from_millis(1100));
+    let r = apps.backup(Kind::App, "blog", &[], false).await.unwrap();
+    assert!(r.made.iter().all(|m| m.parent.is_some()), "{r:?}");
+    assert_eq!(sets().len(), 1);
+
+    // --full starts again; a chain whose parent set is gone from the node does too.
+    std::thread::sleep(Duration::from_millis(1100));
+    let r = apps.backup(Kind::App, "blog", &["a".into()], true).await.unwrap();
+    assert!(r.made[0].parent.is_none());
+    for s in sets() {
+        apps.volumes()
+            .remove(&apps.volumes().backups_dir(Kind::App, "blog").join(s))
+            .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(1100));
+    std::fs::write(data.join("new"), "three").unwrap();
+    let r = apps.backup(Kind::App, "blog", &["a".into()], false).await.unwrap();
+    assert!(r.made[0].parent.is_none(), "{r:?}");
+
+    // An incremental restore on the newest chain of `a`.
+    std::thread::sleep(Duration::from_millis(1100));
+    std::fs::write(data.join("new"), "four").unwrap();
+    let r = apps.backup(Kind::App, "blog", &["a".into()], false).await.unwrap();
+    assert!(r.made[0].parent.is_some());
+    deploy("copy", Some(r.made[0].key.clone())).await;
+    let copy = apps.volumes().app_volume("copy", "data");
+    assert_eq!(std::fs::read_to_string(copy.join("new")).unwrap(), "four");
+    assert_eq!(std::fs::read(copy.join("db")).unwrap().len(), 200_000);
+    assert!(!kn_btrfs::inspect(&copy).unwrap().read_only);
+
+    // Deleting the app sets its snapshots aside, and the next sweep destroys them.
+    apps.delete("blog", false).await.unwrap();
+    assert!(sets().is_empty());
+    apps.volumes().sweep(&[]).unwrap();
+    let backups = apps.volumes().root().join("backups/apps");
+    assert_eq!(Volumes::names(&backups).unwrap(), Vec::<String>::new());
+    assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 0);
+    apps.delete("copy", false).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_restored_snapshot_survives_a_failed_deploy_and_a_restart() {
+    use kn_proto::backup::{Format, Kind};
+    let mut env = Env::new().await;
+    env.use_targets(vec![dir_target(&env.path("backups"), "local", Format::Tar, 5)]);
+    for v in ["aaa", "corpus"] {
+        env.apps.volume_create(v).await.unwrap();
+    }
+    std::fs::write(env.vols().shared_data("corpus").join("words"), "shared").unwrap();
+    let shared = "{ corpus: { target: /c, mode: snapshot } }";
+    env.deploy_yaml("blog", &compose("blog.localhost", &["data"], shared), None)
+        .await
+        .unwrap();
+    std::fs::write(env.vols().snapshot_path("corpus", "blog").join("words"), "the app's").unwrap();
+    let key = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap().made[0]
+        .key
+        .clone();
+
+    // The restored app also mounts `aaa` (before `corpus`, by name) in snapshot mode, and snapshotting it fails:
+    // the restored volumes are in place, the restored snapshot of `corpus` is staged, and the deploy fails.
+    let both = "{ aaa: { target: /a, mode: snapshot }, corpus: { target: /c, mode: snapshot } }";
+    env.fake.fail_snapshots.lock().unwrap().insert(".new-copy".into());
+    assert!(env.deploy_restored("copy", &["data"], both, &key).await.is_err());
+    assert_eq!(
+        env.record("copy").await.restored_snapshots,
+        BTreeSet::from(["corpus".to_string()])
+    );
+    env.fake.fail_snapshots.lock().unwrap().clear();
+
+    // A restart keeps it; the next deploy moves it into place, rather than snapshotting `corpus` afresh.
+    env.restart().await;
+    env.use_targets(vec![dir_target(&env.path("backups"), "local", Format::Tar, 5)]);
+    let staged = Volumes::staging_for(&env.vols().snapshot_path("corpus", "copy"));
+    assert!(Volumes::exists(&staged).unwrap());
+    env.deploy_yaml("copy", &compose("copy.localhost", &["data"], both), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(env.vols().snapshot_path("corpus", "copy").join("words")).unwrap(),
+        "the app's"
+    );
+    assert!(env.record("copy").await.restored_snapshots.is_empty());
+
+    // One that went missing is refused, never made again from the shared volume.
+    env.fake.fail_snapshots.lock().unwrap().insert(".new-copy2".into());
+    assert!(env.deploy_restored("copy2", &["data"], both, &key).await.is_err());
+    env.fake.fail_snapshots.lock().unwrap().clear();
+    env.vols()
+        .remove(&Volumes::staging_for(&env.vols().snapshot_path("corpus", "copy2")))
+        .unwrap();
+    let e = env
+        .deploy_yaml("copy2", &compose("copy2.localhost", &["data"], both), None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("restored from the backup is missing"), "{e}");
+}
+
+#[tokio::test]
+async fn deleting_a_volume_sets_its_backup_snapshots_aside() {
+    use kn_proto::backup::Kind;
+    let mut env = Env::new().await;
+    env.apps.volume_create("corpus").await.unwrap();
+    // A snapshot set kept as a send parent.
+    let set = env.vols().backups_dir(Kind::Volume, "corpus").join("20261106T030000Z");
+    std::fs::create_dir_all(&set).unwrap();
+    env.apps.volume_delete("corpus").await.unwrap();
+    assert!(!Volumes::exists(&env.vols().backups_dir(Kind::Volume, "corpus")).unwrap());
+    let parent = env.vols().root().join("backups/volumes");
+    let gone: Vec<_> = std::fs::read_dir(&parent)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(gone.len(), 1);
+    assert!(gone[0].to_string_lossy().starts_with(".gone-corpus-"), "{gone:?}");
+    // The next start destroys them.
+    env.restart().await;
+    assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
 }

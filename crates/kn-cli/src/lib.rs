@@ -25,6 +25,7 @@ use kn_proto::api::{
     ErrorBody, ForgetQuery, Forgot, LabelRequest, LogsQuery, NestInfo, NodeInfo, TokenInfo, TokenKind, VolumeInfo,
     VolumeQuery, WaitQuery, WhoAmI,
 };
+use kn_proto::backup::{BackupInfo, BackupQuery, BackupResult, ListQuery};
 
 /// The standalone node API's default address.
 pub const DEFAULT_NODE_API: &str = "http://127.0.0.1:7380";
@@ -102,6 +103,13 @@ pub enum Command {
         /// Save the deploy even if its node is offline; it's applied when the node is back. Doesn't wait.
         #[arg(long)]
         queue: bool,
+        /// On the app's first deploy, restore its volumes from this backup (a key from `backup list`), such as
+        /// after its node was lost; with --node, on another node.
+        #[arg(long, value_name = "KEY", conflicts_with = "from")]
+        restore: Option<String>,
+        /// The backup target --restore's key is in [default: the first target that has it].
+        #[arg(long, value_name = "TARGET", requires = "restore")]
+        target: Option<String>,
         /// How long to wait for the node, such as 90s or 15m.
         #[arg(long, default_value = "15m")]
         timeout: String,
@@ -158,6 +166,9 @@ pub enum Command {
     /// Nests: the apps and shared volumes that live together on one node.
     #[command(subcommand)]
     Nest(NestCommand),
+    /// Backups of apps, shared volumes and the server, to the server's backup targets.
+    #[command(subcommand)]
+    Backup(BackupCommand),
     /// Tokens for the CLI, CI and joining nodes (admin only).
     #[command(subcommand)]
     Token(TokenCommand),
@@ -181,6 +192,12 @@ pub enum VolumeCommand {
         /// Save it even if its node is offline. Doesn't wait.
         #[arg(long)]
         queue: bool,
+        /// Restore its data from this backup (a key from `backup list`).
+        #[arg(long, value_name = "KEY")]
+        restore: Option<String>,
+        /// The backup target --restore's key is in [default: the first target that has it].
+        #[arg(long, value_name = "TARGET", requires = "restore")]
+        target: Option<String>,
     },
     /// List the shared volumes.
     List {
@@ -217,6 +234,63 @@ pub enum VolumeCommand {
     },
     /// Delete APP's snapshot of a shared volume. Refused while APP is deployed and mounts it.
     DeleteSnapshot { name: String, app: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum BackupCommand {
+    /// Back up an app now: its volumes (and its snapshots of shared volumes), snapshotted together, to every target
+    /// or one. Its containers are paused only for the instant the snapshots take.
+    App {
+        name: String,
+        /// Only this target.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// A full backup, even where an incremental one could be made.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Back up a shared volume now.
+    Volume {
+        name: String,
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        #[arg(long)]
+        full: bool,
+    },
+    /// Back up the server's own state now (its database and bundles), always as tar. Admin only.
+    Server {
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
+    /// List the backups in the targets: all of them, or of one kind, or of one app or volume.
+    List {
+        /// `app`, `volume` or `server`.
+        kind: Option<BackupKindArg>,
+        /// An app's or volume's name.
+        name: Option<String>,
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BackupKindArg {
+    App,
+    Volume,
+    Server,
+}
+
+impl From<BackupKindArg> for kn_proto::backup::Kind {
+    fn from(k: BackupKindArg) -> Self {
+        match k {
+            BackupKindArg::App => kn_proto::backup::Kind::App,
+            BackupKindArg::Volume => kn_proto::backup::Kind::Volume,
+            BackupKindArg::Server => kn_proto::backup::Kind::Server,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -583,6 +657,17 @@ impl Client {
         .await
     }
 
+    /// Backs up an app, a volume or the server (`what`: `apps/NAME`, `volumes/NAME` or `server`); waits as long as
+    /// that takes.
+    pub async fn backup(&self, what: &str, q: &BackupQuery) -> anyhow::Result<BackupResult> {
+        self.json(self.req(reqwest::Method::POST, &format!("/backups/{what}")).query(q))
+            .await
+    }
+
+    pub async fn backups(&self, q: &ListQuery) -> anyhow::Result<Vec<BackupInfo>> {
+        self.json(self.get("/backups").query(q)).await
+    }
+
     pub async fn whoami(&self) -> anyhow::Result<WhoAmI> {
         self.json(self.get("/whoami")).await
     }
@@ -716,6 +801,8 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
             from,
             node,
             queue,
+            restore,
+            target,
             timeout,
             node_reads_path,
         } => {
@@ -725,6 +812,8 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                 from,
                 node,
                 queue,
+                restore,
+                target,
             };
             if !client.is_server() {
                 let info = if node_reads_path {
@@ -881,6 +970,7 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
         Command::Volume(cmd) => volume(&client, cmd).await?,
         Command::Nest(cmd) => nest(&client, cmd).await?,
         Command::Token(cmd) => token(&client, cmd).await?,
+        Command::Backup(cmd) => backup(&client, cmd).await?,
         Command::Cluster(_) => unreachable!(),
     }
     Ok(())
@@ -911,6 +1001,87 @@ fn print_deployed(info: &AppInfo, notes: Option<&Vec<String>>) {
     }
 }
 
+fn size(n: Option<u64>) -> String {
+    let Some(n) = n else { return String::new() };
+    let units = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < units.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", units[u])
+    }
+}
+
+async fn backup(client: &Client, cmd: BackupCommand) -> anyhow::Result<()> {
+    let (what, q) = match cmd {
+        BackupCommand::List {
+            kind,
+            name,
+            target,
+            json,
+        } => {
+            let q = ListQuery {
+                target,
+                kind: kind.map(Into::into),
+                name,
+            };
+            let list = client.backups(&q).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&list)?);
+            } else {
+                print_table(
+                    &["TARGET", "KIND", "NAME", "TAKEN", "TYPE", "SIZE", "KEY"],
+                    list.iter()
+                        .map(|b| {
+                            vec![
+                                b.target.clone(),
+                                b.kind.to_string(),
+                                b.name.clone(),
+                                b.taken_at.clone(),
+                                b.describe().to_string(),
+                                size(b.size),
+                                b.key.clone(),
+                            ]
+                        })
+                        .collect(),
+                );
+            }
+            return Ok(());
+        }
+        BackupCommand::App { name, target, full } => (format!("apps/{name}"), BackupQuery { target, full }),
+        BackupCommand::Volume { name, target, full } => (format!("volumes/{name}"), BackupQuery { target, full }),
+        BackupCommand::Server { target } => {
+            server_only(client, "backing up the server")?;
+            ("server".to_string(), BackupQuery { target, full: false })
+        }
+    };
+    let r = client.backup(&what, &q).await?;
+    for m in &r.made {
+        println!(
+            "backed up to {}: {} ({}, {})",
+            m.target,
+            m.key,
+            m.describe(),
+            size(m.size)
+        );
+    }
+    for n in &r.notes {
+        println!("  {n}");
+    }
+    for f in &r.failed {
+        eprintln!("backing up to {} failed: {}", f.target, f.error);
+    }
+    if !r.failed.is_empty() {
+        bail!("{} of {} backups failed", r.failed.len(), r.failed.len() + r.made.len());
+    }
+    Ok(())
+}
+
 /// Follows a server's volume change, unless it was queued for an offline node.
 async fn follow_volume(client: &Client, resp: reqwest::Response, what: &str) -> anyhow::Result<()> {
     let acc: Accepted = resp.json().await?;
@@ -929,11 +1100,21 @@ async fn volume(client: &Client, cmd: VolumeCommand) -> anyhow::Result<()> {
             nest,
             node,
             queue,
+            restore,
+            target,
         } => {
             if !client.is_server() && (nest.is_some() || node.is_some()) {
                 bail!("--nest and --node need a cluster; a standalone node is its own");
             }
-            let resp = client.volume_create(&name, &VolumeQuery { node, nest, queue }).await?;
+            let restoring = restore.is_some();
+            let q = VolumeQuery {
+                node,
+                nest,
+                queue,
+                restore,
+                target,
+            };
+            let resp = client.volume_create(&name, &q).await?;
             if client.is_server() {
                 let acc: Accepted = resp.json().await?;
                 let nest = acc.nest.clone().unwrap_or_default();
@@ -944,11 +1125,18 @@ async fn volume(client: &Client, cmd: VolumeCommand) -> anyhow::Result<()> {
                     );
                     return Ok(());
                 }
-                wait_for(client, "volumes", &acc, Duration::from_secs(3600)).await?;
+                let st = wait_for(client, "volumes", &acc, Duration::from_secs(24 * 3600)).await?;
                 println!("created shared volume {name} on node {}, in nest {nest}", acc.node);
+                for n in &st.notes {
+                    println!("  {n}");
+                }
                 return Ok(());
             }
-            println!("created shared volume {name}");
+            if restoring {
+                println!("created shared volume {name}, restored from the backup");
+            } else {
+                println!("created shared volume {name}");
+            }
         }
         VolumeCommand::List { json } => {
             let volumes = client.volumes().await?;
@@ -1479,6 +1667,9 @@ fn print_info(i: &AppInfo) {
     }
     if let Some(from) = &i.from {
         println!("from:        {from}");
+    }
+    if let Some(r) = &i.restored_from {
+        println!("restored:    from {r}");
     }
     println!("created:     {}", i.created_at);
     println!("updated:     {}", i.updated_at);

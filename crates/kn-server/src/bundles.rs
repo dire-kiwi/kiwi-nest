@@ -10,6 +10,10 @@
 //! nothing. A file is written once and never changed, and the database keeps a row for each; a bundle that no app
 //! or volume refers to any more (an app's previous bundle once it's redeployed, a deleted app's) is removed.
 //! Bundles that two apps share are kept once.
+//!
+//! While the server copies its state for a backup, it holds bundle deletion off ([`Bundles::hold`]): files that
+//! would be removed meanwhile are left, and swept afterwards, so every bundle the copied database refers to is
+//! still there to be linked into the backup.
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +31,17 @@ pub const DEFAULT_SERVICE_MEMORY: u64 = 256 * 1024 * 1024;
 pub struct Bundles {
     dir: PathBuf,
     tmp: PathBuf,
+    /// How many backups are holding deletion off.
+    holds: std::sync::Mutex<usize>,
+}
+
+/// Holds bundle deletion off until dropped.
+pub struct Hold<'a>(&'a Bundles);
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        *self.0.holds.lock().expect("holds") -= 1;
+    }
 }
 
 /// Whether `d` is a digest kiwi-nest makes: `sha256:` and 64 lowercase hex digits.
@@ -44,7 +59,18 @@ impl Bundles {
             _ => {}
         }
         std::fs::create_dir_all(&tmp)?;
-        Ok(Bundles { dir, tmp })
+        Ok(Bundles {
+            dir,
+            tmp,
+            holds: std::sync::Mutex::new(0),
+        })
+    }
+
+    /// Holds deletion off, until the guard is dropped: [`Bundles::remove`] leaves files in place meanwhile, for
+    /// [`crate::store::apps::sweep`] to remove later.
+    pub fn hold(&self) -> Hold<'_> {
+        *self.holds.lock().expect("holds") += 1;
+        Hold(self)
     }
 
     /// Where the bundle with this digest is kept.
@@ -73,6 +99,12 @@ impl Bundles {
     }
 
     pub fn remove(&self, digest: &str) {
+        // Checked and acted on under the lock, so a hold taken meanwhile waits for the removal to finish.
+        let holds = self.holds.lock().expect("holds");
+        if *holds > 0 {
+            tracing::debug!(digest, "kept a bundle while the server's state is copied for a backup");
+            return;
+        }
         if let Some(p) = self.path(digest) {
             match std::fs::remove_file(&p) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -136,6 +168,8 @@ pub struct CheckedApp {
     pub host_paths: Vec<String>,
     /// What its services may use: each `mem_limit`, or [`DEFAULT_SERVICE_MEMORY`].
     pub memory_bytes: u64,
+    /// Whether scheduled backups include it.
+    pub backups: bool,
     /// Its basic-auth users, checked by the ingress.
     pub auth: Vec<crate::ingress::BasicAuth>,
 }
@@ -193,6 +227,7 @@ pub fn check_app(zip: &Path, scratch: &Path, limits: &Limits) -> Result<CheckedA
             .collect(),
         host_paths,
         memory_bytes,
+        backups: m.backups,
         auth: m
             .auth
             .iter()

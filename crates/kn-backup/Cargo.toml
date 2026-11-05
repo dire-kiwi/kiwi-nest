@@ -1,0 +1,33 @@
+[package]
+name = "kn-backup"
+description = "kiwi-nest backups: btrfs send and tar streams through zstd to S3, SSH or a directory, chains, retention and restores"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+humantime.workspace = true
+kn-btrfs.workspace = true
+kn-proto.workspace = true
+libc.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rusty-s3.workspace = true
+serde_yaml_ng.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tempfile.workspace = true

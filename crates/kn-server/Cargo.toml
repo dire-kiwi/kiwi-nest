@@ -13,6 +13,7 @@ futures-util.workspace = true
 getrandom.workspace = true
 hex.workspace = true
 humantime.workspace = true
+kn-backup.workspace = true
 kn-bundle.workspace = true
 kn-proto.workspace = true
 reqwest.workspace = true

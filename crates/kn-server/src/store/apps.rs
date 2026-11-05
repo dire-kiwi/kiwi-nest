@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use kn_proto::agent::{AppChange, AppWant, Outcome, Report, VolumeChange, VolumeWant};
 use kn_proto::api::{Accepted, ChangeStatus};
+use kn_proto::backup::Restore;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::nests;
@@ -63,6 +64,10 @@ pub struct AppRow {
     /// How it came to be in its nest, such as `through --from blog`.
     pub nest_via: String,
     pub idle_timeout_secs: u64,
+    /// Whether scheduled backups include it (`x-kiwi-nest.backups`).
+    pub backups: bool,
+    /// The backup it was deployed `--restore` from.
+    pub restore: Option<Restore>,
 }
 
 /// A shared volume as the server records it.
@@ -77,10 +82,12 @@ pub struct VolumeRow {
     pub created_at: u64,
     pub updated_at: u64,
     pub nest: Option<String>,
+    /// The backup it was created `--restore` from.
+    pub restore: Option<Restore>,
 }
 
 const APP_COLUMNS: &str = "name, state, node_id, domain, generation, seq, bundle_digest, from_app, shared, \
-                           memory_bytes, keep_data, created_at, updated_at, nest, nest_via, idle_timeout_secs";
+                           memory_bytes, keep_data, created_at, updated_at, nest, nest_via, idle_timeout_secs, backups, restore";
 
 fn app_row(r: &rusqlite::Row) -> rusqlite::Result<AppRow> {
     let shared: String = r.get(8)?;
@@ -101,10 +108,15 @@ fn app_row(r: &rusqlite::Row) -> rusqlite::Result<AppRow> {
         nest: r.get(13)?,
         nest_via: r.get(14)?,
         idle_timeout_secs: r.get(15)?,
+        backups: r.get(16)?,
+        restore: r
+            .get::<_, Option<String>>(17)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
-const VOLUME_COLUMNS: &str = "name, state, node_id, generation, seq, data_digest, created_at, updated_at, nest";
+const VOLUME_COLUMNS: &str =
+    "name, state, node_id, generation, seq, data_digest, created_at, updated_at, nest, restore";
 
 fn volume_row(r: &rusqlite::Row) -> rusqlite::Result<VolumeRow> {
     Ok(VolumeRow {
@@ -117,6 +129,9 @@ fn volume_row(r: &rusqlite::Row) -> rusqlite::Result<VolumeRow> {
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
         nest: r.get(8)?,
+        restore: r
+            .get::<_, Option<String>>(9)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
@@ -343,6 +358,8 @@ pub struct Deploy {
     pub from: Option<String>,
     pub node: Option<String>,
     pub queue: bool,
+    /// The backup to restore its volumes from, on its first deploy.
+    pub restore: Option<Restore>,
 }
 
 /// Saves a deploy: reserves the name and domain, works out the nest and its node, stores the bundle and bumps the
@@ -426,6 +443,9 @@ pub fn deploy(
     let placed = place_nest(&tx, online, settings, &nest, d.node.as_deref(), &needs, Some(&d.name))?;
     let node_id = placed.node_id;
     let node = nodes::get(&tx, node_id)?;
+    if d.restore.is_some() {
+        nodes::require_backups(&node)?;
+    }
     let up = check_online(&node, online, d.queue, "deploy")?;
     let idles = d.bundle.idle_timeout_secs > 0;
     let warnings: Vec<String> = memory_warning(
@@ -475,11 +495,12 @@ pub fn deploy(
     tx.execute(
         "INSERT INTO apps (name, state, node_id, domain, generation, seq, bundle_digest, from_app, shared,
                            memory_bytes, keep_data, created_at, updated_at, nest, nest_via, idle_timeout_secs,
-                           auth)
-         VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15)
+                           auth, backups, restore)
+         VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT (name) DO UPDATE SET state = 'active', node_id = ?2, domain = ?3, generation = ?4, seq = ?5,
              bundle_digest = ?6, from_app = ?7, shared = ?8, memory_bytes = ?9, keep_data = 0, created_at = ?10,
-             updated_at = ?11, nest = ?12, nest_via = ?13, idle_timeout_secs = ?14, auth = ?15",
+             updated_at = ?11, nest = ?12, nest_via = ?13, idle_timeout_secs = ?14, auth = ?15, backups = ?16,
+             restore = ?17",
         params![
             d.name,
             node_id,
@@ -496,6 +517,8 @@ pub fn deploy(
             via,
             d.bundle.idle_timeout_secs,
             serde_json::to_string(&d.bundle.auth)?,
+            d.bundle.backups,
+            d.restore.as_ref().map(serde_json::to_string).transpose()?,
         ],
     )?;
     tx.commit()?;
@@ -574,6 +597,7 @@ pub fn create_volume(
     node: Option<&str>,
     nest: Option<&str>,
     queue: bool,
+    restore: Option<&Restore>,
     now: u64,
 ) -> Result<Saved> {
     let tx = c.transaction()?;
@@ -597,6 +621,9 @@ pub fn create_volume(
     };
     let placed = place_nest(&tx, online, settings, &nest, node, &Needs::default(), None)?;
     let n = nodes::get(&tx, placed.node_id)?;
+    if restore.is_some() {
+        nodes::require_backups(&n)?;
+    }
     let up = check_online(&n, online, queue, "volume")?;
     if let Some(why) = &placed.new {
         nests::place(
@@ -610,11 +637,20 @@ pub fn create_volume(
     let seq = bump(&tx, n.id)?;
     let generation = previous.as_ref().map_or(1, |v| v.generation + 1);
     tx.execute(
-        "INSERT INTO volumes (name, state, node_id, generation, seq, data_digest, created_at, updated_at, nest)
-         VALUES (?1, 'active', ?2, ?3, ?4, NULL, ?5, ?5, ?6)
+        "INSERT INTO volumes (name, state, node_id, generation, seq, data_digest, created_at, updated_at, nest,
+                              restore)
+         VALUES (?1, 'active', ?2, ?3, ?4, NULL, ?5, ?5, ?6, ?7)
          ON CONFLICT (name) DO UPDATE SET state = 'active', node_id = ?2, generation = ?3, seq = ?4,
-             data_digest = NULL, created_at = ?5, updated_at = ?5, nest = ?6",
-        params![name, n.id, generation, seq, now, nest],
+             data_digest = NULL, created_at = ?5, updated_at = ?5, nest = ?6, restore = ?7",
+        params![
+            name,
+            n.id,
+            generation,
+            seq,
+            now,
+            nest,
+            restore.map(serde_json::to_string).transpose()?
+        ],
     )?;
     tx.commit()?;
     Ok(Saved {
@@ -754,6 +790,7 @@ pub fn desired_since(c: &Connection, node_id: u64, since: u64) -> Result<(u64, V
                     bundle_digest: a.bundle_digest.clone().unwrap_or_default(),
                     from: a.from_app.clone(),
                     shared: a.shared.clone(),
+                    restore: a.restore.clone(),
                 },
             };
             Ok(AppChange {
@@ -775,6 +812,7 @@ pub fn desired_since(c: &Connection, node_id: u64, since: u64) -> Result<(u64, V
                 State::Deleting => VolumeWant::Delete,
                 _ => VolumeWant::Present {
                     data_digest: v.data_digest.clone(),
+                    restore: v.restore.clone(),
                 },
             };
             Ok(VolumeChange {

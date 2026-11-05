@@ -44,4 +44,22 @@ jobs:
         run: |
           command -v mkfs.btrfs || { sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs; }
           scripts/test-btrfs.sh
+      - name: Start an S3-compatible server for the S3 tests
+        run: scripts/test-s3.sh
       - run: make integration
+
+  # btrfs send needs root: the tests of the `send` format run as root, through sudo.
+  root:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Mount a btrfs filesystem for the tests
+        run: |
+          command -v mkfs.btrfs || { sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs; }
+          scripts/test-btrfs.sh
+      - name: Start an S3-compatible server for the S3 tests
+        run: scripts/test-s3.sh
+      - run: make test-root
