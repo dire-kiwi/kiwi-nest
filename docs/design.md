@@ -123,12 +123,47 @@ volumes:
 - **A restricted Compose subset is accepted.** kiwi-nest refuses builds, privileged mode and host namespaces,
   published ports (it assigns its own on loopback), external or custom-named networks and volumes, and absolute host
   paths unless the node allows them. `restart: always` becomes `unless-stopped`, so Docker doesn't wake an app that
-  kiwi-nest stopped for being idle.
+  kiwi-nest stopped for being idle. In detail:
+  - Service settings are checked against a list of known keys, and anything else is refused, so a new Compose
+    feature stays refused until someone looks at it. Also refused: `container_name`, added capabilities, devices,
+    `security_opt`, `sysctls`, `deploy` (use `mem_limit` and `cpus`), `extends`, `profiles`, `configs` and
+    `secrets`, `include`, YAML tags, and log drivers other than `json-file` and `local`. Anchors and merge keys
+    work.
+  - A mount's source is a declared named volume, a path in the bundle (`./site`, always read-only), a `tmpfs`, or a
+    host path under one of the node's `--allow-host-path` directories. Anonymous volumes are refused, because every
+    byte of app data must be a volume kiwi-nest owns. A missing source is an error rather than created.
+  - **No variable interpolation.** Compose runs with an empty environment (apart from what Docker itself needs) and
+    no `.env` file, and a `$` in the bundle must be written `$$`. So the node's environment never leaks into an app,
+    and a bundle means the same thing on every node. Configuration goes in the bundle, for example in an
+    `env_file`.
+  - `x-kiwi-nest` needs `domain`, `service` and `port`. `idle_timeout` defaults to `0` (always on), so forgetting it
+    never stops a production app; previews set it. Unknown keys are refused, which catches typos.
+  - Every problem in a bundle is reported at once, each with where it is (`services.web.ports: …`).
 - **Generated files.** The node writes its own Compose file from the bundle. In it, every named volume becomes a bind
   mount of that app's subvolume, and only the routed service gets a port, bound to `127.0.0.1`. The generated file is
   kept outside the bundle's directory, so a writable mount can't change it.
 - **Redeploying updates in place.** `deploy` on an existing app replaces its bundle: the node stops the old project
   and starts the new one (brief downtime). The app's volumes stay. `--create-only` refuses if the app exists.
+- **Reading a bundle safely.** A ZIP is checked entry by entry before anything is written, and a directory is read
+  by the same rules. Only plain files and directories are accepted: no symlinks, devices, FIFOs or sockets, no
+  absolute paths or `..`, no duplicate names, nothing that's both a file and a directory, and no encrypted entries.
+  There are limits on the ZIP's size, the number of entries, each file's size and the total expanded size, and
+  sizes are counted as the data is decompressed, so a ZIP that lies about them is caught. Files keep only their
+  executable bit. A bundle's digest covers its paths, contents and executable bits, so the same files give the same
+  digest from a ZIP or a directory.
+- **On the node,** each app is one Compose project named `PREFIX` + app name, where every node has its own prefix
+  (`kn-` by default), so several nodes can share one Docker Engine in tests. The routed service is published on a
+  loopback port from the node's range, kept across redeploys. The node's files:
+
+  ```text
+  STATE/state.json                 apps, generations, ports and status, written atomically
+  STATE/staging/                   uploads and bundles being checked
+  STATE/apps/APP/bundle-GEN/       the extracted bundle of APP's generation GEN
+  STATE/apps/APP/compose-GEN.yaml  the Compose file generated from it, outside the bundle
+  ```
+
+  Each app's operations go through one task of its own, so they never overlap. A deploy cut off by a node restart is
+  recorded as failed.
 
 ## Volumes and snapshots
 
@@ -330,6 +365,7 @@ for macOS.
 | D9 | The node agent runs as root under systemd; the server runs as its own unprivileged user. | Controlling Docker is already root-equivalent, and root keeps btrfs and file ownership simple. |
 | D10 | No failover; recover by restoring from backup with `--node`. | Without replicated data, automatic rescheduling would bring an app back empty, which is worse than down. |
 | D11 | Each backup target chooses `send` (default) or `tar`; the server's own state always uses tar. | Only `send` couldn't be read without btrfs; only tar is slower, larger and loses sharing. Incremental tar isn't worth its complexity for occasional off-site copies. |
+| D12 | Bundles can't use Compose variable interpolation; Compose runs with an empty environment and no `.env`. | The node's environment (tokens, paths) never reaches an app, and a bundle behaves the same on every node. Interpolating from the node's environment leaks it; interpolating from a `.env` in the bundle adds a second way to say what `env_file` already says. |
 
 ## Build plan
 

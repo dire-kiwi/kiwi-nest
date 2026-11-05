@@ -1,0 +1,25 @@
+[package]
+name = "kiwi-nest"
+description = "Hosting for single-instance apps on a small cluster"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kiwi-nest"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+kn-bundle.workspace = true
+kn-cli.workspace = true
+kn-node.workspace = true
+kn-proto.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
