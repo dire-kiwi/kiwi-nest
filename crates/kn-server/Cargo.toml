@@ -1,0 +1,31 @@
+[package]
+name = "kn-server"
+description = "The kiwi-nest server: the inventory, tokens, the bundle store and the APIs for the CLI and nodes"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hex.workspace = true
+humantime.workspace = true
+kn-bundle.workspace = true
+kn-proto.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+rustls.workspace = true

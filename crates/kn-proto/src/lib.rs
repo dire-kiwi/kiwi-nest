@@ -1,10 +1,12 @@
 //! Types shared by the kiwi-nest CLI, server and nodes.
 //!
-//! - [`api`]: requests and responses of the HTTP APIs.
+//! - [`api`]: requests and responses of the HTTP APIs for the CLI.
+//! - [`agent`]: the link between nodes and the server: polls, reports, desired state and commands.
 //! - [`state`]: what a node has applied, as it reports it.
 //!
 //! The API is versioned by its path prefix ([`API_PREFIX`]), so a newer side can keep serving an older one.
 
+pub mod agent;
 pub mod api;
 pub mod state;
 
