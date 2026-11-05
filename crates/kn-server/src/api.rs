@@ -988,6 +988,7 @@ async fn backup_app(
         .node
         .as_ref()
         .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
+    nodes::require_backups(node)?;
     let action = Action::Backup {
         what: BackupKind::App,
         name,
@@ -1019,6 +1020,7 @@ async fn backup_volume(
         })
         .await?
         .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
+    nodes::require_backups(&node)?;
     let action = Action::Backup {
         what: BackupKind::Volume,
         name,

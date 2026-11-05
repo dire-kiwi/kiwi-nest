@@ -844,11 +844,17 @@ impl Inner {
                 }
             }
         }
-        // Those that change something wait for a forgotten node to finish forgetting, and then don't run.
+        // Those that change something wait for a forgotten node to finish forgetting, and then don't run. A backup
+        // only reads its snapshots, so it doesn't hold forgetting up (an upload can take hours), but it doesn't
+        // start once the node is forgotten either.
         let changes = matches!(
             c.action,
-            Action::Suspend { .. } | Action::Resume { .. } | Action::DeleteSnapshot { .. } | Action::Backup { .. }
+            Action::Suspend { .. } | Action::Resume { .. } | Action::DeleteSnapshot { .. }
         );
+        if matches!(c.action, Action::Backup { .. }) && self.forgotten.load(std::sync::atomic::Ordering::SeqCst) {
+            self.running.lock().expect("running").remove(&c.id);
+            return;
+        }
         let _applying = if changes {
             Some(self.applying.read().await)
         } else {
@@ -970,6 +976,7 @@ async fn facts(apps: &Apps, cfg: &AgentConfig) -> NodeFacts {
                 .collect(),
             project_prefix: node.project_prefix.clone(),
             gateway,
+            protocol: kn_proto::agent::PROTOCOL,
         }
     })
     .await

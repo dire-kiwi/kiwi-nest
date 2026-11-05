@@ -254,6 +254,7 @@ fn facts(memory: u64) -> NodeFacts {
         memory_available_bytes: memory,
         version: kn_proto::VERSION.into(),
         commit: "test".into(),
+        protocol: kn_proto::agent::PROTOCOL,
         ..Default::default()
     }
 }
@@ -1667,6 +1668,36 @@ async fn restores_are_checked_before_anything_is_saved() {
         assert_eq!(r.status(), want, "{q}: {}", r.text().await.unwrap());
     }
     assert!(!env.apps().await.iter().any(|a| a.name == "copy"));
+    // A node from before backups would deploy the app empty, ignoring the restore: refused, and nothing saved.
+    let mut old = env
+        .join_with(
+            "old",
+            NodeFacts {
+                protocol: 0,
+                ..facts(8 << 30)
+            },
+        )
+        .await;
+    env.poll(&mut old).await;
+    let r = env
+        .deploy(&env.admin, "copy", "copy.test", &format!("restore={key}&node=old"))
+        .await;
+    let (status, msg) = error(r).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(msg.contains("from before backups"), "{msg}");
+    assert!(!env.apps().await.iter().any(|a| a.name == "copy"));
+    assert_eq!(
+        env.deploy(&env.admin, "legacy", "legacy.test", "node=old")
+            .await
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    let r = env
+        .req(reqwest::Method::POST, "/backups/apps/legacy", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
     // A deploy token may restore another app's backup only where it may use that app as --from.
     let t1 = env.token(json!({"kind": "deploy", "patterns": ["blog-pr*"]})).await;
     let r = env.deploy(&t1, "blog-pr1", "pr1.test", &format!("restore={key}")).await;

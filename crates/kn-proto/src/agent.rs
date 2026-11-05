@@ -42,8 +42,13 @@ use crate::api::{ErrorBody, LogsQuery, VolumeInfo};
 use crate::backup::{Kind, Restore};
 use crate::state::AppStatus;
 
-/// The version of the agent link that this build speaks.
-pub const PROTOCOL: u32 = 1;
+/// The version of the agent link that this build speaks. Version 2 added backups: [`Action::Backup`], restores in
+/// [`AppWant::Deploy`] and [`VolumeWant::Present`], `GET /agent/backup-targets`, and [`NodeFacts::protocol`].
+pub const PROTOCOL: u32 = 2;
+
+/// The first version with backups: a server sends a node older than this no backup command and no restore (an
+/// older node would ignore the restore, and deploy the app empty).
+pub const BACKUPS_PROTOCOL: u32 = 2;
 
 /// The oldest version a server built from this code still serves.
 pub const OLDEST_PROTOCOL: u32 = 1;
@@ -93,6 +98,9 @@ pub struct NodeFacts {
     /// The address its gateway listens on.
     #[serde(default)]
     pub gateway: String,
+    /// The version of the agent link it speaks ([`PROTOCOL`]); 0 from a node of version 1, which didn't say.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 /// A filesystem's size and free space.

@@ -443,6 +443,9 @@ pub fn deploy(
     let placed = place_nest(&tx, online, settings, &nest, d.node.as_deref(), &needs, Some(&d.name))?;
     let node_id = placed.node_id;
     let node = nodes::get(&tx, node_id)?;
+    if d.restore.is_some() {
+        nodes::require_backups(&node)?;
+    }
     let up = check_online(&node, online, d.queue, "deploy")?;
     let idles = d.bundle.idle_timeout_secs > 0;
     let warnings: Vec<String> = memory_warning(
@@ -616,6 +619,9 @@ pub fn create_volume(
     };
     let placed = place_nest(&tx, online, settings, &nest, node, &Needs::default(), None)?;
     let n = nodes::get(&tx, placed.node_id)?;
+    if restore.is_some() {
+        nodes::require_backups(&n)?;
+    }
     let up = check_online(&n, online, queue, "volume")?;
     if let Some(why) = &placed.new {
         nests::place(

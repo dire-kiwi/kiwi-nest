@@ -517,6 +517,9 @@ VOLUMES/                         one btrfs filesystem per node
   that fails is tried again after a while (the smaller of `every` and 15 minutes).
 - **Commands.** `kiwi-nest backup app|volume NAME [--target T] [--full]` and `backup server` back up now, and wait;
   `backup list [app|volume|server] [NAME]` lists what the targets hold (deploy tokens see only their apps').
+- **Versions.** Backups came with version 2 of the agent link, and nodes report the version they speak in their
+  facts. A node from before (one version behind) gets no backup command, which it couldn't read, and no restore,
+  which it would ignore, deploying the app empty: both are refused with a reason, and the schedule skips it.
 - **The server's own state** (its SQLite database and bundles) is backed up to the same targets, always as tar,
   since the server's host may not have btrfs, and so there's no snapshot to start from. A tar of the live database
   file and its WAL could capture a torn or partial database. Instead:

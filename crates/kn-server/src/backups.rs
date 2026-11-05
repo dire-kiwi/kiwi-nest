@@ -359,7 +359,11 @@ async fn tick(s: &Server) -> Result<()> {
         if is_due(Kind::Server, "") {
             server_due.push(t.name().to_string());
         }
-        let online = |id: Option<u64>| id.and_then(|i| nodes.get(&i)).filter(|n| s.hub.is_online(n.id));
+        // Online, and new enough for backups.
+        let online = |id: Option<u64>| {
+            id.and_then(|i| nodes.get(&i))
+                .filter(|n| s.hub.is_online(n.id) && nodes::has_backups(n))
+        };
         for a in rows.iter().filter(|a| a.state == apps::State::Active && a.backups) {
             let Some(n) = online(a.node_id) else { continue };
             // Only once the node has it.
