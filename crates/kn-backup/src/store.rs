@@ -267,6 +267,8 @@ pub(crate) mod tests {
         store.delete(key).await.unwrap();
         store.delete(key).await.unwrap();
         assert_eq!(store.list("apps/").await.unwrap(), []);
+        store.delete(other).await.unwrap();
+        assert_eq!(store.list("").await.unwrap(), []);
     }
 
     #[tokio::test]

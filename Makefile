@@ -3,7 +3,10 @@
 TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
 
-.PHONY: all build check fmt clippy test integration test-btrfs release clean
+# The host's target, as Cargo spells it in CARGO_TARGET_<TRIPLE>_RUNNER.
+HOST := $(shell rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
+
+.PHONY: all build check fmt clippy test integration test-root test-btrfs test-s3 release clean
 
 all: build
 
@@ -25,6 +28,16 @@ test:
 ## integration: also run the tests that need Docker (and btrfs: set KIWI_NEST_TEST_BTRFS_DIR, see test-btrfs)
 integration:
 	KIWI_NEST_INTEGRATION=1 cargo test --workspace
+
+## test-root: the tests that need root (btrfs send), built as you and run as root through sudo; with Docker, the
+## end-to-end backup tests too (set KIWI_NEST_TEST_BTRFS_DIR, and KIWI_NEST_TEST_S3 for S3)
+test-root:
+	CARGO_TARGET_$(HOST)_RUNNER="sudo -E" cargo test -p kn-btrfs -p kn-backup -p kn-node
+	CARGO_TARGET_$(HOST)_RUNNER="sudo -E" KIWI_NEST_INTEGRATION=1 cargo test -p kiwi-nest --test backup
+
+## test-s3: start an S3-compatible server in Docker for the S3 tests; prints the KIWI_NEST_TEST_S3 to set
+test-s3:
+	scripts/test-s3.sh
 
 ## test-btrfs: mount a loop-mounted btrfs file for the tests (needs sudo); prints the KIWI_NEST_TEST_BTRFS_DIR to set
 test-btrfs:

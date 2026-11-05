@@ -22,16 +22,30 @@ fn is_root() -> bool {
 
 /// A targets file with one target, `local`, in `store`.
 fn targets(dir: &Path, store: &Path, format: &str) -> PathBuf {
+    write_targets(dir, &format!("dir: {{ path: {} }}", store.display()), format)
+}
+
+fn write_targets(dir: &Path, storage: &str, format: &str) -> PathBuf {
     let path = dir.join("targets.yaml");
     std::fs::write(
         &path,
-        format!(
-            "targets:\n  - name: local\n    dir: {{ path: {} }}\n    format: {format}\n    keep: {{ last: 5 }}\n",
-            store.display()
-        ),
+        format!("targets:\n  - name: local\n    {storage}\n    format: {format}\n    keep: {{ last: 5 }}\n"),
     )
     .unwrap();
     path
+}
+
+/// `KIWI_NEST_TEST_S3` (`ENDPOINT BUCKET ACCESS SECRET`) as a target's storage, under a prefix of its own.
+fn s3_storage() -> Option<String> {
+    let v = std::env::var("KIWI_NEST_TEST_S3").ok()?;
+    let p: Vec<&str> = v.split_whitespace().collect();
+    let [endpoint, bucket, access, secret] = p[..] else {
+        panic!("KIWI_NEST_TEST_S3 should be 'ENDPOINT BUCKET ACCESS SECRET'")
+    };
+    Some(format!(
+        "s3: {{ endpoint: '{endpoint}', bucket: {bucket}, region: us-east-1, access_key: {access}, secret_key: {secret} }}\n    prefix: {}",
+        random_prefix().replace('-', "/")
+    ))
 }
 
 /// A busybox web server at `domain` with a volume, mounting shared volume `corpus` read-only.
@@ -118,10 +132,13 @@ fn lose(server: &Server, node: &mut ClusterNode) {
     server.ok(&["node", "forget", &node.name, "--yes"]);
 }
 
-fn recover_a_lost_nest(format: &str) {
+fn recover_a_lost_nest(format: &str, storage: Option<String>) {
     let work = tempfile::tempdir().unwrap();
     let store = work.path().join("store");
-    let t = targets(work.path(), &store, format);
+    let t = match &storage {
+        Some(s) => write_targets(work.path(), s, format),
+        None => targets(work.path(), &store, format),
+    };
     let server = Server::start_with(&["--backup-targets", t.to_str().unwrap()]);
     let prefix = random_prefix();
     let mut a = ClusterNode::join(&server, "a", &format!("{prefix}a-"));
@@ -190,7 +207,7 @@ fn recover_a_lost_nest(format: &str) {
         "two"
     );
 
-    if format == "tar" {
+    if format == "tar" && storage.is_none() {
         // Plain tar, on a filesystem that isn't btrfs, gives the same files, owners and modes included.
         let plain = tempfile::tempdir().unwrap();
         let file = store.join(&key);
@@ -211,7 +228,19 @@ fn a_lost_nodes_nest_comes_back_from_tar_backups() {
     if !docker_and_btrfs() {
         return;
     }
-    recover_a_lost_nest("tar");
+    recover_a_lost_nest("tar", None);
+}
+
+#[test]
+fn a_lost_nodes_nest_comes_back_from_an_s3_bucket() {
+    if !docker_and_btrfs() {
+        return;
+    }
+    let Some(s3) = s3_storage() else {
+        eprintln!("skipped: set KIWI_NEST_TEST_S3 to 'ENDPOINT BUCKET ACCESS SECRET' to test against S3");
+        return;
+    };
+    recover_a_lost_nest(if is_root() { "send" } else { "tar" }, Some(s3));
 }
 
 #[test]
@@ -223,7 +252,7 @@ fn a_lost_nodes_nest_comes_back_from_send_backups() {
         eprintln!("skipped: btrfs send needs root");
         return;
     }
-    recover_a_lost_nest("send");
+    recover_a_lost_nest("send", None);
 }
 
 #[test]

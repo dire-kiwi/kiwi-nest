@@ -334,6 +334,10 @@ impl ChannelWriter {
 
 impl Write for ChannelWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        // An upload that stopped stops its producer at once, however well its data compresses.
+        if self.tx.is_closed() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "the upload stopped"));
+        }
         self.buf.extend_from_slice(data);
         if self.buf.len() >= PIECE {
             self.send()?;
@@ -443,6 +447,35 @@ pub(crate) mod tests {
         // A corrupt download is an error, not short data.
         std::fs::write(d.path().join("home").join(k.to_string()), b"not zstd").unwrap();
         assert!(t.download(&k, |r| Ok(r.read(&mut [0; 10])?)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_upload_cut_off_part_way_leaves_nothing_listed() {
+        let d = tempfile::tempdir().unwrap();
+        let t = std::sync::Arc::new(dir_target(d.path(), "local", Format::Tar));
+        let k = Key::new(Kind::App, "blog", Stamp(1_800_000_000), None, Format::Tar);
+        // A slow producer, and the upload dropped part way, as when the node stops.
+        let (t2, k2) = (t.clone(), k.clone());
+        let upload = tokio::spawn(async move {
+            t2.upload(
+                &k2,
+                Box::new(|w| {
+                    for _ in 0..1000 {
+                        w.write_all(&[3u8; 1 << 20])?;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Ok(())
+                }),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        upload.abort();
+        assert!(upload.await.is_err());
+        assert!(t.list(None).await.unwrap().is_empty());
+        // The same backup made again is complete.
+        t.upload(&k, Box::new(|w| Ok(w.write_all(b"whole")?))).await.unwrap();
+        assert_eq!(t.list(None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
