@@ -42,6 +42,9 @@ use crate::error::{Error, Result};
 use crate::hub::{Hub, Outcome};
 use crate::store::Store;
 
+/// The largest JSON body accepted, such as a node's report.
+pub const MAX_JSON: usize = 8 * 1024 * 1024;
+
 /// How a server is set up.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -133,7 +136,8 @@ impl Server {
     pub fn router(&self) -> axum::Router {
         api::router()
             .merge(agent::router())
-            .layer(axum::extract::DefaultBodyLimit::disable())
+            // JSON bodies (reports, tokens, joins) are small; uploads are streamed under their own limits.
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_JSON))
             .with_state(self.clone())
     }
 

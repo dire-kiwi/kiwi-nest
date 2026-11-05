@@ -673,17 +673,25 @@ impl Apps {
     }
 
     /// Every app as the node records it, for the server, with what Docker reports for its containers (or
-    /// `unknown`, if Docker can't be asked).
+    /// `unknown`, if Docker can't be asked within a few seconds, so a stuck Docker never holds up a report).
     pub async fn reports(&self) -> Vec<kn_proto::agent::AppReport> {
         let records: Vec<AppRecord> = self.inner.state.lock().await.apps.values().cloned().collect();
-        let live: Option<HashMap<String, String>> = self
-            .inner
-            .runtime
-            .projects(&self.inner.cfg.project_prefix)
-            .await
-            .map_err(|e| tracing::warn!(error = %e, "couldn't list the apps' containers"))
-            .ok()
-            .map(|ps| ps.into_iter().map(|p| (p.name, p.status)).collect());
+        let projects = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.inner.runtime.projects(&self.inner.cfg.project_prefix),
+        )
+        .await;
+        let live: Option<HashMap<String, String>> = match projects {
+            Ok(Ok(ps)) => Some(ps.into_iter().map(|p| (p.name, p.status)).collect()),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "couldn't list the apps' containers");
+                None
+            }
+            Err(_) => {
+                tracing::warn!("listing the apps' containers timed out");
+                None
+            }
+        };
         records
             .into_iter()
             .map(|r| kn_proto::agent::AppReport {

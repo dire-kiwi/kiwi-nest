@@ -741,3 +741,18 @@ async fn only_admins_make_tokens_and_the_last_admin_token_stays() {
         assert!(!db.windows(needle.len()).any(|w| w == needle), "{f}");
     }
 }
+
+#[tokio::test]
+async fn json_bodies_are_limited_even_before_a_token_is_checked() {
+    let env = Env::new().await;
+    let huge = format!(r#"{{"token":"{}","name":"a","facts":{{}}}}"#, "x".repeat(MAX_JSON));
+    let r = env
+        .http
+        .post(format!("{}/agent/join", env.url))
+        .header("content-type", "application/json")
+        .body(huge)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
