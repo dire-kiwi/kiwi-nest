@@ -529,6 +529,56 @@ pub(crate) mod tests {
                 (cmd::SYMLINK, vec![p("esc2"), (attr::PATH_LINK, b"../outside".to_vec())]),
                 (cmd::RENAME, vec![p("esc2/whatever"), (attr::PATH_TO, b"y".to_vec())]),
             ],
+            // A FIFO (or, as root, a device node) written to, truncated or cloned from: never opened.
+            vec![
+                (cmd::MKFIFO, vec![p("fifo")]),
+                (
+                    cmd::WRITE,
+                    vec![
+                        p("fifo"),
+                        (attr::FILE_OFFSET, le(0).to_vec()),
+                        (attr::DATA, b"x".to_vec()),
+                    ],
+                ),
+            ],
+            vec![
+                (cmd::MKFIFO, vec![p("fifo")]),
+                (cmd::TRUNCATE, vec![p("fifo"), (attr::SIZE, le(0).to_vec())]),
+            ],
+            vec![
+                (cmd::MKFIFO, vec![p("fifo")]),
+                (cmd::MKFILE, vec![p("f")]),
+                (
+                    cmd::CLONE,
+                    vec![
+                        p("f"),
+                        (attr::FILE_OFFSET, le(0).to_vec()),
+                        (attr::CLONE_LEN, le(1).to_vec()),
+                        (attr::CLONE_UUID, uuid.to_vec()),
+                        (attr::CLONE_CTRANSID, le(1).to_vec()),
+                        (attr::CLONE_PATH, b"fifo".to_vec()),
+                        (attr::CLONE_OFFSET, le(0).to_vec()),
+                    ],
+                ),
+            ],
+            vec![
+                (
+                    cmd::MKNOD,
+                    vec![
+                        p("disk"),
+                        (attr::MODE, le(u64::from(libc::S_IFBLK | 0o600)).to_vec()),
+                        (attr::RDEV, le(0x800).to_vec()),
+                    ],
+                ),
+                (
+                    cmd::WRITE,
+                    vec![
+                        p("disk"),
+                        (attr::FILE_OFFSET, le(0).to_vec()),
+                        (attr::DATA, b"x".to_vec()),
+                    ],
+                ),
+            ],
         ]
         .into_iter()
         .enumerate()

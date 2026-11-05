@@ -479,9 +479,9 @@ VOLUMES/                         one btrfs filesystem per node
   `full_every` (and `--full` wasn't given). Otherwise it's a full backup. A volume new since the parent is sent
   whole within an incremental backup. After each backup, the node keeps only the sets some `send` target could
   continue from (each one's newest), so a set no target took, such as one whose upload failed, is destroyed and
-  never becomes a parent. Backups of one app or volume never overlap. Deleting an app sets its sets aside at once
-  (`VOLUMES/backups/apps/.gone-…`, destroyed by later backups and the next start), so a new app of the same name
-  starts its own chains; `--keep-data` keeps them. A forgotten node sets `VOLUMES/backups` aside with the rest.
+  never becomes a parent. Backups of one app or volume never overlap. Deleting an app or a shared volume sets its
+  sets aside at once (`VOLUMES/backups/apps/.gone-…`, destroyed by later backups and the next start), so a new one
+  of the same name starts its own chains; an app's `--keep-data` keeps them. A forgotten node sets `VOLUMES/backups` aside with the rest.
 - **A failed upload never leaves a backup that looks complete.** Uploads are fed through a channel that ends with
   an explicit end marker; a producer that fails (or panics, or a node that stops) never sends it. An S3 upload is a
   single `PUT` when it fits in one part (16 MiB, growing for large ones), and otherwise a multipart upload,
@@ -498,7 +498,12 @@ VOLUMES/                         one btrfs filesystem per node
     ignored. The restored volumes are made in the first deploy's staging directory and moved into place with the
     rest, so a failed restore leaves nothing. Volumes the bundle declares but the backup lacks start empty; what
     the backup holds that the bundle doesn't use is dropped, with a note. An app's snapshot of a shared volume
-    comes back as its snapshot again if the bundle mounts that volume in `snapshot` mode.
+    comes back as its snapshot again if the bundle mounts that volume in `snapshot` mode. It's staged beside its
+    place, and recorded as pending in the app's record before anything is moved into place, so a deploy that fails
+    (or a node that stops) after that moves it into place when tried again, and the sweep keeps it; a pending one
+    that's gone is refused, never replaced by a fresh snapshot of the shared volume's current data.
+  - Writes and clones only ever open regular files (checked before and after opening, without blocking), so a
+    backup that makes a device node or a FIFO can't write to a disk of the host's or hang the restore.
   - A `send` chain is received in order, full backup first: each backup's subvolumes are snapshots of the
     previous one's with its changes applied, and the previous ones are then destroyed. Receiving is kiwi-nest's
     own (see D21): each command becomes a file operation in the new subvolume, with every path confined to it
@@ -509,7 +514,9 @@ VOLUMES/                         one btrfs filesystem per node
 - **Retention** is per target: the newest `last`, and the newest of each of the last `daily` days, `weekly` weeks
   (from Monday) and `monthly` months that have a backup; with none of them set, everything is kept. It never deletes
   a backup that a kept incremental one needs (its whole chain is kept), nor the newest. It runs after each backup,
-  for that app, volume or the server. Backups of deleted apps stay until deleted by hand.
+  for that app, volume or the server. It never deletes a backup taken before the app or volume was created: those
+  are an earlier one's of the same name (deleted, or lost with its node), so a new app can't push them out.
+  Backups of deleted apps stay until deleted by hand.
 - **The schedule.** Every minute (`--backup-check`), the server lists each target that has `every`, and backs up
   whatever's due there (its newest backup in that target is older than `every`): every app on an online node (apps
   whose bundle says `x-kiwi-nest.backups: false`, such as previews, are skipped; `kiwi-nest backup app` still works)

@@ -137,7 +137,7 @@ impl Server {
                 Ok(size) => {
                     tracing::info!(target = t.name(), key = %key, size, "backed up the server");
                     result.made.push(key.info(t.name(), Some(size)));
-                    match t.prune(Kind::Server, "").await {
+                    match t.prune(Kind::Server, "", None).await {
                         Ok(gone) if !gone.is_empty() => result.notes.push(format!(
                             "retention removed {} older backup{} from target `{}`",
                             gone.len(),

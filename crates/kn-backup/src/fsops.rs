@@ -206,23 +206,38 @@ impl Root {
 
     /// Opens an existing regular file (not through a symlink) for writing.
     pub fn open_write(&self, path: &[u8]) -> io::Result<File> {
-        let at = self.at(path)?;
-        let fd = self.wrap(
-            &at,
-            "opening",
-            openat(at.dir(), &at.name, libc::O_WRONLY | libc::O_NOFOLLOW, 0),
-        )?;
-        Ok(File::from(fd))
+        self.open_regular(path, libc::O_WRONLY)
     }
 
     /// Opens an existing regular file (not through a symlink) for reading.
     pub fn open_read(&self, path: &[u8]) -> io::Result<File> {
+        self.open_regular(path, libc::O_RDONLY)
+    }
+
+    /// Opens a regular file, and nothing else: a backup could make a device node and then write to it (as root,
+    /// a disk of the host's), or a FIFO and block on it. It's checked before it's opened (so a device is never
+    /// opened at all), opened so a FIFO or a terminal couldn't block or take over, and checked again.
+    fn open_regular(&self, path: &[u8], flags: libc::c_int) -> io::Result<File> {
         let at = self.at(path)?;
-        let fd = self.wrap(
-            &at,
-            "opening",
-            openat(at.dir(), &at.name, libc::O_RDONLY | libc::O_NOFOLLOW, 0),
-        )?;
+        let not_regular = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{:?} isn't a regular file", String::from_utf8_lossy(path)),
+            )
+        };
+        let st = self.wrap(&at, "checking", fstatat(at.dir(), &at.name))?;
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(not_regular());
+        }
+        let flags = flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY;
+        let fd = self.wrap(&at, "opening", openat(at.dir(), &at.name, flags, 0))?;
+        // SAFETY: as in `fstatat`.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid descriptor and out-pointer.
+        check(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) })?;
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(not_regular());
+        }
         Ok(File::from(fd))
     }
 

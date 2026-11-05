@@ -262,8 +262,10 @@ impl Target {
         self.store.delete(&self.full(key)).await
     }
 
-    /// Applies retention to one app's, volume's or the server's backups here; returns what it deleted.
-    pub async fn prune(&self, kind: Kind, name: &str) -> anyhow::Result<Vec<Key>> {
+    /// Applies retention to one app's, volume's or the server's backups here; returns what it deleted. Backups
+    /// taken before `since` (when the app or volume was created) are never deleted: they're an earlier app's of the
+    /// same name (one deleted, or lost with its node), and a new app's backups mustn't push them out.
+    pub async fn prune(&self, kind: Kind, name: &str, since: Option<Stamp>) -> anyhow::Result<Vec<Key>> {
         if self.cfg.keep.everything() {
             return Ok(Vec::new());
         }
@@ -273,7 +275,10 @@ impl Target {
             .into_iter()
             .map(|l| l.key)
             .collect();
-        let gone = key::prune(&listing, &self.cfg.keep);
+        let mut gone = key::prune(&listing, &self.cfg.keep);
+        if let Some(since) = since {
+            gone.retain(|k| k.stamp >= since);
+        }
         for k in &gone {
             self.delete(k)
                 .await
@@ -495,7 +500,10 @@ pub(crate) mod tests {
         }
         let k = Key::new(Kind::Volume, "corpus", Stamp(86_400), None, Format::Tar);
         t.upload(&k, Box::new(|_| Ok(()))).await.unwrap();
-        let gone = t.prune(Kind::App, "blog").await.unwrap();
+        // Backups from before the app was created (an earlier app of the name) are left alone.
+        let gone = t.prune(Kind::App, "blog", Some(Stamp(3 * 86_400))).await.unwrap();
+        assert!(gone.is_empty(), "{gone:?}");
+        let gone = t.prune(Kind::App, "blog", None).await.unwrap();
         assert_eq!(gone.len(), 2);
         assert_eq!(t.list(Some((Kind::App, "blog"))).await.unwrap().len(), 2);
         assert_eq!(t.list(Some((Kind::Volume, "corpus"))).await.unwrap().len(), 1);

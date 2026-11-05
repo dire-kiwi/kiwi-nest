@@ -86,6 +86,11 @@ pub struct AppRecord {
     /// The backup this one's volumes were restored from, on its first deploy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore: Option<Restore>,
+    /// The shared volumes whose snapshot the restore staged (at `snaps/.new-APP`) and that aren't in place yet: a
+    /// deploy that failed in between moves them into place when it's tried again, rather than snapshotting the
+    /// shared volume afresh, and the sweep when the node starts keeps them.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub restored_snapshots: BTreeSet<String>,
     /// Set while the app's containers are paused for a snapshot, so a restarted node unpauses them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub paused: bool,
@@ -793,7 +798,16 @@ fn recover_volumes(state: &mut StateFile, volumes: &Volumes) -> anyhow::Result<b
             changed = true;
         }
     }
-    for p in volumes.sweep()? {
+    let pending: Vec<PathBuf> = state
+        .apps
+        .values()
+        .flat_map(|a| {
+            a.restored_snapshots
+                .iter()
+                .map(|n| Volumes::staging_for(&volumes.snapshot_path(n, &a.name)))
+        })
+        .collect();
+    for p in volumes.sweep(&pending)? {
         tracing::warn!(path = %p.display(), "removed a half-made volume left by a node restart");
     }
     // A shared volume moved into place just before a crash, before it was recorded.
@@ -1119,6 +1133,10 @@ impl App<'_> {
                 shared,
                 from,
                 restore,
+                restored_snapshots: previous
+                    .as_ref()
+                    .map(|p| p.restored_snapshots.clone())
+                    .unwrap_or_default(),
                 paused: false,
                 created_at: previous.as_ref().map_or(t, |p| p.created_at),
                 updated_at: t,
@@ -1259,11 +1277,9 @@ impl App<'_> {
 
         // The volumes, while any previous generation keeps running. `--from` waits on the source app's task, so no
         // shared volume's lock is held yet.
-        let restored = self.prepare_volumes(first, notes).await.map_err(Failure::NotStarted)?;
+        self.prepare_volumes(first, notes).await.map_err(Failure::NotStarted)?;
         let _locks = self.inner.lock_shared(record.shared.keys()).await;
-        self.prepare_snapshots(&restored, notes)
-            .await
-            .map_err(Failure::NotStarted)?;
+        self.prepare_snapshots(notes).await.map_err(Failure::NotStarted)?;
         self.verify_mounts().await.map_err(Failure::NotStarted)?;
 
         if let Some(prev) = previous {
@@ -1293,8 +1309,9 @@ impl App<'_> {
     /// restored from a backup, or empty, and moved into place together, so a failure part way leaves nothing. Later
     /// deploys check the recorded volumes, adopt any in place but not recorded, and create the new ones.
     ///
-    /// Returns the shared volumes whose snapshots a restore staged, for [`App::prepare_snapshots`] to move into place.
-    async fn prepare_volumes(&self, first: bool, notes: &mut Vec<String>) -> Result<BTreeSet<String>> {
+    /// A restore also stages the app's snapshots of shared volumes; they're recorded (in `restored_snapshots`) with
+    /// the volumes' IDs, for [`App::prepare_snapshots`] to move into place.
+    async fn prepare_volumes(&self, first: bool, notes: &mut Vec<String>) -> Result<()> {
         let r = self.record().await?;
         let vols = self.inner.volumes.clone();
         let app = self.name.to_string();
@@ -1307,7 +1324,8 @@ impl App<'_> {
             };
             let made = self.make_first_volumes(&r, &staging, &mut restored, notes).await;
             if made.is_err() {
-                self.unstage_restored_snapshots(&restored).await;
+                self.unstage_restored_snapshots(&r).await;
+                let _ = self.update(|r| r.restored_snapshots.clear()).await;
                 let v = vols.clone();
                 match blocking(move || v.remove(&staging)).await {
                     Ok(Ok(())) => {}
@@ -1359,8 +1377,14 @@ impl App<'_> {
             }
             ids
         };
-        self.update(|r| r.volume_ids = ids).await?;
-        Ok(restored)
+        self.update(|r| {
+            r.volume_ids = ids;
+            if first {
+                r.restored_snapshots = restored;
+            }
+        })
+        .await?;
+        Ok(())
     }
 
     /// Makes the first deploy's volumes in `staging`, then moves them into place. A restore also stages the app's
@@ -1375,6 +1399,9 @@ impl App<'_> {
         let mut ids = BTreeMap::new();
         if let Some(restore) = &r.restore {
             ids.extend(self.restore_volumes(r, restore, staging, restored, notes).await?);
+            // Recorded before anything is moved into place, so a crash from here on keeps them.
+            let pending = restored.clone();
+            self.update(|r| r.restored_snapshots = pending).await?;
         }
         if let Some(from) = &r.from {
             let source = Apps {
@@ -1415,9 +1442,29 @@ impl App<'_> {
     }
 
     /// Makes the app's snapshots of the shared volumes it mounts in `snapshot` mode, the first time it mounts each
-    /// (or moves into place the ones a restore staged, in `restored`), and records their IDs. The caller holds the
-    /// volumes' locks.
-    async fn prepare_snapshots(&self, restored: &BTreeSet<String>, notes: &mut Vec<String>) -> Result<()> {
+    /// (or moves into place the ones a restore staged, in `restored_snapshots`), and records their IDs. The caller
+    /// holds the volumes' locks.
+    async fn prepare_snapshots(&self, notes: &mut Vec<String>) -> Result<()> {
+        let r = self.record().await?;
+        // A staged restored snapshot the bundle no longer mounts in snapshot mode is dropped.
+        let unused: Vec<String> = r
+            .restored_snapshots
+            .iter()
+            .filter(|n| r.shared.get(*n).is_none_or(|m| m.mode != SharedMode::Snapshot))
+            .cloned()
+            .collect();
+        if !unused.is_empty() {
+            let (vols, app, u) = (self.inner.volumes.clone(), self.name.to_string(), unused.clone());
+            blocking(move || -> Result<(), VolumeError> {
+                for n in u {
+                    vols.remove(&Volumes::staging_for(&vols.snapshot_path(&n, &app)))?;
+                }
+                Ok(())
+            })
+            .await??;
+            self.update(|r| r.restored_snapshots.retain(|n| !unused.contains(n)))
+                .await?;
+        }
         let r = self.record().await?;
         let wanted: Vec<(String, Option<u64>)> = r
             .shared
@@ -1429,7 +1476,11 @@ impl App<'_> {
             return Ok(());
         }
         let sources = self.shared_ids(&r).await?;
-        let (vols, app, restored) = (self.inner.volumes.clone(), self.name.to_string(), restored.clone());
+        let (vols, app, restored) = (
+            self.inner.volumes.clone(),
+            self.name.to_string(),
+            r.restored_snapshots.clone(),
+        );
         let (ids, made, kept) = blocking(move || -> Result<_> {
             let (mut ids, mut made, mut kept) = (BTreeMap::new(), Vec::new(), Vec::new());
             for (name, recorded) in wanted {
@@ -1441,8 +1492,18 @@ impl App<'_> {
                         kept.push(name.clone());
                         vols.check(&path, None).map_err(refuse)?
                     }
+                    // Never snapshotted afresh: that would put the shared volume's data where the backup's was.
                     None if restored.contains(&name) => {
                         let staged = Volumes::staging_for(&path);
+                        if !Volumes::exists(&staged)? {
+                            return Err(refuse_start(
+                                &app,
+                                &[format!(
+                                    "the snapshot of shared volume `{name}` restored from the backup is missing from                                      {}; delete the app and deploy it again with --restore",
+                                    staged.display()
+                                )],
+                            ));
+                        }
                         let id = vols.check(&staged, None).map_err(refuse)?;
                         vols.commit(&path)?;
                         id
@@ -1470,6 +1531,7 @@ impl App<'_> {
         }
         self.update(|r| {
             for (name, id) in ids {
+                r.restored_snapshots.remove(&name);
                 if let Some(m) = r.shared.get_mut(&name) {
                     m.snapshot_id = Some(id);
                 }
@@ -1856,21 +1918,8 @@ impl App<'_> {
                 let dir = vols.app_dir(&app);
                 vols.remove(&Volumes::staging_for(&dir))?;
                 vols.remove(&dir)?;
-                // Its backups' snapshots too: set aside at once (a backup's send may still hold them), and destroyed
-                // later. A new app of the same name never continues this one's chains.
-                let backups = vols.backups_dir(kn_proto::backup::Kind::App, &app);
-                if Volumes::exists(&backups)? {
-                    let gone = backups.with_file_name(format!(
-                        "{}{app}-{}",
-                        crate::volumes::GONE_PREFIX,
-                        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos())
-                    ));
-                    kn_btrfs::rename_noreplace(&backups, &gone).map_err(|e| VolumeError {
-                        context: format!("setting aside {}", backups.display()),
-                        source: e.into(),
-                    })?;
-                }
-                Ok(())
+                // Its backups' snapshots too. A new app of the same name never continues this one's chains.
+                vols.set_aside_backups(kn_proto::backup::Kind::App, &app)
             })
             .await??;
         }

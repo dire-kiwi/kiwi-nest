@@ -303,6 +303,8 @@ impl Apps {
             }
             vols.remove(&vols.shared_data(&n))?;
             vols.remove(&vols.shared_dir(&n))?;
+            // Its backups' snapshots too, which would otherwise never be freed.
+            vols.set_aside_backups(kn_proto::backup::Kind::Volume, &n)?;
             Ok(())
         })
         .await??;

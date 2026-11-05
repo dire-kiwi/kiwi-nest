@@ -128,19 +128,23 @@ impl Apps {
                 "backing up to a `send` target needs btrfs send, which needs the node to run as root".into(),
             ));
         }
-        {
+        // When it was created: retention leaves earlier apps' (or volumes') backups of the same name alone.
+        let since = {
             let state = self.inner.state.lock().await;
-            let exists = match kind {
-                Kind::App => state.apps.contains_key(name),
-                _ => state.shared.contains_key(name),
+            let created = match kind {
+                Kind::App => state.apps.get(name).map(|a| a.created_at),
+                _ => state.shared.get(name).map(|s| s.created_at),
             };
-            if !exists {
-                return Err(match kind {
-                    Kind::App => AppsError::NotFound(name.into()),
-                    _ => AppsError::NotFoundOther(format!("shared volume `{name}` doesn't exist")),
-                });
+            match created {
+                Some(c) => Stamp(c),
+                None => {
+                    return Err(match kind {
+                        Kind::App => AppsError::NotFound(name.into()),
+                        _ => AppsError::NotFoundOther(format!("shared volume `{name}` doesn't exist")),
+                    });
+                }
             }
-        }
+        };
         let lock = self.backup_lock(kind, name);
         let _held = lock.lock().await;
         let mut result = BackupResult::default();
@@ -211,7 +215,7 @@ impl Apps {
                     tracing::info!(target = t.name(), key = %key, size, "backed up");
                     result.made.push(key.info(t.name(), Some(size)));
                     uploaded.push((t, stamp));
-                    match t.prune(kind, name).await {
+                    match t.prune(kind, name, Some(since)).await {
                         Ok(gone) if !gone.is_empty() => result.notes.push(format!(
                             "retention removed {} older backup{} from target `{}`",
                             gone.len(),
@@ -572,9 +576,11 @@ impl App<'_> {
         Ok(ids)
     }
 
-    /// Removes the shared-volume snapshots a failed restore staged.
-    pub(super) async fn unstage_restored_snapshots(&self, restored: &BTreeSet<String>) {
-        let (vols, app, names) = (self.inner.volumes.clone(), self.name.to_string(), restored.clone());
+    /// Removes the shared-volume snapshots a failed first deploy's restore may have staged (all of the app's: the
+    /// staging names are its own).
+    pub(super) async fn unstage_restored_snapshots(&self, r: &AppRecord) {
+        let (vols, app) = (self.inner.volumes.clone(), self.name.to_string());
+        let names: Vec<String> = r.shared.keys().cloned().collect();
         let _ = blocking(move || {
             for n in names {
                 let _ = vols.remove(&Volumes::staging_for(&vols.snapshot_path(&n, &app)));

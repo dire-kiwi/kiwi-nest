@@ -1103,9 +1103,89 @@ async fn send_backups_continue_chains_from_what_both_sides_have() {
     // Deleting the app sets its snapshots aside, and the next sweep destroys them.
     apps.delete("blog", false).await.unwrap();
     assert!(sets().is_empty());
-    apps.volumes().sweep().unwrap();
+    apps.volumes().sweep(&[]).unwrap();
     let backups = apps.volumes().root().join("backups/apps");
     assert_eq!(Volumes::names(&backups).unwrap(), Vec::<String>::new());
     assert_eq!(std::fs::read_dir(&backups).unwrap().count(), 0);
     apps.delete("copy", false).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_restored_snapshot_survives_a_failed_deploy_and_a_restart() {
+    use kn_proto::backup::{Format, Kind};
+    let mut env = Env::new().await;
+    env.use_targets(vec![dir_target(&env.path("backups"), "local", Format::Tar, 5)]);
+    for v in ["aaa", "corpus"] {
+        env.apps.volume_create(v).await.unwrap();
+    }
+    std::fs::write(env.vols().shared_data("corpus").join("words"), "shared").unwrap();
+    let shared = "{ corpus: { target: /c, mode: snapshot } }";
+    env.deploy_yaml("blog", &compose("blog.localhost", &["data"], shared), None)
+        .await
+        .unwrap();
+    std::fs::write(env.vols().snapshot_path("corpus", "blog").join("words"), "the app's").unwrap();
+    let key = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap().made[0]
+        .key
+        .clone();
+
+    // The restored app also mounts `aaa` (before `corpus`, by name) in snapshot mode, and snapshotting it fails:
+    // the restored volumes are in place, the restored snapshot of `corpus` is staged, and the deploy fails.
+    let both = "{ aaa: { target: /a, mode: snapshot }, corpus: { target: /c, mode: snapshot } }";
+    env.fake.fail_snapshots.lock().unwrap().insert(".new-copy".into());
+    assert!(env.deploy_restored("copy", &["data"], both, &key).await.is_err());
+    assert_eq!(
+        env.record("copy").await.restored_snapshots,
+        BTreeSet::from(["corpus".to_string()])
+    );
+    env.fake.fail_snapshots.lock().unwrap().clear();
+
+    // A restart keeps it; the next deploy moves it into place, rather than snapshotting `corpus` afresh.
+    env.restart().await;
+    env.use_targets(vec![dir_target(&env.path("backups"), "local", Format::Tar, 5)]);
+    let staged = Volumes::staging_for(&env.vols().snapshot_path("corpus", "copy"));
+    assert!(Volumes::exists(&staged).unwrap());
+    env.deploy_yaml("copy", &compose("copy.localhost", &["data"], both), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(env.vols().snapshot_path("corpus", "copy").join("words")).unwrap(),
+        "the app's"
+    );
+    assert!(env.record("copy").await.restored_snapshots.is_empty());
+
+    // One that went missing is refused, never made again from the shared volume.
+    env.fake.fail_snapshots.lock().unwrap().insert(".new-copy2".into());
+    assert!(env.deploy_restored("copy2", &["data"], both, &key).await.is_err());
+    env.fake.fail_snapshots.lock().unwrap().clear();
+    env.vols()
+        .remove(&Volumes::staging_for(&env.vols().snapshot_path("corpus", "copy2")))
+        .unwrap();
+    let e = env
+        .deploy_yaml("copy2", &compose("copy2.localhost", &["data"], both), None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("restored from the backup is missing"), "{e}");
+}
+
+#[tokio::test]
+async fn deleting_a_volume_sets_its_backup_snapshots_aside() {
+    use kn_proto::backup::Kind;
+    let mut env = Env::new().await;
+    env.apps.volume_create("corpus").await.unwrap();
+    // A snapshot set kept as a send parent.
+    let set = env.vols().backups_dir(Kind::Volume, "corpus").join("20261106T030000Z");
+    std::fs::create_dir_all(&set).unwrap();
+    env.apps.volume_delete("corpus").await.unwrap();
+    assert!(!Volumes::exists(&env.vols().backups_dir(Kind::Volume, "corpus")).unwrap());
+    let parent = env.vols().root().join("backups/volumes");
+    let gone: Vec<_> = std::fs::read_dir(&parent)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(gone.len(), 1);
+    assert!(gone[0].to_string_lossy().starts_with(".gone-corpus-"), "{gone:?}");
+    // The next start destroys them.
+    env.restart().await;
+    assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
 }

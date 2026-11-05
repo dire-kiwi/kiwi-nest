@@ -204,6 +204,20 @@ impl Volumes {
         self.root.join("backups").join(k).join(name)
     }
 
+    /// Sets a deleted app's or volume's backup snapshot sets aside, as `.gone-NAME-…` beside them: at once (a
+    /// backup's send may still hold them), to be destroyed by later backups and the next sweep.
+    pub fn set_aside_backups(&self, kind: kn_proto::backup::Kind, name: &str) -> Result<()> {
+        let backups = self.backups_dir(kind, name);
+        if !Self::exists(&backups)? {
+            return Ok(());
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let gone = backups.with_file_name(format!("{GONE_PREFIX}{name}-{nanos}"));
+        kn_btrfs::rename_noreplace(&backups, &gone).map_err(ctx(format!("setting aside {}", backups.display())))
+    }
+
     /// The staging name beside `path`.
     pub fn staging_for(path: &Path) -> PathBuf {
         let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
@@ -366,8 +380,9 @@ impl Volumes {
     }
 
     /// Removes every staging leftover (and half-made load) under the volumes directory: what a crash in the middle of
-    /// making something leaves. Only run when nothing is being made.
-    pub fn sweep(&self) -> Result<Vec<PathBuf>> {
+    /// making something leaves, except the staging paths in `keep` (restored snapshots waiting to be moved into
+    /// place). Only run when nothing is being made.
+    pub fn sweep(&self, keep: &[PathBuf]) -> Result<Vec<PathBuf>> {
         let mut dirs = vec![self.root.join("apps"), self.root.join("shared")];
         for app in Self::names(&self.root.join("apps"))? {
             dirs.push(self.app_dir(&app));
@@ -398,7 +413,7 @@ impl Volumes {
         for dir in dirs {
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
             for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(STAGING_PREFIX) {
+                if entry.file_name().to_string_lossy().starts_with(STAGING_PREFIX) && !keep.contains(&entry.path()) {
                     self.remove(&entry.path())?;
                     removed.push(entry.path());
                 }
@@ -663,7 +678,7 @@ mod tests {
         v.create(&Volumes::staging_for(&v.app_volume("blog", "more"))).unwrap();
         std::fs::create_dir_all(v.snapshots_dir("corpus")).unwrap();
         v.create(&v.shared_dir("corpus").join(LOAD_NAME)).unwrap();
-        let mut swept = v.sweep().unwrap();
+        let mut swept = v.sweep(&[]).unwrap();
         swept.sort();
         assert_eq!(swept.len(), 3, "{swept:?}");
         assert!(!Volumes::exists(&staged).unwrap());
@@ -685,7 +700,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &apps).unwrap();
         let e = v.remove(&v.app_dir("blog")).unwrap_err().to_string();
         assert!(e.contains("is a symlink"), "{e}");
-        assert!(v.sweep().is_err() || outside.join("blog/data/precious").exists());
+        assert!(v.sweep(&[]).is_err() || outside.join("blog/data/precious").exists());
         assert!(outside.join("blog/data/precious").exists());
         // A symlink itself is removed, not what it points to.
         std::fs::remove_file(&apps).unwrap();
