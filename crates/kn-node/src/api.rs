@@ -11,15 +11,17 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{delete as delete_route, get, put};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use kn_proto::api::{AppInfo, AppSummary, DeployDirectory, DeployQuery, ErrorBody, LogsQuery, VersionInfo};
+use kn_proto::api::{
+    AppInfo, AppSummary, DeleteQuery, DeployDirectory, DeployQuery, ErrorBody, LogsQuery, VersionInfo, VolumeInfo,
+};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdout};
 use tokio_util::io::ReaderStream;
 
-use crate::apps::{Apps, AppsError, Logs};
+use crate::apps::{Apps, AppsError, DeployOptions, LoadSource, Logs};
 
 /// The largest JSON body accepted.
 const MAX_JSON: usize = 64 * 1024;
@@ -49,8 +51,10 @@ impl From<AppsError> for ApiError {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
             AppsError::NotFound(_) | AppsError::NotFoundOther(_) => StatusCode::NOT_FOUND,
-            AppsError::Exists(_) | AppsError::DomainTaken { .. } => StatusCode::CONFLICT,
-            AppsError::DeployFailed { .. } | AppsError::Runtime(_) | AppsError::Internal(_) => {
+            AppsError::Exists(_) | AppsError::DomainTaken { .. } | AppsError::Conflict(_) | AppsError::Mount(_) => {
+                StatusCode::CONFLICT
+            }
+            AppsError::DeployFailed { .. } | AppsError::Runtime(_) | AppsError::Volume(_) | AppsError::Internal(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
@@ -86,6 +90,16 @@ pub fn router(apps: Apps) -> Router {
         .route(&format!("{p}/apps"), get(list))
         .route(&format!("{p}/apps/{{name}}"), get(inspect).put(deploy).delete(delete))
         .route(&format!("{p}/apps/{{name}}/logs"), get(logs))
+        .route(&format!("{p}/volumes"), get(volume_list))
+        .route(
+            &format!("{p}/volumes/{{name}}"),
+            get(volume_inspect).put(volume_create).delete(volume_delete),
+        )
+        .route(&format!("{p}/volumes/{{name}}/data"), put(volume_load))
+        .route(
+            &format!("{p}/volumes/{{name}}/snapshots/{{app}}"),
+            delete_route(volume_delete_snapshot),
+        )
         // Uploads are streamed to disk under the bundle limits instead.
         .layer(DefaultBodyLimit::disable())
         .layer(axum::middleware::from_fn(loopback_only))
@@ -161,21 +175,22 @@ async fn inspect(State(apps): State<Apps>, Path(name): Path<String>) -> ApiResul
     Ok(axum::Json(apps.inspect(&name).await?))
 }
 
-async fn delete(State(apps): State<Apps>, Path(name): Path<String>) -> ApiResult<StatusCode> {
-    apps.delete(&name).await?;
+async fn delete(
+    State(apps): State<Apps>,
+    Path(name): Path<String>,
+    Query(q): Query<DeleteQuery>,
+) -> ApiResult<StatusCode> {
+    apps.delete(&name, q.keep_data).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn deploy(
-    State(apps): State<Apps>,
-    Path(name): Path<String>,
-    Query(q): Query<DeployQuery>,
-    headers: HeaderMap,
-    body: Body,
-) -> ApiResult<axum::Json<AppInfo>> {
-    if !kn_bundle::manifest::is_valid_app_name(&name) {
-        return Err(AppsError::InvalidName(name).into());
-    }
+/// A request body that's either a ZIP (saved to the staging directory, within `limit`) or a directory on the node.
+enum Received {
+    Zip(tempfile::NamedTempFile),
+    Dir(std::path::PathBuf),
+}
+
+async fn receive(apps: &Apps, headers: &HeaderMap, body: Body, limit: u64) -> ApiResult<Received> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -185,10 +200,9 @@ async fn deploy(
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    let staged = match content_type.as_str() {
+    match content_type.as_str() {
         "application/zip" | "application/octet-stream" => {
             let upload = apps.upload_file()?;
-            let limit = apps.config().limits.max_archive_size;
             let mut file = tokio::fs::File::from_std(upload.reopen().map_err(|e| AppsError::Internal(e.into()))?);
             let mut stream = body.into_data_stream();
             let mut n: u64 = 0;
@@ -199,7 +213,7 @@ async fn deploy(
                 if n > limit {
                     return Err(ApiError::new(
                         StatusCode::PAYLOAD_TOO_LARGE,
-                        format!("the bundle is larger than {limit} bytes"),
+                        format!("the upload is larger than {limit} bytes"),
                     ));
                 }
                 file.write_all(&chunk)
@@ -207,10 +221,7 @@ async fn deploy(
                     .map_err(|e| AppsError::Internal(e.into()))?;
             }
             file.flush().await.map_err(|e| AppsError::Internal(e.into()))?;
-            drop(file);
-            let staged = apps.stage_zip(upload.path().to_path_buf()).await;
-            drop(upload);
-            staged?
+            Ok(Received::Zip(upload))
         }
         "application/json" => {
             let bytes = axum::body::to_bytes(body, MAX_JSON)
@@ -225,16 +236,84 @@ async fn deploy(
                     "the directory must be an absolute path",
                 ));
             }
-            apps.stage_dir(dir).await?
+            Ok(Received::Dir(dir))
         }
-        other => {
-            return Err(ApiError::new(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                format!("send a ZIP as application/zip, or a directory as JSON, not {other:?}"),
-            ));
+        other => Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("send a ZIP as application/zip, or a directory as JSON, not {other:?}"),
+        )),
+    }
+}
+
+async fn volume_list(State(apps): State<Apps>) -> ApiResult<axum::Json<Vec<VolumeInfo>>> {
+    Ok(axum::Json(apps.volume_list().await?))
+}
+
+async fn volume_inspect(State(apps): State<Apps>, Path(name): Path<String>) -> ApiResult<axum::Json<VolumeInfo>> {
+    Ok(axum::Json(apps.volume_info(&name).await?))
+}
+
+async fn volume_create(State(apps): State<Apps>, Path(name): Path<String>) -> ApiResult<Response> {
+    Ok((StatusCode::CREATED, axum::Json(apps.volume_create(&name).await?)).into_response())
+}
+
+async fn volume_load(
+    State(apps): State<Apps>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<axum::Json<VolumeInfo>> {
+    let limit = apps.config().load_limits.max_archive_size;
+    let info = match receive(&apps, &headers, body, limit).await? {
+        Received::Zip(upload) => {
+            let r = apps
+                .volume_load(&name, LoadSource::Zip(upload.path().to_path_buf()))
+                .await;
+            drop(upload);
+            r?
         }
+        Received::Dir(dir) => apps.volume_load(&name, LoadSource::Dir(dir)).await?,
     };
-    Ok(axum::Json(apps.deploy(&name, staged, q.create_only).await?))
+    Ok(axum::Json(info))
+}
+
+async fn volume_delete(State(apps): State<Apps>, Path(name): Path<String>) -> ApiResult<StatusCode> {
+    apps.volume_delete(&name).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn volume_delete_snapshot(
+    State(apps): State<Apps>,
+    Path((name, app)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    apps.volume_delete_snapshot(&name, &app).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn deploy(
+    State(apps): State<Apps>,
+    Path(name): Path<String>,
+    Query(q): Query<DeployQuery>,
+    headers: HeaderMap,
+    body: Body,
+) -> ApiResult<axum::Json<AppInfo>> {
+    if !kn_bundle::manifest::is_valid_app_name(&name) {
+        return Err(AppsError::InvalidName(name).into());
+    }
+    let limit = apps.config().limits.max_archive_size;
+    let staged = match receive(&apps, &headers, body, limit).await? {
+        Received::Zip(upload) => {
+            let staged = apps.stage_zip(upload.path().to_path_buf()).await;
+            drop(upload);
+            staged?
+        }
+        Received::Dir(dir) => apps.stage_dir(dir).await?,
+    };
+    let opts = DeployOptions {
+        create_only: q.create_only,
+        from: q.from,
+    };
+    Ok(axum::Json(apps.deploy(&name, staged, opts).await?))
 }
 
 async fn logs(State(apps): State<Apps>, Path(name): Path<String>, Query(q): Query<LogsQuery>) -> ApiResult<Response> {

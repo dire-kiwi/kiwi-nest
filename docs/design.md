@@ -106,7 +106,7 @@ x-kiwi-nest:
   auth:                   # optional basic auth, checked at the ingress
     - { user: preview, hash: "$2y$..." }
   shared:                 # optional shared volumes
-    corpus: { target: /corpus, mode: snapshot }   # snapshot | ro | rw
+    corpus: { target: /corpus, mode: snapshot }   # snapshot | ro (default) | rw; services: [web] limits it
   nest: blog              # optional; usually worked out (see below)
   arch: arm64             # optional placement constraints
   node_labels: { disk: ssd }
@@ -138,9 +138,12 @@ volumes:
     `env_file`.
   - `x-kiwi-nest` needs `domain`, `service` and `port`. `idle_timeout` defaults to `0` (always on), so forgetting it
     never stops a production app; previews set it. Unknown keys are refused, which catches typos.
+  - A shared volume is mounted into every service, or only those its `services` list names (which must exist). Its
+    target can't be where the service already mounts something, or where another shared volume lands.
   - Every problem in a bundle is reported at once, each with where it is (`services.web.ports: …`).
 - **Generated files.** The node writes its own Compose file from the bundle. In it, every named volume becomes a bind
-  mount of that app's subvolume, and only the routed service gets a port, bound to `127.0.0.1`. The generated file is
+  mount of that app's subvolume, each shared volume a bind mount of the shared subvolume (read-only for `ro`) or of
+  the app's own snapshot of it, and only the routed service gets a port, bound to `127.0.0.1`. The generated file is
   kept outside the bundle's directory, so a writable mount can't change it.
 - **Redeploying updates in place.** `deploy` on an existing app replaces its bundle: the node stops the old project
   and starts the new one (brief downtime). The app's volumes stay. `--create-only` refuses if the app exists.
@@ -156,7 +159,8 @@ volumes:
   loopback port from the node's range, kept across redeploys. The node's files:
 
   ```text
-  STATE/state.json                 apps, generations, ports and status, written atomically
+  STATE/state.json                 apps (generations, ports, status, subvolume IDs) and shared volumes, written
+                                   atomically
   STATE/staging/                   uploads and bundles being checked
   STATE/apps/APP/bundle-GEN/       the extracted bundle of APP's generation GEN
   STATE/apps/APP/compose-GEN.yaml  the Compose file generated from it, outside the bundle
@@ -166,7 +170,7 @@ volumes:
   recorded as failed. A redeploy that fails before the old project is stopped (its files can't be written, or `down`
   fails) leaves the old generation's bundle, file and record in place, since its containers may still be running;
   one that fails after that leaves the new generation as a failed app.
-- **The standalone node's API** (step 1, before the server exists) listens on loopback only and has no tokens. It
+- **The standalone node's API** (steps 1 to 3, before the server exists) listens on loopback only and has no tokens. It
   answers only requests whose `Host` is `localhost`, `127.x.x.x` or `[::1]` and that carry no `Origin`, so a web page
   can't reach it by rebinding its DNS name to 127.0.0.1.
 
@@ -180,23 +184,60 @@ VOLUMES/                         one btrfs filesystem per node
   backups/…                      read-only snapshots kept as parents for incremental sends
 ```
 
-- **The node agent calls the btrfs ioctls directly** (create, snapshot, destroy) through `nix`/`libc`. It runs as
-  root, which is no more power than controlling Docker already gives, so it needs no helper process. Before every
-  start it checks each mount: it must be the right subvolume, reached without symlinks.
+- **The node agent calls the btrfs ioctls directly** (create, snapshot, destroy) through `libc`, with no
+  `btrfs-progs`. It runs as root, which is no more power than controlling Docker already gives, so it needs no helper
+  process. `--volumes-dir` must be on btrfs and reached without symlinks, or the node refuses to start.
+- **Every path is opened one component at a time without following symlinks**, from `/`, and the ioctls act on those
+  file descriptors, so a symlink anywhere on the way is refused rather than followed.
+- **The check before every start.** Each mount must be reached without symlinks, be a writable subvolume (inode 256,
+  `statfs` says btrfs) of the node's filesystem (by UUID), and have the subvolume ID the node recorded for it. So a
+  volume swapped for a symlink, a plain directory, a mount or another app's subvolume is refused, and the app isn't
+  started. A recorded volume that's missing is refused too, never quietly recreated empty. On a redeploy the check
+  runs before the old generation is stopped (a failure leaves it running) and again right before the start.
+- **Nothing half-made is ever in place.** A new subvolume, or a set of them, is made under a staging name beside its
+  place (`.new-NAME`, which no app or volume name can be) and renamed into place with `RENAME_NOREPLACE`, so it never
+  replaces anything. A crash leaves at most a staging leftover, destroyed before that name is staged again and when
+  the node starts. A subvolume found in place but not recorded (kept with `--keep-data`, or moved into place just
+  before a crash) is adopted by the next deploy, which records its ID.
 - **Previews from production: `deploy blog-pr12 ./bundle --from blog`.**
-  - For each named volume that both bundles declare, blog's subvolume is snapshotted as blog-pr12's.
-  - blog's containers are paused for the few milliseconds the snapshots take, so all of its volumes are captured at
-    one instant, like a power cut. Databases recover from that the way they recover from a crash.
+  - For each named volume that both bundles declare, blog's subvolume is snapshotted as blog-pr12's. The others
+    start empty. blog must be deployed on the same node, and not be in the middle of its own first deploy (which may
+    be waiting on another app's snapshots, so waiting on it could deadlock).
+  - The snapshots are made by blog's own task, so they never overlap blog's deploys or deletes. If blog has running
+    containers, they're paused for the few milliseconds the snapshots take (`docker compose pause`), so all of its
+    volumes are captured at one instant, like a power cut. Databases recover from that the way they recover from a
+    crash.
+  - They're always unpaused afterwards, even when a snapshot fails, and unpausing is retried. A flag in blog's record
+    is set while it's paused, so a node that dies in between unpauses blog when it starts. If unpausing still fails,
+    the deploy fails and blog's record says its containers may be paused.
+  - The whole set is made in a staging directory and moved into place together, so a failure part way (one volume
+    snapshotted, the next not) leaves nothing, and the next try starts again.
   - The preview's snapshots share disk space with production's data until either side writes.
-  - Only the first deploy snapshots. Later redeploys keep the preview's data.
+  - Only the first deploy snapshots: the one that makes `VOLUMES/apps/blog-pr12`, for an app with no recorded volumes.
+    Later deploys keep the preview's data and say that `--from` was ignored, so CI can pass it on every push. If an
+    app with recorded volumes finds its directory gone (removed, or the filesystem not mounted), the deploy is refused
+    and the running generation stays; nothing is made again, empty or from `--from`. Deleting the app starts over.
 - **Shared volumes**: `kiwi-nest volume create corpus`, then fill it, for example with
   `kiwi-nest volume load corpus ./dir`, or from an app that mounts it read-write. An app mounts a shared volume
   `ro` (read-only), `rw` (read-write; every app mounting it sees the writes) or `snapshot` (its own writable copy,
-  made on its first deploy).
-- **Deleting.** Deleting an app deletes its own subvolumes; `--keep-data` keeps them, so a redeploy of the same name
-  gets them back. A shared volume can't be deleted while any app mounts it or any snapshot of it exists.
+  made on the first deploy that mounts it, and kept across redeploys).
+  - `volume load` replaces the contents with a directory (or a ZIP) of plain files, read by the bundle reader's rules
+    under larger limits. It fills a new subvolume beside `data`, syncs it, and swaps the two with `RENAME_EXCHANGE`,
+    so the volume is always all old or all new; the new subvolume's ID is recorded before the swap, so a restart can
+    tell whether it happened. It's refused while an app mounts the volume `ro` or `rw`. Snapshots keep what they had.
+  - Each shared volume has a lock: deploys that mount it hold it shared (from making their snapshots until their
+    containers are up), and `volume` commands that change it hold it exclusively, so a load or delete never runs
+    under a deploy.
+  - `volume list` and `volume inspect` show who mounts each volume, its snapshots, and anything wrong on disk.
+- **Deleting.** Deleting an app deletes its own subvolumes: its volumes and its snapshots of shared volumes.
+  `--keep-data` keeps them, so a redeploy of the same name gets them back. A shared volume can't be deleted while any
+  app mounts it or any snapshot of it exists, even a kept one. `volume delete-snapshot NAME APP` deletes one, and is
+  refused while APP is deployed and mounts that snapshot.
 - Docker named volumes aren't used at all, so every byte of app data is a subvolume that can be snapshotted, backed up
   and moved. Files keep the owners the containers gave them; snapshots, backups and restores keep owners and modes.
+- **Without root** (tests, a development node), creating subvolumes and snapshotting your own still work, but the
+  kernel only lets other users destroy a subvolume on a filesystem mounted with `user_subvol_rm_allowed`. Otherwise
+  the node empties the subvolume and removes it with `rmdir`, which the kernel allows for an empty one.
 
 ## Nests and placement
 
@@ -342,7 +383,7 @@ One Cargo workspace. A few crates keep the server and node apart and build in pa
 | `kiwi-nest` (bin) | | The one binary; `clap` chooses between `server`, `node` and the CLI commands. |
 | `kn-proto` | `api`, `agent`, `state` | Types shared by the CLI, server and nodes: API requests and responses, the agent link's polls, desired state, reports and commands. Versioned, so the server can talk to nodes one version behind. |
 | `kn-bundle` | `zip`, `compose`, `manifest`, `generate` | Safe ZIP reading, validation of the Compose subset and `x-kiwi-nest`, and the generated Compose file. No I/O beyond the bundle, so plain unit tests cover it. |
-| `kn-btrfs` | | btrfs ioctls (create, snapshot, destroy, read-only snapshots), subvolume checks, send and receive as streams. |
+| `kn-btrfs` | | btrfs ioctls (create, snapshot, destroy, read-only snapshots), subvolume checks, paths opened without following symlinks; later, send and receive as streams. |
 | `kn-node` | `volumes`, `runtime`, `apps`, `gateway`, `agent` | The node: the volume layout and rules; `docker compose` through `tokio::process`; each app's lifecycle (one task per app, so its operations are serialized) and the state file; the `hyper` gateway; the link to the server. |
 | `kn-server` | `api`, `store`, `scheduler`, `bundles`, `auth`, `ingress`, `registry`, `ui` | The server: `axum` APIs for the CLI and agents, SQLite, placement, the bundle store, tokens, Caddy sync, the registry, and the embedded UI. |
 | `kn-backup` | `chain`, `s3`, `ssh` | Send and tar streams through zstd to S3, R2 or SSH, chains and retention, restores. Used by nodes, and by the server for its own state. |
@@ -351,7 +392,7 @@ One Cargo workspace. A few crates keep the server and node apart and build in pa
 
 Main dependencies: `tokio`; `hyper` 1 and `hyper-util` (the gateway, WebSocket upgrades included); `axum`; `reqwest`
 with rustls (no OpenSSL); `rusqlite` (bundled); `serde`, `serde_json` and a maintained YAML crate; `zip`, `zstd`,
-`tar`; `nix`; `clap`; `tracing`; `rusty-s3` (a small S3 signer rather than the AWS SDK). Releases are static binaries
+`tar`; `libc` (the btrfs ioctls); `clap`; `tracing`; `rusty-s3` (a small S3 signer rather than the AWS SDK). Releases are static binaries
 for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, built with `cargo zigbuild`; the CLI is also built
 for macOS.
 
@@ -371,6 +412,7 @@ for macOS.
 | D10 | No failover; recover by restoring from backup with `--node`. | Without replicated data, automatic rescheduling would bring an app back empty, which is worse than down. |
 | D11 | Each backup target chooses `send` (default) or `tar`; the server's own state always uses tar. | Only `send` couldn't be read without btrfs; only tar is slower, larger and loses sharing. Incremental tar isn't worth its complexity for occasional off-site copies. |
 | D12 | Bundles can't use Compose variable interpolation; Compose runs with an empty environment and no `.env`. | The node's environment (tokens, paths) never reaches an app, and a bundle behaves the same on every node. Interpolating from the node's environment leaks it; interpolating from a `.env` in the bundle adds a second way to say what `env_file` already says. |
+| D13 | Every subvolume's ID is recorded when it's put in place and checked before every start; a missing or different one is refused, never recreated. | Previews and shared volumes make it easy to mount the wrong data: a swapped directory could give a preview production's live database, or give production an empty one. Checking only that the path is some subvolume wouldn't catch a swap of one for another. |
 
 ## Build plan
 

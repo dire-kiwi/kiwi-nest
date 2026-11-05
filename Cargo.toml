@@ -12,6 +12,7 @@ publish = false
 kn-proto = { path = "crates/kn-proto" }
 kn-bundle = { path = "crates/kn-bundle" }
 kn-node = { path = "crates/kn-node" }
+kn-btrfs = { path = "crates/kn-btrfs" }
 kn-cli = { path = "crates/kn-cli" }
 
 anyhow = "1"

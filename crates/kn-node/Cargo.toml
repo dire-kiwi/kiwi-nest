@@ -1,6 +1,6 @@
 [package]
 name = "kn-node"
-description = "The kiwi-nest node: apps, the Compose runtime and the standalone API"
+description = "The kiwi-nest node: apps, btrfs volumes, the Compose runtime and the standalone API"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -11,6 +11,7 @@ axum.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 humantime.workspace = true
+kn-btrfs.workspace = true
 kn-bundle.workspace = true
 kn-proto.workspace = true
 serde.workspace = true

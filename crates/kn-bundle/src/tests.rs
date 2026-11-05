@@ -418,6 +418,7 @@ fn reports_every_problem() {
 
 struct Gen {
     volume_dirs: BTreeMap<String, PathBuf>,
+    shared_dirs: BTreeMap<String, PathBuf>,
     labels: BTreeMap<String, String>,
 }
 
@@ -430,7 +431,18 @@ impl Gen {
         let labels = [("kiwi-nest.app".to_string(), "blog".to_string())]
             .into_iter()
             .collect();
-        Gen { volume_dirs, labels }
+        let shared_dirs = [
+            ("corpus", "/vol/shared/corpus/data"),
+            ("maps", "/vol/shared/maps/snaps/blog"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), PathBuf::from(v)))
+        .collect();
+        Gen {
+            volume_dirs,
+            shared_dirs,
+            labels,
+        }
     }
 
     fn params<'a>(&'a self, bundle_dir: &'a Path) -> Params<'a> {
@@ -438,6 +450,7 @@ impl Gen {
             project: "kn-blog",
             bundle_dir,
             volume_dirs: &self.volume_dirs,
+            shared_dirs: &self.shared_dirs,
             host_port: 31234,
             labels: &self.labels,
         }
@@ -501,6 +514,80 @@ fn named_volumes_become_bind_mounts_of_the_apps_directories() {
     assert_eq!(get(data, "read_only").as_bool(), Some(false));
     assert_eq!(get(data, "bind.create_host_path").as_bool(), Some(false));
     assert_eq!(get(&out, "services.db.volumes.0.source"), "/vol/apps/blog/db");
+}
+
+/// The base bundle, with `x-kiwi-nest.shared` set to `shared`.
+fn with_shared(shared: &str, web: &str) -> String {
+    bundle(web, "").replacen("port: 8080 }", &format!("port: 8080, shared: {shared} }}"), 1)
+}
+
+#[test]
+fn shared_volumes_become_bind_mounts_by_mode() {
+    let out = Gen::new().run(&with_shared(
+        "{ corpus: { target: /corpus }, maps: { target: /maps, mode: snapshot, services: [web] } }",
+        "",
+    ));
+    // `ro` by default, into every service.
+    for svc in ["web", "db"] {
+        let vols = get(&out, &format!("services.{svc}.volumes")).as_sequence().unwrap();
+        let corpus = vols.iter().find(|v| v["target"] == "/corpus").unwrap();
+        assert_eq!(get(corpus, "source"), "/vol/shared/corpus/data");
+        assert_eq!(get(corpus, "read_only").as_bool(), Some(true));
+        assert_eq!(get(corpus, "bind.create_host_path").as_bool(), Some(false));
+    }
+    // A snapshot is the app's own, so it's writable; and it's only in the services named.
+    let web = get(&out, "services.web.volumes").as_sequence().unwrap();
+    let maps = web.iter().find(|v| v["target"] == "/maps").unwrap();
+    assert_eq!(get(maps, "source"), "/vol/shared/maps/snaps/blog");
+    assert_eq!(get(maps, "read_only").as_bool(), Some(false));
+    let db = get(&out, "services.db.volumes").as_sequence().unwrap();
+    assert!(db.iter().all(|v| v["target"] != "/maps"));
+
+    let out = Gen::new().run(&with_shared("{ corpus: { target: /corpus, mode: rw } }", ""));
+    assert_eq!(get(&out, "services.web.volumes.2.read_only").as_bool(), Some(false));
+
+    // A service without mounts of its own still gets them.
+    let yaml = "x-kiwi-nest: { domain: a.example.com, service: web, port: 80, shared: { corpus: { target: /c } } }\n\
+                services:\n  web:\n    image: x\n";
+    let out = Gen::new().run(yaml);
+    assert_eq!(get(&out, "services.web.volumes.0.target"), "/c");
+
+    let mut g = Gen::new();
+    g.shared_dirs.clear();
+    assert!(matches!(
+        generate(&ok(yaml), &g.params(Path::new("/b"))),
+        Err(GenerateError::MissingShared(_))
+    ));
+}
+
+#[test]
+fn refuses_shared_volumes_on_taken_paths_or_missing_services() {
+    let e = refused(&with_shared("{ corpus: { target: /var/lib/blog } }", ""));
+    assert!(
+        e.contains(
+            "x-kiwi-nest.shared.corpus: mounts at `/var/lib/blog`, where service `web` already mounts something"
+        ),
+        "{e}"
+    );
+    // Only the services it's mounted into count.
+    ok(&with_shared(
+        "{ corpus: { target: /var/lib/blog, services: [db] } }",
+        "",
+    ));
+    let e = refused(&with_shared("{ a: { target: /x }, b: { target: /x, mode: rw } }", ""));
+    assert!(
+        e.contains("x-kiwi-nest.shared.b: mounts at `/x` in service `web`, like shared volume `a`"),
+        "{e}"
+    );
+    ok(&with_shared(
+        "{ a: { target: /x, services: [web] }, b: { target: /x, services: [db] } }",
+        "",
+    ));
+    let e = refused(&with_shared("{ corpus: { target: /c, services: [worker] } }", ""));
+    assert!(
+        e.contains("x-kiwi-nest.shared.corpus: names service `worker`, which doesn't exist"),
+        "{e}"
+    );
 }
 
 #[test]
