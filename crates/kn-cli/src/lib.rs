@@ -51,6 +51,30 @@ pub struct GlobalArgs {
     /// Where the CLI keeps its clusters [default: ~/.config/kiwi-nest].
     #[arg(long, global = true, env = "KIWI_NEST_CONFIG_DIR", value_name = "DIR")]
     pub config_dir: Option<PathBuf>,
+    /// A CA certificate (PEM) to trust for the server, as well as the system's: the ingress's internal CA (the
+    /// server's STATE/ingress-ca.crt), say. `cluster add` keeps it with the cluster; a node uses it to reach its
+    /// --server.
+    #[arg(long, global = true, env = "KIWI_NEST_CA_CERT", value_name = "FILE")]
+    pub ca_cert: Option<PathBuf>,
+}
+
+impl GlobalArgs {
+    /// The contents of --ca-cert, checked to hold at least one certificate.
+    pub fn read_ca_cert(&self) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some(path) = &self.ca_cert else { return Ok(None) };
+        let pem = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        check_ca_cert(&pem).with_context(|| format!("reading {}", path.display()))?;
+        Ok(Some(pem))
+    }
+}
+
+/// Checks that PEM holds at least one certificate.
+fn check_ca_cert(pem: &[u8]) -> anyhow::Result<()> {
+    let certs = reqwest::Certificate::from_pem_bundle(pem)?;
+    if certs.is_empty() {
+        bail!("there's no PEM certificate in it");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -243,7 +267,12 @@ pub enum ClusterCommand {
 #[derive(Debug, Clone)]
 pub enum Target {
     Node(String),
-    Server { url: String, token: String },
+    Server {
+        url: String,
+        token: String,
+        /// A CA certificate (PEM) to trust as well as the system's.
+        ca: Option<Vec<u8>>,
+    },
 }
 
 impl Target {
@@ -260,6 +289,7 @@ impl Target {
             return Ok(Target::Server {
                 url: url.clone(),
                 token,
+                ca: global.read_ca_cert()?,
             });
         }
         let dir = config::dir(global.config_dir.as_deref())?;
@@ -276,9 +306,14 @@ impl Target {
                 config::Config::path(&dir).display()
             )
         })?;
+        let ca = match global.read_ca_cert()? {
+            Some(pem) => Some(pem),
+            None => c.ca_cert.clone().map(String::into_bytes),
+        };
         Ok(Target::Server {
             url: c.url.clone(),
             token: global.token.clone().unwrap_or_else(|| c.token.clone()),
+            ca,
         })
     }
 }
@@ -297,19 +332,22 @@ pub fn install_tls() {
 
 impl Client {
     pub fn new(target: &Target) -> anyhow::Result<Self> {
-        let (base, token) = match target {
-            Target::Node(url) => (url.as_str(), None),
-            Target::Server { url, token } => (url.as_str(), Some(token.clone())),
+        let (base, token, ca) = match target {
+            Target::Node(url) => (url.as_str(), None, None),
+            Target::Server { url, token, ca } => (url.as_str(), Some(token.clone()), ca.as_deref()),
         };
         let base = base.trim_end_matches('/').to_string();
         if !base.starts_with("http://") && !base.starts_with("https://") {
             bail!("the API must be an http:// or https:// URL, not {base}");
         }
         install_tls();
-        let http = reqwest::Client::builder()
+        let mut http = reqwest::Client::builder()
             .user_agent(format!("kiwi-nest/{}", kn_proto::VERSION))
-            .connect_timeout(Duration::from_secs(10))
-            .build()?;
+            .connect_timeout(Duration::from_secs(10));
+        if let Some(pem) = ca {
+            http = http.tls_certs_merge(reqwest::Certificate::from_pem_bundle(pem)?);
+        }
+        let http = http.build()?;
         Ok(Client { http, base, token })
     }
 
@@ -956,15 +994,19 @@ async fn cluster(global: &GlobalArgs, cmd: ClusterCommand) -> anyhow::Result<()>
                 .clone()
                 .context("pass the cluster's token with --token (or KIWI_NEST_TOKEN)")?;
             let url = url.trim_end_matches('/').to_string();
+            let ca = global.read_ca_cert()?;
             let target = Target::Server {
                 url: url.clone(),
                 token: token.clone(),
+                ca: ca.clone(),
             };
             let who = Client::new(&target)?
                 .whoami()
                 .await
                 .with_context(|| format!("checking the token with {url}"))?;
-            cfg.clusters.insert(name.clone(), config::Cluster { url, token });
+            let ca_cert = ca.map(|pem| String::from_utf8_lossy(&pem).into_owned());
+            cfg.clusters
+                .insert(name.clone(), config::Cluster { url, token, ca_cert });
             if make_current || cfg.current.is_none() {
                 cfg.current = Some(name.clone());
             }
@@ -1186,7 +1228,42 @@ mod tests {
             server: None,
             token: None,
             config_dir: Some(dir.to_path_buf()),
+            ca_cert: None,
         }
+    }
+
+    #[test]
+    fn a_clusters_ca_certificate_is_used_unless_another_is_given() {
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = config::Config::default();
+        cfg.clusters.insert(
+            "home".into(),
+            config::Cluster {
+                url: "https://kn.home.example".into(),
+                token: "kna_home".into(),
+                ca_cert: Some("-----BEGIN CERTIFICATE-----".into()),
+            },
+        );
+        cfg.current = Some("home".into());
+        cfg.save(d.path()).unwrap();
+        let Target::Server { ca, .. } = Target::resolve(&global(d.path())).unwrap() else {
+            panic!("a server")
+        };
+        assert_eq!(ca.as_deref(), Some(&b"-----BEGIN CERTIFICATE-----"[..]));
+        // A --ca-cert that isn't a certificate is refused, rather than ignored.
+        let bad = d.path().join("bad.pem");
+        std::fs::write(&bad, "not a certificate").unwrap();
+        let g = GlobalArgs {
+            ca_cert: Some(bad.clone()),
+            ..global(d.path())
+        };
+        let err = format!("{:#}", Target::resolve(&g).unwrap_err());
+        assert!(err.contains("no PEM certificate"), "{err}");
+        let g = GlobalArgs {
+            ca_cert: Some(d.path().join("missing.pem")),
+            ..global(d.path())
+        };
+        assert!(Target::resolve(&g).is_err());
     }
 
     #[test]
@@ -1218,6 +1295,7 @@ mod tests {
                 config::Cluster {
                     url: url.into(),
                     token: format!("kna_{name}"),
+                    ca_cert: None,
                 },
             );
         }
@@ -1226,7 +1304,7 @@ mod tests {
         assert!(err.contains("cluster use"), "{err}");
         cfg.current = Some("home".into());
         cfg.save(d.path()).unwrap();
-        let Target::Server { url, token } = Target::resolve(&global(d.path())).unwrap() else {
+        let Target::Server { url, token, .. } = Target::resolve(&global(d.path())).unwrap() else {
             panic!("a server")
         };
         assert_eq!((url.as_str(), token.as_str()), ("https://home.example", "kna_home"));

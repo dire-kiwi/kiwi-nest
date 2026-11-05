@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use kn_proto::agent::{CommandResult, JoinRequest, JoinResponse, PollRequest, PollResponse};
+use kn_proto::agent::{CommandResult, IngressToken, JoinRequest, JoinResponse, PollRequest, PollResponse};
 use kn_proto::api::ErrorBody;
 use tokio::io::AsyncWriteExt;
 
@@ -41,13 +41,21 @@ pub struct Link {
     token: String,
 }
 
-fn client() -> Result<reqwest::Client, LinkError> {
+/// A client for the server, trusting `ca_certs` (PEM) as well as the system's roots.
+fn client(ca_certs: Option<&[u8]>) -> Result<reqwest::Client, LinkError> {
     install_tls();
-    Ok(reqwest::Client::builder()
+    let mut b = reqwest::Client::builder()
         .user_agent(format!("kiwi-nest-node/{}", kn_proto::VERSION))
         .connect_timeout(Duration::from_secs(10))
-        .tcp_keepalive(Duration::from_secs(30))
-        .build()?)
+        .tcp_keepalive(Duration::from_secs(30));
+    if let Some(pem) = ca_certs {
+        let certs = reqwest::Certificate::from_pem_bundle(pem)?;
+        if certs.is_empty() {
+            return Err(LinkError::Other("the CA certificate file has no certificates".into()));
+        }
+        b = b.tls_certs_merge(certs);
+    }
+    Ok(b.build()?)
 }
 
 fn base(server: &str) -> Result<String, LinkError> {
@@ -74,22 +82,34 @@ async fn check(resp: reqwest::Response) -> Result<reqwest::Response, LinkError> 
 }
 
 impl Link {
-    pub fn new(server: &str, token: &str) -> Result<Link, LinkError> {
+    pub fn new(server: &str, token: &str, ca_certs: Option<&[u8]>) -> Result<Link, LinkError> {
         Ok(Link {
-            http: client()?,
+            http: client(ca_certs)?,
             base: base(server)?,
             token: token.to_string(),
         })
     }
 
     /// Swaps a join token for a node token.
-    pub async fn join(server: &str, req: &JoinRequest) -> Result<JoinResponse, LinkError> {
-        let resp = client()?
+    pub async fn join(server: &str, ca_certs: Option<&[u8]>, req: &JoinRequest) -> Result<JoinResponse, LinkError> {
+        let resp = client(ca_certs)?
             .post(format!("{}/agent/join", base(server)?))
             .json(req)
             .send()
             .await?;
         Ok(check(resp).await?.json().await?)
+    }
+
+    /// The node's ingress token, for a node that joined before the server gave them out.
+    pub async fn ingress_token(&self) -> Result<String, LinkError> {
+        let resp = self
+            .http
+            .get(format!("{}/agent/ingress-token", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        Ok(check(resp).await?.json::<IngressToken>().await?.ingress_token)
     }
 
     pub async fn poll(&self, req: &PollRequest, wait: Duration) -> Result<PollResponse, LinkError> {

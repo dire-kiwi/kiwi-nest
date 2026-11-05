@@ -23,6 +23,9 @@ pub struct Config {
 pub struct Cluster {
     pub url: String,
     pub token: String,
+    /// A CA certificate (PEM) to trust for the server, such as the ingress's internal CA.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
 }
 
 /// The directory of the CLI's configuration.
@@ -81,6 +84,7 @@ mod tests {
             Cluster {
                 url: "https://kn.example".into(),
                 token: "kna_x".into(),
+                ca_cert: None,
             },
         );
         c.current = Some("home".into());

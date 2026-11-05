@@ -1,7 +1,8 @@
 //! The node agent: the node's side of the link to the server (see [`kn_proto::agent`]).
 //!
-//! - **Joining.** The first start swaps a join token for the node's own token, kept in `STATE/agent.json` (mode
-//!   0600) with the server's URL, so later starts need neither.
+//! - **Joining.** The first start swaps a join token for the node's own token and its ingress token (which the
+//!   gateway expects from the ingress), kept in `STATE/agent.json` (mode 0600) with the server's URL, so later starts
+//!   need neither. A node that joined before the server gave out ingress tokens asks for its own.
 //! - **Polling.** One loop long-polls the server with a report of the node (its facts, its apps and volumes, the
 //!   changes it has finished, the commands it's running), and hands what comes back to the applier and to command
 //!   tasks. It never waits for either, so it never stalls. When a change finishes, a reporter sends a report at
@@ -55,8 +56,12 @@ pub struct AgentConfig {
     /// The one-time token to join with, the first time.
     pub join_token: Option<String>,
     pub labels: BTreeMap<String, String>,
-    /// The address the node's gateway listens on, as reported to the server.
+    /// The address the node's gateway listens on, on loopback, as reported to the server.
     pub gateway: String,
+    /// The address its gateway listens on for the ingress, as reported to the server; empty if none.
+    pub ingress: String,
+    /// Extra root certificates (PEM) to trust for the server, such as the ingress's internal CA.
+    pub ca_certs: Option<Vec<u8>>,
     /// The longest poll to ask for.
     pub poll_wait: Duration,
     /// The longest wait between attempts when the server can't be reached.
@@ -71,6 +76,8 @@ impl AgentConfig {
             join_token: None,
             labels: BTreeMap::new(),
             gateway: String::new(),
+            ingress: String::new(),
+            ca_certs: None,
             poll_wait: Duration::from_secs(25),
             max_backoff: Duration::from_secs(5),
         }
@@ -85,6 +92,9 @@ struct AgentFile {
     node_id: u64,
     name: String,
     token: String,
+    /// The token the ingress adds to its requests to the gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ingress_token: Option<String>,
     #[serde(default)]
     applied: Applied,
 }
@@ -231,6 +241,7 @@ impl Agent {
                 let facts = facts(&apps, &cfg).await;
                 let joined = Link::join(
                     &cfg.server,
+                    cfg.ca_certs.as_deref(),
                     &JoinRequest {
                         token,
                         name: cfg.name.clone(),
@@ -245,6 +256,7 @@ impl Agent {
                     node_id: joined.node_id,
                     name: joined.name,
                     token: joined.token,
+                    ingress_token: Some(joined.ingress_token).filter(|t| !t.is_empty()),
                     applied: Applied::default(),
                 };
                 let bytes = serde_json::to_vec_pretty(&f)?;
@@ -255,7 +267,18 @@ impl Agent {
             }
             Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", path.display())),
         };
-        let link = Link::new(&cfg.server, &file.token)?;
+        let link = Link::new(&cfg.server, &file.token, cfg.ca_certs.as_deref())?;
+        let mut file = file;
+        if file.ingress_token.is_none() && !cfg.ingress.is_empty() {
+            let t = link
+                .ingress_token()
+                .await
+                .with_context(|| format!("getting this node's ingress token from {}", cfg.server))?;
+            file.ingress_token = Some(t);
+            let bytes = serde_json::to_vec_pretty(&file)?;
+            let p = path.clone();
+            tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await??;
+        }
         Ok(Agent {
             inner: Arc::new(Inner {
                 apps,
@@ -286,6 +309,11 @@ impl Agent {
 
     pub fn node_id(&self) -> u64 {
         self.inner.node_id
+    }
+
+    /// The token the gateway expects from the ingress, if the server has given one.
+    pub fn ingress_token(&self) -> Option<String> {
+        self.inner.file.lock().expect("agent file").ingress_token.clone()
     }
 
     /// Polls the server, and reports finished changes, until `stop` is cancelled.
@@ -754,7 +782,7 @@ impl Inner {
 /// What the node is, now.
 async fn facts(apps: &Apps, cfg: &AgentConfig) -> NodeFacts {
     let node = apps.config().clone();
-    let (labels, gateway) = (cfg.labels.clone(), cfg.gateway.clone());
+    let (labels, gateway, ingress) = (cfg.labels.clone(), cfg.gateway.clone(), cfg.ingress.clone());
     tokio::task::spawn_blocking(move || {
         let (memory_bytes, memory_available_bytes) = meminfo().unwrap_or_default();
         let space = |p: &Path, btrfs: bool| {
@@ -783,6 +811,7 @@ async fn facts(apps: &Apps, cfg: &AgentConfig) -> NodeFacts {
                 .collect(),
             project_prefix: node.project_prefix.clone(),
             gateway,
+            ingress,
         }
     })
     .await

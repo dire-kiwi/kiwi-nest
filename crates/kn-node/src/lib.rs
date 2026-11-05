@@ -151,22 +151,39 @@ pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen:
     });
     tokio::try_join!(
         api::serve(listener, apps.clone(), stop.clone().cancelled_owned()),
-        gateway::serve(gw_listener, apps, stop.cancelled_owned()),
+        gateway::serve(gw_listener, apps, gateway::Access::Local, stop.cancelled_owned()),
     )?;
     tracing::info!("stopped; apps keep running");
     Ok(())
 }
 
+/// Refuses an address the ingress can't be told to reach: `0.0.0.0` or `::`.
+pub fn check_ingress_listen(addr: &SocketAddr) -> anyhow::Result<()> {
+    if addr.ip().is_unspecified() {
+        bail!(
+            "the gateway's ingress address must be the node's own address on the private network (such as \
+             10.0.0.5:7382), since the ingress is told to reach it there; not {addr}"
+        );
+    }
+    Ok(())
+}
+
 /// Runs a node joined to a server: its apps, the agent and its gateway, until interrupted.
 ///
-/// Prints `gateway on http://ADDR`, then `node NAME polling URL` once it has joined (on its first start, with
-/// `agent.join_token`). Apps keep running after the node exits, and the next node agent adopts them.
+/// Prints `gateway on http://ADDR`, then `ingress gateway on http://ADDR` if it listens for the ingress
+/// (`ingress_listen`, on the node's private address), then `node NAME polling URL` once it has joined (on its
+/// first start, with `agent.join_token`). Apps keep running after the node exits, and the next node agent adopts
+/// them.
 pub async fn run_agent(
     cfg: NodeConfig,
     mut agent: agent::AgentConfig,
     gateway_listen: SocketAddr,
+    ingress_listen: Option<SocketAddr>,
 ) -> anyhow::Result<()> {
     check_loopback(&gateway_listen)?;
+    if let Some(a) = &ingress_listen {
+        check_ingress_listen(a)?;
+    }
     let apps = apps::Apps::open(cfg).await?;
     let gw_listener = tokio::net::TcpListener::bind(gateway_listen)
         .await
@@ -174,10 +191,37 @@ pub async fn run_agent(
     let gw_addr = gw_listener.local_addr()?;
     println!("gateway on http://{gw_addr}");
     agent.gateway = gw_addr.to_string();
+    let ingress_listener = match ingress_listen {
+        Some(a) => {
+            let l = tokio::net::TcpListener::bind(a)
+                .await
+                .with_context(|| format!("listening on {a}"))?;
+            let addr = l.local_addr()?;
+            println!("ingress gateway on http://{addr}");
+            agent.ingress = addr.to_string();
+            Some(l)
+        }
+        None => None,
+    };
     let server = agent.server.clone();
     let agent = agent::Agent::start(apps.clone(), agent).await?;
     println!("node {} polling {server}", agent.name());
     tracing::info!(node = agent.name(), server, gateway = %gw_addr, "node agent running");
+    let ingress = match ingress_listener {
+        Some(l) => {
+            let token = agent.ingress_token().context(
+                "the server gave this node no ingress token, so its gateway can't take requests from the ingress",
+            )?;
+            Some((l, gateway::Access::Ingress(token.into())))
+        }
+        None => {
+            tracing::warn!(
+                "the gateway isn't listening for the ingress (--ingress-listen), so the ingress can't reach this \
+                 node's apps"
+            );
+            None
+        }
+    };
     let stop = tokio_util::sync::CancellationToken::new();
     tokio::spawn({
         let stop = stop.clone();
@@ -187,9 +231,21 @@ pub async fn run_agent(
         }
     });
     let polling = agent.run(stop.clone());
-    let gateway = gateway::serve(gw_listener, apps, stop.cancelled_owned());
-    let ((), served) = tokio::join!(polling, gateway);
+    let gateway = gateway::serve(
+        gw_listener,
+        apps.clone(),
+        gateway::Access::Local,
+        stop.clone().cancelled_owned(),
+    );
+    let for_ingress = async {
+        match ingress {
+            Some((l, access)) => gateway::serve(l, apps, access, stop.clone().cancelled_owned()).await,
+            None => Ok(()),
+        }
+    };
+    let ((), served, served_ingress) = tokio::join!(polling, gateway, for_ingress);
     served?;
+    served_ingress?;
     tracing::info!("stopped; apps keep running");
     Ok(())
 }

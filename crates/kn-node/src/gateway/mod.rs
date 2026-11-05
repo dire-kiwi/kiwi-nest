@@ -14,8 +14,12 @@
 //! - **Failures.** A connection to the app that fails gets `503`, isn't retried, and makes the next request check
 //!   the app (and start it if needed). A start that failed is refused for a cooldown.
 //!
-//! For now the gateway listens on loopback with no authentication; step 6 puts it on the private address behind
-//! the ingress, with the ingress token.
+//! - **Access.** The gateway listens on loopback, where anything on the node may use it, and (joined to a server)
+//!   on the node's private address for the ingress ([`Access`]). There every request must carry the node's ingress
+//!   token in [`INGRESS_HEADER`], or it's refused with `403` before anything else, so a machine on the private
+//!   network can't skip the ingress's basic auth or wake an app. The token is removed before the request goes on.
+//!   Forwarding headers (`X-Forwarded-For` and the like) are passed on only from requests that carried the token,
+//!   since the ingress sets them; on any other request they're replaced with what the gateway saw.
 
 pub mod gate;
 pub mod pages;
@@ -37,6 +41,7 @@ use tokio_util::sync::WaitForCancellationFutureOwned;
 
 use crate::apps::Apps;
 use gate::{Gate, Lease, Phase};
+use kn_proto::agent::INGRESS_HEADER;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -60,10 +65,81 @@ const HOP_BY_HOP: [HeaderName; 7] = [
     header::UPGRADE,
 ];
 
-/// Serves the gateway on `listener` until `shutdown` completes. Open connections are dropped then.
+/// Headers that say where a request came from, which only the ingress is believed about.
+const FORWARDING: [HeaderName; 6] = [
+    HeaderName::from_static("forwarded"),
+    HeaderName::from_static("x-forwarded-for"),
+    HeaderName::from_static("x-forwarded-host"),
+    HeaderName::from_static("x-forwarded-proto"),
+    HeaderName::from_static("x-forwarded-port"),
+    HeaderName::from_static("x-real-ip"),
+];
+
+/// Who may use a listener of the gateway.
+#[derive(Clone)]
+pub enum Access {
+    /// On loopback: anything on the node. Nothing vouches for forwarding headers, so they're replaced.
+    Local,
+    /// On the node's private address, for the ingress: every request must carry this token.
+    Ingress(std::sync::Arc<str>),
+}
+
+/// Compares two byte strings in time that depends only on their lengths.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// What a listener's access makes of a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admitted {
+    /// It carried the ingress token: its forwarding headers are the ingress's.
+    FromIngress,
+    /// On loopback, without the token: nothing vouches for its forwarding headers.
+    Local,
+    Refused,
+}
+
+/// Checks a request against the listener's access, and removes the ingress token from it.
+fn admit<B>(access: &Access, req: &mut Request<B>) -> Admitted {
+    let given: Vec<HeaderValue> = match req.headers_mut().entry(INGRESS_HEADER) {
+        header::Entry::Occupied(e) => e.remove_entry_mult().1.collect(),
+        header::Entry::Vacant(_) => Vec::new(),
+    };
+    match access {
+        Access::Ingress(token) => match given.as_slice() {
+            [one] if same(one.as_bytes(), token.as_bytes()) => Admitted::FromIngress,
+            _ => Admitted::Refused,
+        },
+        Access::Local => Admitted::Local,
+    }
+}
+
+/// Replaces a request's forwarding headers with what the gateway saw: the peer's address, plain HTTP, and the
+/// Host.
+fn own_forwarding<B>(req: &mut Request<B>, peer: std::net::SocketAddr) {
+    let host = req.headers().get(header::HOST).cloned();
+    let h = req.headers_mut();
+    for name in &FORWARDING {
+        h.remove(name);
+    }
+    if let Ok(v) = HeaderValue::from_str(&peer.ip().to_string()) {
+        h.insert(HeaderName::from_static("x-forwarded-for"), v);
+    }
+    h.insert(
+        HeaderName::from_static("x-forwarded-proto"),
+        HeaderValue::from_static("http"),
+    );
+    if let Some(host) = host {
+        h.insert(HeaderName::from_static("x-forwarded-host"), host);
+    }
+}
+
+/// Serves the gateway on `listener`, to those `access` allows, until `shutdown` completes. Open connections are
+/// dropped then.
 pub async fn serve(
     listener: TcpListener,
     apps: Apps,
+    access: Access,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let mut connections = tokio::task::JoinSet::new();
@@ -82,11 +158,23 @@ pub async fn serve(
             () = &mut shutdown => break,
         };
         let _ = stream.set_nodelay(true);
-        let apps = apps.clone();
+        let (apps, access) = (apps.clone(), access.clone());
         connections.spawn(async move {
-            let service = hyper::service::service_fn(move |req| {
-                let apps = apps.clone();
-                async move { Ok::<_, Infallible>(handle(&apps, req).await) }
+            let service = hyper::service::service_fn(move |mut req| {
+                let (apps, access) = (apps.clone(), access.clone());
+                async move {
+                    match admit(&access, &mut req) {
+                        Admitted::FromIngress => {}
+                        Admitted::Local => own_forwarding(&mut req, peer),
+                        Admitted::Refused => {
+                            return Ok::<_, Infallible>(text(
+                                StatusCode::FORBIDDEN,
+                                "this address only takes requests from the cluster's ingress\n",
+                            ));
+                        }
+                    }
+                    Ok::<_, Infallible>(handle(&apps, req).await)
+                }
             });
             let conn = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
