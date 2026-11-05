@@ -12,4 +12,6 @@ kiwi-nest is being built: see [docs/design.md](docs/design.md) for the design an
 subvolumes and a gateway on loopback that starts stopped apps for their requests and stops idle ones. The CLI
 (`kiwi-nest deploy|list|inspect|logs|suspend|resume|delete`, `deploy --from` for previews, `kiwi-nest volume …` for
 shared volumes, `kiwi-nest token …`, `kiwi-nest cluster …`) goes through the server, or to a standalone node
-(`kiwi-nest node --standalone`). `scripts/dev-cluster.sh` runs a server and two nodes on one machine.
+(`kiwi-nest node --standalone`). The server also serves a web UI (`kiwi-nest user add NAME`, then log in at the
+server's address) showing the nodes, nests, apps, volumes and backups, with suspend, resume, logs, back up now and
+cordon. `scripts/dev-cluster.sh` runs a server and two nodes on one machine.

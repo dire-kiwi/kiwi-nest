@@ -418,7 +418,10 @@ async fn tick(s: &Server) -> Result<()> {
                 targets: targets.clone(),
                 full: false,
             };
-            let r = match s.command_with(node_id, &node, action, s.cfg.backup_timeout).await {
+            let r = match s
+                .command_with(node_id, &node, action, "schedule", s.cfg.backup_timeout)
+                .await
+            {
                 Ok(o) => crate::api::result::<BackupResult>(o),
                 Err(e) => Err(e),
             };

@@ -19,6 +19,7 @@ kn-install = { path = "crates/kn-install" }
 kn-server = { path = "crates/kn-server" }
 
 anyhow = "1"
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "password-hash"] }
 axum = "0.8"
 base64 = "0.23"
 bytes = "1"
@@ -36,6 +37,8 @@ getrandom = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls-no-provider"] }
 rusqlite = { version = "0.40", features = ["backup", "bundled", "fallible_uint"] }
 rusty-s3 = "0.11"
+# The web UI, built into web/dist (or a page saying it wasn't built), embedded in the server.
+rust-embed = { version = "8", features = ["interpolate-folder-path", "mime-guess"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

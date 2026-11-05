@@ -15,8 +15,9 @@
 //! - [`nodes`]: nodes, their facts and their last reports.
 //! - [`apps`]: apps and shared volumes, the desired state of each node, and whether a change is done.
 //! - [`nests`]: which nest each app and shared volume is in, and the node each nest is pinned to.
-//! - [`commands`]: one-off commands for nodes.
+//! - [`commands`]: one-off commands for nodes, kept as each app's history.
 //! - [`registry`]: what the image registry's garbage collection needs: the images apps use, pushes and releases.
+//! - [`users`]: the web UI's users and their sessions.
 
 pub mod apps;
 pub mod commands;
@@ -24,6 +25,7 @@ pub mod nests;
 pub mod nodes;
 pub mod registry;
 pub mod tokens;
+pub mod users;
 
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -68,6 +70,12 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         sql: MIGRATION_5,
         then: None,
+    },
+    // 6: the web UI: its users and their sessions; commands record what they act on and who asked, for each app's
+    // history.
+    Migration {
+        sql: MIGRATION_6,
+        then: Some(commands::backfill),
     },
 ];
 
@@ -229,6 +237,33 @@ const MIGRATION_5: &str = r#"
     -- SHA-256 of the node's read-only registry credential (`knr_…`).
     ALTER TABLE nodes ADD COLUMN registry_hash TEXT;
     CREATE INDEX nodes_by_registry_hash ON nodes (registry_hash);
+    "#;
+
+// 6: the web UI's users and sessions, and each command's target and caller.
+const MIGRATION_6: &str = r#"
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        -- Argon2id, as a PHC string.
+        password_hash TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        password_changed_at INTEGER NOT NULL,
+        last_login_at INTEGER
+    );
+    CREATE TABLE sessions (
+        -- SHA-256 of the session's token, in hex. The token itself is only in the browser's cookie.
+        hash TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users (id),
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER NOT NULL
+    );
+    CREATE INDEX sessions_by_user ON sessions (user_id);
+    -- What a command acts on (`app` or `volume`, and its name), and who asked: `user NAME`, `token NAME` or
+    -- `schedule`. Filled in for earlier commands from their actions, with an empty caller.
+    ALTER TABLE commands ADD COLUMN target_kind TEXT;
+    ALTER TABLE commands ADD COLUMN target TEXT;
+    ALTER TABLE commands ADD COLUMN caller TEXT NOT NULL DEFAULT '';
+    CREATE INDEX commands_by_target ON commands (target_kind, target, id);
     "#;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;

@@ -41,7 +41,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::{ErrorBody, LogsQuery, VolumeInfo};
+use crate::api::{ErrorBody, LogsQuery, Space, VolumeInfo};
 use crate::backup::{Kind, Restore};
 use crate::state::AppStatus;
 
@@ -203,6 +203,36 @@ pub struct Report {
     /// arrived late.
     #[serde(default)]
     pub serial: u64,
+    /// What its volumes take, once it has measured them (each app's volumes are in [`AppReport::space`], each shared
+    /// volume's in its [`VolumeInfo`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/// What a node's subvolumes take on disk, measured now and then (`--usage-interval`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    /// Unix seconds.
+    pub measured_at: u64,
+    /// The sets of subvolumes that can share data (an app, the apps made `--from` it, the shared volumes they mount
+    /// and the snapshots of those), each with the space it takes counting shared data once. Each set is within one
+    /// nest.
+    #[serde(default)]
+    pub groups: Vec<UsageGroup>,
+    /// The read-only snapshot sets kept as the parents of incremental backups.
+    #[serde(default)]
+    pub backups: Space,
+}
+
+/// A set of subvolumes that can share data, in [`Usage`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageGroup {
+    #[serde(default)]
+    pub apps: Vec<String>,
+    #[serde(default)]
+    pub volumes: Vec<String>,
+    /// The space its subvolumes take, counting data they share with one another once.
+    pub bytes: u64,
 }
 
 /// One app on a node.
@@ -223,6 +253,19 @@ pub struct AppReport {
     /// It's being started, or deployed, or looked at after the node agent started, so it may be pulling images.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub starting: bool,
+    /// When a request through the gateway last began or ended (Unix seconds), if one has since the node started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_request_at: Option<u64>,
+    /// Requests through the gateway whose responses haven't finished.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub open_requests: u64,
+    /// The space each of its named volumes takes, as last measured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub space: BTreeMap<String, Space>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// The changes a node has finished applying, by app and by shared volume.

@@ -260,7 +260,7 @@ async fn upgrade(s: &Server, n: &Node) {
         size: offer.size,
     };
     let answer = s
-        .command_with(n.id, &n.name, action, s.cfg.upgrade_timeout)
+        .command_with(n.id, &n.name, action, "upgrade", s.cfg.upgrade_timeout)
         .await
         .and_then(crate::api::result::<UpgradeAnswer>);
     match answer {

@@ -5,7 +5,7 @@
 //! checking that it's ready and taking its lease.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -54,6 +54,8 @@ struct State {
     leases: u64,
     /// When the last lease ended, or the app became ready.
     last_active: Instant,
+    /// When a lease was last taken or ended: the app's last activity, as the UI shows it.
+    last_request: Option<SystemTime>,
     /// Cancelled to break every open lease.
     cancel: CancellationToken,
 }
@@ -67,6 +69,7 @@ impl Gate {
                 idle_timeout,
                 leases: 0,
                 last_active: Instant::now(),
+                last_request: None,
                 cancel: CancellationToken::new(),
             }),
             phase: watch::Sender::new(phase),
@@ -115,6 +118,7 @@ impl Gate {
             return Err(phase);
         }
         s.leases += 1;
+        s.last_request = Some(SystemTime::now());
         Ok(Lease {
             gate: self.clone(),
             port: s.port,
@@ -124,6 +128,12 @@ impl Gate {
 
     pub fn open_leases(&self) -> u64 {
         self.lock().leases
+    }
+
+    /// When a request last began or ended, if one has since the gate was made, and how many are open.
+    pub fn activity(&self) -> (Option<SystemTime>, u64) {
+        let s = self.lock();
+        (s.last_request, s.leases)
     }
 
     /// Moves a stopped app (or one whose cooldown is over) to `Starting`; whoever gets `true` must start it.
@@ -209,6 +219,7 @@ impl Drop for Lease {
         let mut s = self.gate.lock();
         s.leases -= 1;
         s.last_active = Instant::now();
+        s.last_request = Some(SystemTime::now());
     }
 }
 
@@ -223,7 +234,15 @@ mod tests {
         let later = Instant::now() + Duration::from_secs(1);
         assert!(!g.begin_idle_stop(later), "a lease is open");
         assert_eq!(g.begin_suspend(), Err(1));
+        let (began, open) = g.activity();
+        assert_eq!(open, 1);
         drop(lease);
+        let (ended, open) = g.activity();
+        assert_eq!(open, 0);
+        assert!(
+            began.is_some() && ended >= began,
+            "a lease's start and end are activity"
+        );
         assert_eq!(g.open_leases(), 0);
         assert!(
             !g.begin_idle_stop(Instant::now()),

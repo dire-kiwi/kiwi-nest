@@ -61,6 +61,8 @@ pub struct NodeConfig {
     pub idle_check_interval: Duration,
     /// A standalone node's backup targets (a node joined to a server gets the server's).
     pub backup_targets: Option<PathBuf>,
+    /// How often the volumes' space is measured; zero never.
+    pub usage_interval: Duration,
 }
 
 impl NodeConfig {
@@ -84,6 +86,7 @@ impl NodeConfig {
             starting_page_after: Duration::from_secs(1),
             idle_check_interval: Duration::from_secs(1),
             backup_targets: None,
+            usage_interval: Duration::from_secs(300),
         }
     }
 
@@ -143,6 +146,7 @@ pub fn check_loopback(addr: &SocketAddr) -> anyhow::Result<()> {
 pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen: SocketAddr) -> anyhow::Result<()> {
     check_loopback(&listen)?;
     check_loopback(&gateway_listen)?;
+    let usage_interval = cfg.usage_interval;
     let apps = apps::Apps::open(cfg).await?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -162,6 +166,7 @@ pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen:
             stop.cancel();
         }
     });
+    apps.spawn_usage(usage_interval, stop.clone());
     tokio::try_join!(
         api::serve(listener, apps.clone(), stop.clone().cancelled_owned()),
         gateway::serve(gw_listener, apps, gateway::Access::Local, stop.cancelled_owned()),
@@ -204,6 +209,7 @@ pub async fn run_agent(
     // A node the server forgot finishes taking its apps down before it opens (and adopts) them.
     cfg.validate()?;
     agent::prepare(&cfg, &runtime::Docker::for_node(&cfg), agent.join_token.is_some()).await?;
+    let usage_interval = cfg.usage_interval;
     let apps = apps::Apps::open(cfg).await?;
     let gw_listener = tokio::net::TcpListener::bind(gateway_listen)
         .await
@@ -250,6 +256,7 @@ pub async fn run_agent(
             stop.cancel();
         }
     });
+    apps.spawn_usage(usage_interval, stop.clone());
     let polling = async {
         let r = agent.run(stop.clone()).await;
         // Forgotten, or restarting into a new release: the gateways stop too.

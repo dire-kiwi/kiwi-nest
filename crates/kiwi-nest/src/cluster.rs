@@ -199,6 +199,9 @@ pub struct NodeArgs {
     /// A standalone node's backup targets, as for the server (a node joined to a server uses the server's).
     #[arg(long, env = "KIWI_NEST_BACKUP_TARGETS", value_name = "FILE")]
     pub backup_targets: Option<PathBuf>,
+    /// How often to measure the space each volume and snapshot takes (reading every file's extents); 0 never.
+    #[arg(long, default_value = "5m")]
+    pub usage_interval: String,
 }
 
 #[derive(clap::Subcommand)]
@@ -424,6 +427,7 @@ pub async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result
     cfg.start_cooldown = duration("--start-cooldown", &args.start_cooldown)?;
     cfg.image_grace = duration("--image-grace", &args.image_grace)?;
     cfg.prune_interval = duration("--prune-interval", &args.prune_interval)?;
+    cfg.usage_interval = duration("--usage-interval", &args.usage_interval)?;
     let Some(server) = server else {
         cfg.backup_targets = args.backup_targets.map(absolute).transpose()?;
         if args.ingress_listen.is_some() {

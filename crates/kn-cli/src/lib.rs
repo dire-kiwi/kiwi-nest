@@ -21,9 +21,10 @@ use anyhow::{Context, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use kn_proto::api::{
-    Accepted, AppInfo, AppSummary, ChangeStatus, CreateToken, CreatedToken, DeleteQuery, DeployDirectory, DeployQuery,
-    ErrorBody, ForgetQuery, Forgot, GcQuery, GcReport, LabelRequest, LogsQuery, NestInfo, NodeInfo, PruneQuery,
-    PruneReport, RegistryInfo, TokenInfo, TokenKind, VolumeInfo, VolumeQuery, WaitQuery, WhoAmI,
+    Accepted, AppInfo, AppSummary, ChangeStatus, CreateToken, CreateUser, CreatedToken, DeleteQuery, DeployDirectory,
+    DeployQuery, ErrorBody, ForgetQuery, Forgot, GcQuery, GcReport, LabelRequest, LogsQuery, NestInfo, NodeInfo,
+    PruneQuery, PruneReport, RegistryInfo, SetPassword, TokenInfo, TokenKind, UserInfo, VolumeInfo, VolumeQuery,
+    WaitQuery, WhoAmI,
 };
 use kn_proto::backup::{BackupInfo, BackupQuery, BackupResult, ListQuery};
 
@@ -196,6 +197,9 @@ pub enum Command {
     /// Tokens for the CLI, CI and joining nodes (admin only).
     #[command(subcommand)]
     Token(TokenCommand),
+    /// The web UI's users, who log in with a password and may do what an admin token may (admin only).
+    #[command(subcommand)]
+    User(UserCommand),
     /// The clusters this CLI knows, in ~/.config/kiwi-nest.
     #[command(subcommand)]
     Cluster(ClusterCommand),
@@ -447,6 +451,33 @@ pub enum TokenCommand {
     },
     /// Revoke a token by its ID.
     Revoke { id: u64 },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum UserCommand {
+    /// Add a user of the web UI, asking for their password (at least 10 characters).
+    Add {
+        /// Lowercase letters, digits, `-`, `_` and `.`.
+        name: String,
+        /// Read the password from the first line of standard input, rather than asking for it.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// List the users.
+    List {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a user's password, which logs them out everywhere.
+    Passwd {
+        name: String,
+        /// Read the password from the first line of standard input, rather than asking for it.
+        #[arg(long)]
+        password_stdin: bool,
+    },
+    /// Delete a user, and end their sessions.
+    Delete { name: String },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -1087,6 +1118,7 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
         Command::Volume(cmd) => volume(&client, cmd).await?,
         Command::Nest(cmd) => nest(&client, cmd).await?,
         Command::Token(cmd) => token(&client, cmd).await?,
+        Command::User(cmd) => user(&client, cmd).await?,
         Command::Backup(cmd) => backup(&client, cmd).await?,
         Command::Cluster(_) => unreachable!(),
     }
@@ -1787,6 +1819,112 @@ async fn registry(client: &Client, cmd: RegistryCommand) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn user(client: &Client, cmd: UserCommand) -> anyhow::Result<()> {
+    server_only(client, "`user`")?;
+    match cmd {
+        UserCommand::Add { name, password_stdin } => {
+            let password = new_password(&format!("Password for {name}: "), password_stdin)?;
+            let _: UserInfo = client
+                .json(client.req(reqwest::Method::POST, "/users").json(&CreateUser {
+                    name: name.clone(),
+                    password,
+                }))
+                .await?;
+            println!("added user {name}");
+        }
+        UserCommand::List { json } => {
+            let users: Vec<UserInfo> = client.json(client.get("/users")).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&users)?);
+            } else {
+                print_table(
+                    &["NAME", "CREATED", "LAST LOGIN"],
+                    users
+                        .iter()
+                        .map(|u| {
+                            vec![
+                                u.name.clone(),
+                                u.created_at.clone(),
+                                u.last_login_at.clone().unwrap_or_else(|| "never".into()),
+                            ]
+                        })
+                        .collect(),
+                );
+            }
+        }
+        UserCommand::Passwd { name, password_stdin } => {
+            let password = new_password(&format!("New password for {name}: "), password_stdin)?;
+            client
+                .send(
+                    client
+                        .req(reqwest::Method::PUT, &format!("/users/{name}/password"))
+                        .json(&SetPassword { password }),
+                )
+                .await?;
+            println!("changed {name}'s password; their sessions have ended");
+        }
+        UserCommand::Delete { name } => {
+            client
+                .send(client.req(reqwest::Method::DELETE, &format!("/users/{name}")))
+                .await?;
+            println!("deleted user {name}");
+        }
+    }
+    Ok(())
+}
+
+/// A new password: the first line of standard input, or asked for twice on the terminal without echoing it.
+fn new_password(prompt: &str, from_stdin: bool) -> anyhow::Result<String> {
+    use std::io::{BufRead, IsTerminal};
+    if from_stdin || !std::io::stdin().is_terminal() {
+        if !from_stdin {
+            bail!("standard input isn't a terminal: pass --password-stdin to read the password from it");
+        }
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        let p = line.trim_end_matches(['\n', '\r']).to_string();
+        if p.is_empty() {
+            bail!("no password on standard input");
+        }
+        return Ok(p);
+    }
+    let first = read_hidden(prompt)?;
+    let again = read_hidden("Again: ")?;
+    if first != again {
+        bail!("the passwords didn't match");
+    }
+    Ok(first)
+}
+
+/// Reads a line from the terminal with echo off.
+fn read_hidden(prompt: &str) -> anyhow::Result<String> {
+    use std::io::BufRead;
+    use std::os::fd::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    // SAFETY: a zeroed termios is valid, and only used once `tcgetattr` fills it.
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is standard input, a terminal; `old` is a valid out-pointer.
+    if unsafe { libc::tcgetattr(fd, &mut old) } != 0 {
+        bail!(
+            "can't read the terminal's settings: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let mut quiet = old;
+    quiet.c_lflag &= !libc::ECHO;
+    quiet.c_lflag |= libc::ECHONL;
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+    // SAFETY: as above; the settings are put back below, whatever the read does.
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+    // SAFETY: restores what `tcgetattr` returned.
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &old) };
+    read?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
 /// Says what forgetting a node does, and asks for its name to go ahead.
 fn confirm_forget(plan: &Forgot) -> anyhow::Result<()> {
     use std::io::{BufRead, IsTerminal};
@@ -1837,7 +1975,7 @@ async fn nest(client: &Client, cmd: NestCommand) -> anyhow::Result<()> {
                 return Ok(());
             }
             print_table(
-                &["NAME", "NODE", "APPS", "VOLUMES", "MEMORY", "PLACED"],
+                &["NAME", "NODE", "APPS", "VOLUMES", "MEMORY", "DISK", "PLACED"],
                 nests
                     .iter()
                     .map(|n| {
@@ -1851,6 +1989,7 @@ async fn nest(client: &Client, cmd: NestCommand) -> anyhow::Result<()> {
                             n.apps.join(","),
                             n.volumes.join(","),
                             gib(n.memory_bytes),
+                            n.disk_bytes.map_or_else(|| "-".into(), |b| size(Some(b))),
                             n.placement.clone(),
                         ]
                     })

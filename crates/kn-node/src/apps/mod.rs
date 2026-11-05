@@ -28,6 +28,7 @@ mod lifecycle;
 mod shared;
 #[cfg(test)]
 mod tests;
+pub mod usage;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::BuildHasher;
@@ -305,6 +306,10 @@ struct Inner {
     targets: std::sync::RwLock<Arc<dyn TargetSource>>,
     /// Held while an app or volume is backed up, so its backups (and their snapshots) never overlap.
     backup_locks: Mutex<HashMap<BackupKey, Arc<AsyncMutex<()>>>>,
+    /// The last measurement of the volumes' space; see [`usage`].
+    usage: Mutex<Option<Arc<usage::Measured>>>,
+    /// Notified when the state changes, so the space is measured again soon.
+    usage_changed: tokio::sync::Notify,
 }
 
 /// An app or a shared volume, for its backup lock.
@@ -334,6 +339,23 @@ impl Inner {
 
     fn gate(&self, name: &str) -> Option<Arc<Gate>> {
         self.gates().by_name.get(name).cloned()
+    }
+
+    /// When a request to the app last began or ended (Unix seconds), and how many are open.
+    fn activity(&self, name: &str) -> (Option<u64>, u64) {
+        let Some((last, open)) = self.gate(name).map(|g| g.activity()) else {
+            return (None, 0);
+        };
+        let secs = last
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        (secs, open)
+    }
+
+    /// The space each of an app's named volumes took when last measured.
+    fn app_space(&self, name: &str) -> BTreeMap<String, kn_proto::api::Space> {
+        let usage = self.usage.lock().expect("usage lock").clone();
+        usage.and_then(|u| u.apps.get(name).cloned()).unwrap_or_default()
     }
 
     /// Routes `domain` to the app's gate, creating it (busy) if needed.
@@ -406,6 +428,8 @@ impl Inner {
     async fn persist(&self, state: &StateFile) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(state).map_err(|e| AppsError::Internal(e.into()))?;
         let path = self.cfg.state_dir.join("state.json");
+        // Something changed (a deploy, a delete, a volume made or loaded): measure the space again soon.
+        self.usage_changed.notify_one();
         blocking(move || write_atomic(&path, &bytes))
             .await?
             .map_err(|e| AppsError::Internal(e.into()))
@@ -545,6 +569,8 @@ impl Apps {
                 closed: std::sync::atomic::AtomicBool::new(false),
                 targets: std::sync::RwLock::new(targets),
                 backup_locks: Mutex::new(HashMap::new()),
+                usage: Mutex::new(None),
+                usage_changed: tokio::sync::Notify::new(),
             }),
         };
         for r in paused {
@@ -760,17 +786,25 @@ impl Apps {
             .collect();
         Ok(records
             .into_iter()
-            .map(|r| AppSummary {
-                containers: live.get(&r.project).cloned().unwrap_or_else(|| "absent".into()),
-                name: r.name,
-                status: r.status,
-                generation: r.generation,
-                domain: r.domain,
-                port: r.port,
-                updated_at: rfc3339(r.updated_at),
-                node: None,
-                nest: None,
-                pending: None,
+            .map(|r| {
+                let (last, open) = self.inner.activity(&r.name);
+                AppSummary {
+                    containers: live.get(&r.project).cloned().unwrap_or_else(|| "absent".into()),
+                    space: self.inner.app_space(&r.name),
+                    last_request_at: last.map(rfc3339),
+                    open_requests: open,
+                    idle_timeout_secs: r.idle_timeout_secs,
+                    error: r.error,
+                    name: r.name,
+                    status: r.status,
+                    generation: r.generation,
+                    domain: r.domain,
+                    port: r.port,
+                    updated_at: rfc3339(r.updated_at),
+                    node: None,
+                    nest: None,
+                    pending: None,
+                }
             })
             .collect())
     }
@@ -797,22 +831,28 @@ impl Apps {
         };
         records
             .into_iter()
-            .map(|r| kn_proto::agent::AppReport {
-                starting: self
-                    .inner
-                    .gate(&r.name)
-                    .is_some_and(|g| matches!(g.phase(), Phase::Starting | Phase::Busy)),
-                containers: match &live {
-                    Some(l) => l.get(&r.project).cloned().unwrap_or_else(|| "absent".into()),
-                    None => "unknown".into(),
-                },
-                name: r.name,
-                status: r.status,
-                generation: r.generation,
-                error: r.error,
-                domain: r.domain,
-                port: r.port,
-                bundle_digest: r.bundle_digest,
+            .map(|r| {
+                let (last_request_at, open_requests) = self.inner.activity(&r.name);
+                kn_proto::agent::AppReport {
+                    starting: self
+                        .inner
+                        .gate(&r.name)
+                        .is_some_and(|g| matches!(g.phase(), Phase::Starting | Phase::Busy)),
+                    last_request_at,
+                    open_requests,
+                    space: self.inner.app_space(&r.name),
+                    containers: match &live {
+                        Some(l) => l.get(&r.project).cloned().unwrap_or_else(|| "absent".into()),
+                        None => "unknown".into(),
+                    },
+                    name: r.name,
+                    status: r.status,
+                    generation: r.generation,
+                    error: r.error,
+                    domain: r.domain,
+                    port: r.port,
+                    bundle_digest: r.bundle_digest,
+                }
             })
             .collect()
     }
@@ -1896,7 +1936,8 @@ impl App<'_> {
     }
 
     async fn info(&self, r: AppRecord) -> Result<AppInfo> {
-        let open_requests = self.inner.gate(self.name).map_or(0, |g| g.open_leases());
+        let (last_request_at, open_requests) = self.inner.activity(self.name);
+        let space = self.inner.app_space(self.name);
         let containers = self
             .inner
             .runtime
@@ -1940,6 +1981,8 @@ impl App<'_> {
             updated_at: rfc3339(r.updated_at),
             containers,
             open_requests,
+            last_request_at: last_request_at.map(rfc3339),
+            space,
             node: None,
             nest: None,
             placement: None,

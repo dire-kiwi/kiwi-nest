@@ -45,11 +45,24 @@
 //! | `GET /registry` | | [`RegistryInfo`] |
 //! | `POST /registry/gc?` [`GcQuery`] | | [`GcReport`] (admin) |
 //! | `GET /registry/auth` | | `200`, `401` or `403`: the ingress asks it about every request to the registry |
+//! | `GET /apps/{name}/commands?` [`CommandsQuery`] | | `Vec<`[`CommandInfo`]`>`, newest first |
+//! | `POST /session` | [`Login`] | [`SessionInfo`], and the session cookie ([`SESSION_COOKIE`]) |
+//! | `GET /session` | | [`SessionInfo`] |
+//! | `DELETE /session` | | `204 No Content`, and the cookie cleared |
+//! | `GET /users` | | `Vec<`[`UserInfo`]`>` |
+//! | `POST /users` | [`CreateUser`] | [`UserInfo`] |
+//! | `PUT /users/{name}/password` | [`SetPassword`] | `204 No Content` |
+//! | `DELETE /users/{name}` | | `204 No Content` |
 //! | `GET /upgrade` | | [`UpgradeStatus`] (admin): the server's release rolling out to the nodes |
 //! | `POST /upgrade` | | [`UpgradeStatus`] (admin): try the nodes again, after a failure halted the rollout |
 //!
 //! The server refuses a CLI older than itself with `426 Upgrade Required`: the CLI sends its version in its
 //! `User-Agent` (see [`crate::version`]).
+//!
+//! **The web UI's users** log in with a password (`POST /session`), and the session cookie then stands for an admin
+//! token on every route but the agent link's. A request with the cookie must come from the server's own origin
+//! (`Origin` and `Sec-Fetch-Site` say so), and one that changes anything must be JSON (`Content-Type:
+//! application/json`), so no other site can make one; see the design's "Web UI".
 
 use std::collections::BTreeMap;
 
@@ -189,6 +202,15 @@ pub struct LogsQuery {
     pub service: Option<String>,
 }
 
+/// The disk space a subvolume takes, as its node last measured it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Space {
+    /// What its files take on disk, including data it shares with snapshots of it (or that it's a snapshot of).
+    pub bytes: u64,
+    /// What only it holds: about what deleting it would free.
+    pub exclusive_bytes: u64,
+}
+
 /// One app in `GET /apps`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSummary {
@@ -203,6 +225,21 @@ pub struct AppSummary {
     pub containers: String,
     /// When the app was last deployed, as RFC 3339.
     pub updated_at: String,
+    /// Why its last deploy or start failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Seconds without requests before the app is stopped; 0 means always on.
+    #[serde(default)]
+    pub idle_timeout_secs: u64,
+    /// When a request through the gateway last began or ended (RFC 3339); none since the node started, if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_request_at: Option<String>,
+    /// Requests through the gateway whose responses haven't finished, WebSockets included.
+    #[serde(default)]
+    pub open_requests: u64,
+    /// The space each of its named volumes takes, as last measured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub space: BTreeMap<String, Space>,
     /// Server only: the node it's on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
@@ -256,6 +293,12 @@ pub struct AppInfo {
     /// Requests to the app through the gateway whose responses haven't finished, WebSockets included.
     #[serde(default)]
     pub open_requests: u64,
+    /// When a request through the gateway last began or ended (RFC 3339); none since the node started, if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_request_at: Option<String>,
+    /// The space each of its named volumes takes, as last measured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub space: BTreeMap<String, Space>,
     /// Server only: the node it's on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
@@ -313,6 +356,12 @@ pub struct VolumeInfo {
     /// What's wrong with it on disk, if anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub problem: Option<String>,
+    /// The space its data takes, as last measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<Space>,
+    /// The space each app's snapshot of it takes, as last measured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub snapshot_space: BTreeMap<String, Space>,
     /// Server only: the node it's on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
@@ -360,6 +409,20 @@ pub struct NodeInfo {
     /// always-on apps, and a share of those of its apps that idle out. Negative when it's overcommitted.
     #[serde(default)]
     pub headroom_bytes: i64,
+    /// The space its volumes take, as it last measured them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<NodeUsage>,
+}
+
+/// The space a node's volumes take, in [`NodeInfo`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeUsage {
+    /// When the node measured it (RFC 3339).
+    pub measured_at: String,
+    /// Its apps' volumes and its shared volumes with their snapshots, counting data that snapshots share once.
+    pub data_bytes: u64,
+    /// The read-only snapshot sets kept as the parents of incremental backups.
+    pub backup_snapshots: Space,
 }
 
 /// A nest, in `GET /nests`: apps and shared volumes that live together on one node.
@@ -372,6 +435,10 @@ pub struct NestInfo {
     pub volumes: Vec<String>,
     /// What its apps may use: each service's `mem_limit`, or 256 MiB without one.
     pub memory_bytes: u64,
+    /// The space its apps' volumes and its shared volumes (with their snapshots) take, counting data that snapshots
+    /// share once, as the node last measured it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
     /// Why its node was chosen when it was placed.
     pub placement: String,
     pub created_at: String,
@@ -551,15 +618,96 @@ pub struct TokenInfo {
     pub used_at: Option<String>,
 }
 
-/// `GET /whoami`: the caller's token.
+/// `GET /whoami`: the caller's token, or the user whose session it is (who may do what an admin token may).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoAmI {
     pub kind: TokenKind,
     pub name: String,
+    /// The web UI's user, for a request with a session cookie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patterns: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub from: Vec<String>,
+}
+
+/// The query of `GET /apps/{name}/commands`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommandsQuery {
+    /// At most this many (the newest); 20 by default, and at most 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// A command run on an app's node for it (logs, suspend, resume, back up, …), in `GET /apps/{name}/commands`.
+/// Inspecting an app isn't listed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandInfo {
+    pub id: u64,
+    /// `logs`, `suspend`, `resume` or `backup`.
+    pub action: String,
+    /// More about it, such as a backup's targets or how many lines of logs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+    pub node: String,
+    /// Who asked: `user NAME`, `token NAME`, or `schedule`.
+    pub by: String,
+    /// `pending` (not yet handed to the node), `delivered` (running), `done`, `cancelled` (its caller gave up before
+    /// the node got it) or `lost` (the node didn't run it to the end).
+    pub state: String,
+    /// For a command that's done: whether it worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+}
+
+/// The web UI's session cookie: `HttpOnly`, `Secure`, `SameSite=Strict` and host-only (the `__Host-` prefix), so
+/// neither scripts nor other sites (the apps' domains included) can read, send or set it.
+pub const SESSION_COOKIE: &str = "__Host-kn-session";
+
+/// `POST /session`: log in to the web UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Login {
+    pub user: String,
+    pub password: String,
+}
+
+/// A web UI session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub user: String,
+    /// When it was made (RFC 3339).
+    pub created_at: String,
+    /// When it ends unless it's used before (RFC 3339); it ends at `expires_at` regardless, at the latest.
+    pub idle_expires_at: String,
+    pub expires_at: String,
+}
+
+/// A user of the web UI, in `GET /users`. Every user may do what an admin token may.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub name: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_login_at: Option<String>,
+}
+
+/// `POST /users`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateUser {
+    pub name: String,
+    pub password: String,
+}
+
+/// `PUT /users/{name}/password`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetPassword {
+    pub password: String,
 }
 
 /// The body of every error response.

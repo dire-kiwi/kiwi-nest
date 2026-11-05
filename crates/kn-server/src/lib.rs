@@ -9,6 +9,7 @@
 //! - [`api`] is the API for the CLI, and [`agent`] the link for nodes.
 //! - [`backups`] is the backup targets, the schedule, and backups (and restores) of the server's own state.
 //! - [`ingress`] configures the cluster's Caddy.
+//! - [`ui`] serves the web UI, and logs its users in.
 //! - [`registry`] runs the cluster's image registry, checks its credentials and collects its garbage.
 //! - [`upgrades`] offers the server's release to older nodes, one at a time.
 //!
@@ -33,6 +34,7 @@ pub mod ingress;
 pub mod registry;
 pub mod scheduler;
 pub mod store;
+pub mod ui;
 pub mod upgrades;
 
 use std::future::Future;
@@ -130,6 +132,8 @@ pub struct Inner {
     pub stop: CancellationToken,
     pub ingress: Option<Arc<ingress::Ingress>>,
     pub registry: Option<Arc<registry::Registry>>,
+    /// The web UI's failed logins, and the limit on passwords checked at once.
+    pub logins: ui::Logins,
     pub upgrades: Arc<upgrades::Upgrades>,
 }
 
@@ -210,15 +214,18 @@ impl Server {
             stop: CancellationToken::new(),
             ingress,
             registry,
+            logins: ui::Logins::default(),
         }));
         Ok((server, first))
     }
 
-    /// Every route: the CLI's API and the agent link.
+    /// Every route: the CLI's API, the agent link, and the web UI (with its files for anything else).
     pub fn router(&self) -> axum::Router {
         api::router()
             .merge(agent::router())
             .merge(registry::router())
+            .merge(ui::router())
+            .fallback(ui::files)
             // JSON bodies (reports, tokens, joins) are small; uploads are streamed under their own limits.
             .layer(axum::extract::DefaultBodyLimit::max(MAX_JSON))
             .with_state(self.clone())
@@ -247,21 +254,30 @@ impl Server {
         move |id| hub.is_online(id)
     }
 
-    /// Runs a command on a node and waits for its outcome. Refused at once if the node is offline.
-    pub async fn command(&self, node_id: u64, node: &str, action: Action) -> Result<Outcome> {
-        self.command_with(node_id, node, action, self.cfg.command_timeout).await
+    /// Runs a command on a node for `by` (who asked, as the history shows it: `user NAME`, `token NAME` or
+    /// `schedule`) and waits for its outcome. Refused at once if the node is offline.
+    pub async fn command(&self, node_id: u64, node: &str, action: Action, by: &str) -> Result<Outcome> {
+        self.command_with(node_id, node, action, by, self.cfg.command_timeout)
+            .await
     }
 
     /// [`Server::command`], waiting up to `timeout`.
-    pub async fn command_with(&self, node_id: u64, node: &str, action: Action, timeout: Duration) -> Result<Outcome> {
+    pub async fn command_with(
+        &self,
+        node_id: u64,
+        node: &str,
+        action: Action,
+        by: &str,
+        timeout: Duration,
+    ) -> Result<Outcome> {
         if !self.hub.is_online(node_id) {
             return Err(Error::Offline(format!("node `{node}` is offline")));
         }
-        let hub = self.hub.clone();
+        let (hub, by) = (self.hub.clone(), by.to_string());
         let (id, rx) = self
             .store
             .call(move |c| {
-                let id = store::commands::insert(c, node_id, &action, store::now())?;
+                let id = store::commands::insert(c, node_id, &action, &by, store::now())?;
                 Ok((id, hub.wait_for(id)))
             })
             .await?;
