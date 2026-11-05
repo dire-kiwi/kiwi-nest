@@ -18,6 +18,7 @@ hyper-util.workspace = true
 kn-backup.workspace = true
 kn-btrfs.workspace = true
 kn-bundle.workspace = true
+kn-install.workspace = true
 kn-proto.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

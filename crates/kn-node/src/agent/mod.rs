@@ -22,6 +22,12 @@
 //!   for that app's or volume's earlier changes first; deletes and volume changes wait for every earlier change.
 //! - **Commands** each run in a task of their own, and their results (or, for logs, their output, streamed) are
 //!   sent back on the link.
+//! - **Upgrades.** A node that runs from an installed release ([`AgentConfig::installed`]) can take
+//!   [`Action::Upgrade`]: it downloads the server's release for its architecture, checks its size, its SHA-256 and
+//!   that it runs and says it's that version, installs it beside its other releases and answers. Then it waits for
+//!   the changes it's applying to finish, starts no more, makes the new release current and stops, saying to
+//!   restart into it ([`Stopped::Restart`]), which the binary does by executing it in place. Its apps keep
+//!   running: the new agent adopts them, as after any restart.
 //! - **Forgotten.** When the server answers that it forgot the node (`node forget`, and only that: see
 //!   [`LinkError::Forgotten`]), the agent stops applying anything, takes every app down, sets the node's data aside
 //!   and stops; see [`forgotten`]. It refuses to start again until it's given a fresh join token.
@@ -77,6 +83,8 @@ pub struct AgentConfig {
     pub poll_wait: Duration,
     /// The longest wait between attempts when the server can't be reached.
     pub max_backoff: Duration,
+    /// The releases this node runs from, if it was installed (`kiwi-nest node join`): it can upgrade itself.
+    pub installed: Option<kn_install::Layout>,
 }
 
 impl AgentConfig {
@@ -91,6 +99,7 @@ impl AgentConfig {
             ca_certs: None,
             poll_wait: Duration::from_secs(25),
             max_backoff: Duration::from_secs(5),
+            installed: None,
         }
     }
 }
@@ -127,6 +136,83 @@ fn read_file(path: &Path) -> anyhow::Result<Option<AgentFile>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
     }
+}
+
+/// What [`join`] got from the server.
+#[derive(Debug, Clone)]
+pub struct Joined {
+    pub node_id: u64,
+    pub name: String,
+    /// The cluster's registry's host, if it has one.
+    pub registry: Option<String>,
+}
+
+/// Joins the server with `cfg.join_token`, and records the node's tokens in `STATE/agent.json` (and its registry
+/// credential in `STATE/docker`), as a first start does; `kiwi-nest node join` does this before it installs the
+/// node's service. Refuses if the node has joined a server already, unless it was forgotten.
+pub async fn join(node: &NodeConfig, cfg: &AgentConfig) -> anyhow::Result<Joined> {
+    let path = node.state_dir.join("agent.json");
+    if let Some(f) = read_file(&path)?
+        && f.forgotten.is_none()
+    {
+        anyhow::bail!(
+            "this machine is node `{}` of {} already (its state is in {})",
+            f.name,
+            f.server,
+            node.state_dir.display()
+        );
+    }
+    std::fs::create_dir_all(&node.state_dir).with_context(|| format!("creating {}", node.state_dir.display()))?;
+    // Docker's configuration is the node's own, as when it runs (see `run_agent`).
+    let mut node = node.clone();
+    node.docker_config.get_or_insert_with(|| node.state_dir.join("docker"));
+    let (f, registry) = join_and_record(&node, cfg, &path).await?;
+    Ok(Joined {
+        node_id: f.node_id,
+        name: f.name,
+        registry: registry.map(|r| r.host),
+    })
+}
+
+/// Swaps the join token for the node's own, and writes `agent.json` and the registry credential.
+async fn join_and_record(
+    node: &NodeConfig,
+    cfg: &AgentConfig,
+    path: &Path,
+) -> anyhow::Result<(AgentFile, Option<kn_proto::agent::RegistryLogin>)> {
+    let token = cfg
+        .join_token
+        .clone()
+        .context("this node hasn't joined a server yet: pass --join-token")?;
+    let joined = Link::join(
+        &cfg.server,
+        cfg.ca_certs.as_deref(),
+        &JoinRequest {
+            token,
+            name: cfg.name.clone(),
+            facts: facts(node, cfg).await,
+        },
+    )
+    .await
+    .with_context(|| format!("joining {}", cfg.server))?;
+    let f = AgentFile {
+        version: FILE_VERSION,
+        server: cfg.server.clone(),
+        node_id: joined.node_id,
+        name: joined.name,
+        token: joined.token,
+        ingress_token: Some(joined.ingress_token).filter(|t| !t.is_empty()),
+        applied: Applied::default(),
+        forgotten: None,
+    };
+    let bytes = serde_json::to_vec_pretty(&f)?;
+    let p = path.to_path_buf();
+    tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await??;
+    tracing::info!(server = cfg.server, node = f.name, "joined the server");
+    if let Some(login) = &joined.registry {
+        write_registry_login(node, login)?;
+    }
+    Ok((f, joined.registry))
 }
 
 /// Run before the node opens its apps. If the server forgot this node: finishes taking its apps down and setting its
@@ -232,8 +318,21 @@ struct Inner {
     /// Set once the server says it forgot this node: nothing more is applied or run.
     forgotten: std::sync::atomic::AtomicBool,
     /// Held (shared) while a change is applied or a command that changes something runs, and exclusively once the
-    /// node is forgotten, to wait for those in flight.
+    /// node is forgotten or about to restart into a new release, to wait for those in flight.
     applying: tokio::sync::RwLock<()>,
+    /// Set to the release to restart into, once it's current.
+    restart: Mutex<Option<PathBuf>>,
+    /// Cancelled once [`Inner::restart`] is set: the agent stops.
+    restarting: CancellationToken,
+}
+
+/// Why [`Agent::run`] returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stopped {
+    /// It was asked to stop.
+    Asked,
+    /// It made a new release current: run that binary, with the same arguments, in this process's place.
+    Restart(PathBuf),
 }
 
 fn now() -> u64 {
@@ -300,40 +399,8 @@ impl Agent {
                         "this node was forgotten; joining again as a new node with the join token"
                     );
                 }
-                let token = cfg
-                    .join_token
-                    .clone()
-                    .context("this node hasn't joined a server yet: pass --join-token")?;
-                let facts = facts(&apps, &cfg).await;
-                let joined = Link::join(
-                    &cfg.server,
-                    cfg.ca_certs.as_deref(),
-                    &JoinRequest {
-                        token,
-                        name: cfg.name.clone(),
-                        facts,
-                    },
-                )
-                .await
-                .with_context(|| format!("joining {}", cfg.server))?;
-                let f = AgentFile {
-                    version: FILE_VERSION,
-                    server: cfg.server.clone(),
-                    node_id: joined.node_id,
-                    name: joined.name,
-                    token: joined.token,
-                    ingress_token: Some(joined.ingress_token).filter(|t| !t.is_empty()),
-                    applied: Applied::default(),
-                    forgotten: None,
-                };
-                let bytes = serde_json::to_vec_pretty(&f)?;
-                let p = path.clone();
-                tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await??;
-                tracing::info!(server = cfg.server, node = f.name, "joined the server");
-                if let Some(login) = &joined.registry {
-                    write_registry_login(apps.config(), login)?;
-                }
-                (f, joined.registry.is_some())
+                let (f, registry) = join_and_record(apps.config(), &cfg, &path).await?;
+                (f, registry.is_some())
             }
         };
         let link = Link::new(&cfg.server, &file.token, cfg.ca_certs.as_deref())?;
@@ -384,6 +451,8 @@ impl Agent {
                 ),
                 forgotten: std::sync::atomic::AtomicBool::new(false),
                 applying: tokio::sync::RwLock::new(()),
+                restart: Mutex::new(None),
+                restarting: CancellationToken::new(),
             }),
         })
     }
@@ -402,10 +471,18 @@ impl Agent {
         self.inner.file.lock().expect("agent file").ingress_token.clone()
     }
 
-    /// Polls the server, and reports finished changes, until `stop` is cancelled. If the server says it forgot this
-    /// node, takes every app down, sets the node's data aside, and fails with why.
-    pub async fn run(&self, stop: CancellationToken) -> anyhow::Result<()> {
+    /// Polls the server, and reports finished changes, until `stop` is cancelled, or the node has a new release to
+    /// restart into. If the server says it forgot this node, takes every app down, sets the node's data aside, and
+    /// fails with why.
+    pub async fn run(&self, stop: CancellationToken) -> anyhow::Result<Stopped> {
         let mine = stop.child_token();
+        let watcher = tokio::spawn({
+            let (restarting, mine) = (self.inner.restarting.clone(), mine.clone());
+            async move {
+                restarting.cancelled().await;
+                mine.cancel();
+            }
+        });
         let (forgotten, ()) = tokio::join!(
             async {
                 let f = self.inner.clone().poll_loop(mine.clone()).await;
@@ -414,10 +491,14 @@ impl Agent {
             },
             self.inner.clone().report_loop(mine.clone())
         );
-        match forgotten {
-            Some(body) => Err(self.inner.forget(body).await),
-            None => Ok(()),
+        watcher.abort();
+        if let Some(body) = forgotten {
+            return Err(self.inner.forget(body).await);
         }
+        Ok(match self.inner.restart.lock().expect("restart").clone() {
+            Some(path) => Stopped::Restart(path),
+            None => Stopped::Asked,
+        })
     }
 }
 
@@ -485,7 +566,7 @@ impl Inner {
 
     async fn report(&self) -> Report {
         Report {
-            facts: facts(&self.apps, &self.cfg).await,
+            facts: facts(self.apps.config(), &self.cfg).await,
             apps: self.apps.reports().await,
             volumes: self.apps.volume_list().await.unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "couldn't list the shared volumes");
@@ -913,7 +994,30 @@ impl Inner {
             self.running.lock().expect("running").remove(&c.id);
             return;
         }
+        let mut restart_into = None;
         let result = match c.action {
+            Action::Upgrade { version, sha256, size } => Some(match self.upgrade(&version, &sha256, size).await {
+                Ok(path) => {
+                    let answer = kn_proto::agent::UpgradeAnswer {
+                        version: version.clone(),
+                        restarting: path.is_some(),
+                    };
+                    restart_into = path.map(|p| (version, p));
+                    CommandResult::Ok {
+                        value: serde_json::to_value(answer).unwrap_or_default(),
+                    }
+                }
+                Err((status, error)) => {
+                    tracing::warn!(version, error, "couldn't upgrade");
+                    CommandResult::Err {
+                        status,
+                        error: kn_proto::api::ErrorBody {
+                            error,
+                            problems: Vec::new(),
+                        },
+                    }
+                }
+            }),
             Action::Inspect { app } => Some(json(self.apps.inspect(&app).await)),
             Action::Suspend { app } => Some(json(self.apps.suspend(&app).await)),
             Action::Resume { app } => Some(json(self.apps.resume(&app).await)),
@@ -952,6 +1056,98 @@ impl Inner {
             }
         }
         self.running.lock().expect("running").remove(&c.id);
+        if let Some((version, path)) = restart_into {
+            self.restart_into(&version, path).await;
+        }
+    }
+
+    /// Fetches, checks and installs a release for [`Action::Upgrade`]. `None` if it's the release this node already
+    /// runs, as its current one. Errors are a status and a message, for the command's result.
+    async fn upgrade(&self, version: &str, sha256: &str, size: u64) -> Result<Option<PathBuf>, (u16, String)> {
+        let bad = |e: anyhow::Error| (500, format!("{e:#}"));
+        let Some(layout) = self.cfg.installed.clone() else {
+            return Err((
+                409,
+                "this node doesn't run from an installed release (`kiwi-nest node join` installs one), so it can't \
+                 upgrade itself"
+                    .into(),
+            ));
+        };
+        kn_install::layout::check_version(version).map_err(|e| (400, e.to_string()))?;
+        if version == kn_proto::VERSION && layout.current().as_deref() == Some(version) {
+            return Ok(None);
+        }
+        let arch = kn_bundle::manifest::Arch::current()
+            .map_or(std::env::consts::ARCH, |a| a.as_str())
+            .to_string();
+        let bin = layout.binary(version);
+        let have = {
+            let (bin, sha) = (bin.clone(), sha256.to_string());
+            tokio::task::spawn_blocking(move || kn_install::checksums::verify_file(&bin, &sha).is_ok())
+                .await
+                .unwrap_or(false)
+        };
+        if !have {
+            tracing::info!(version, arch, "downloading the server's release");
+            let staged = {
+                let (l, v) = (layout.clone(), version.to_string());
+                tokio::task::spawn_blocking(move || l.staging(&v))
+                    .await
+                    .map_err(|e| bad(e.into()))?
+                    .map_err(bad)?
+            };
+            self.link
+                .release(version, &arch, &staged, size)
+                .await
+                .map_err(|e| (502, format!("downloading release {version}: {e}")))?;
+            let (l, v, sha) = (layout.clone(), version.to_string(), sha256.to_string());
+            tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
+                let got = kn_install::checksums::verify_file(&staged, &sha)?;
+                if got != size {
+                    anyhow::bail!("release {v} is {got} bytes, and the server said {size}");
+                }
+                l.commit(&v, &staged)
+            })
+            .await
+            .map_err(|e| bad(e.into()))?
+            .map_err(bad)?;
+        }
+        let (b, v) = (bin.clone(), version.to_string());
+        tokio::task::spawn_blocking(move || kn_install::layout::check_binary(&b, &v))
+            .await
+            .map_err(|e| bad(e.into()))?
+            .map_err(bad)?;
+        Ok(Some(bin))
+    }
+
+    /// Restarts into a release once nothing is being applied: makes it current and stops the agent, which then
+    /// runs it in its place. Nothing starts being applied after this; if the release can't be made current, the
+    /// node carries on as it was.
+    async fn restart_into(&self, version: &str, path: PathBuf) {
+        tracing::info!(
+            version,
+            "upgrading: waiting for the changes being applied, then restarting into it"
+        );
+        let all = self.applying.write().await;
+        let Some(layout) = self.cfg.installed.clone() else {
+            return;
+        };
+        let v = version.to_string();
+        match tokio::task::spawn_blocking(move || layout.activate(&v)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "couldn't make the new release current; carrying on as before");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "couldn't make the new release current; carrying on as before");
+                return;
+            }
+        }
+        // Held until the process is replaced, so nothing starts in between.
+        std::mem::forget(all);
+        *self.restart.lock().expect("restart") = Some(path);
+        self.restarting.cancel();
     }
 
     /// Streams logs to the server until they end or nobody is reading them; a following `docker compose logs` is
@@ -1036,9 +1232,10 @@ impl crate::apps::TargetSource for ServerTargets {
 }
 
 /// What the node is, now.
-async fn facts(apps: &Apps, cfg: &AgentConfig) -> NodeFacts {
-    let node = apps.config().clone();
+async fn facts(node: &NodeConfig, cfg: &AgentConfig) -> NodeFacts {
+    let node = node.clone();
     let (labels, gateway, ingress) = (cfg.labels.clone(), cfg.gateway.clone(), cfg.ingress.clone());
+    let self_upgrade = cfg.installed.is_some();
     tokio::task::spawn_blocking(move || {
         let (memory_bytes, memory_available_bytes) = meminfo().unwrap_or_default();
         let space = |p: &Path, btrfs: bool| {
@@ -1069,6 +1266,7 @@ async fn facts(apps: &Apps, cfg: &AgentConfig) -> NodeFacts {
             gateway,
             protocol: kn_proto::agent::PROTOCOL,
             ingress,
+            self_upgrade,
         }
     })
     .await

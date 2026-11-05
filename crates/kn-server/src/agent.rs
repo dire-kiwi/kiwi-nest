@@ -34,6 +34,7 @@ pub fn router() -> Router<Server> {
         .route(&format!("{p}/agent/report"), post(report))
         .route(&format!("{p}/agent/bundles/{{digest}}"), get(bundle))
         .route(&format!("{p}/agent/backup-targets"), get(backup_targets))
+        .route(&format!("{p}/agent/releases/{{version}}/{{arch}}"), get(release))
         .route(&format!("{p}/agent/commands/{{id}}/result"), post(command_result))
         .route(&format!("{p}/agent/commands/{{id}}/output"), post(command_output))
 }
@@ -245,6 +246,34 @@ async fn bundle(State(s): State<Server>, node: NodeCaller, Path(digest): Path<St
     Ok((
         [
             (header::CONTENT_TYPE, "application/zip".to_string()),
+            (header::CONTENT_LENGTH, len.to_string()),
+        ],
+        Body::from_stream(ReaderStream::new(file)),
+    )
+        .into_response())
+}
+
+/// The server's release for the node's architecture, which it offered with `Action::Upgrade`.
+async fn release(
+    State(s): State<Server>,
+    _node: NodeCaller,
+    Path((version, arch)): Path<(String, String)>,
+) -> Result<Response> {
+    if version != kn_proto::VERSION {
+        return Err(Error::NotFound(format!(
+            "this server offers release {}, not {version}",
+            kn_proto::VERSION
+        )));
+    }
+    let offer = s
+        .upgrades
+        .offer(&arch)
+        .ok_or_else(|| Error::NotFound(format!("this server has no {arch} release")))?;
+    let file = tokio::fs::File::open(&offer.path).await?;
+    let len = file.metadata().await?.len();
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
             (header::CONTENT_LENGTH, len.to_string()),
         ],
         Body::from_stream(ReaderStream::new(file)),

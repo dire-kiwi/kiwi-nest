@@ -116,6 +116,16 @@ pub enum Command {
         /// Have the node read the directory itself, rather than uploading it (a standalone node on this machine).
         #[arg(long)]
         node_reads_path: bool,
+        /// Deploy with this domain instead of the bundle's `x-kiwi-nest.domain`, such as a pull request's preview
+        /// made from production's bundle.
+        #[arg(long, value_name = "DOMAIN")]
+        domain: Option<String>,
+        /// Deploy with this `x-kiwi-nest.idle_timeout` instead of the bundle's, such as 10m for a preview.
+        #[arg(long, value_name = "DURATION")]
+        idle_timeout: Option<String>,
+        /// Deploy with `x-kiwi-nest.backups: false`: no scheduled backups (`backup app` still works).
+        #[arg(long)]
+        no_backups: bool,
     },
     /// List the apps.
     List {
@@ -189,6 +199,23 @@ pub enum Command {
     /// The clusters this CLI knows, in ~/.config/kiwi-nest.
     #[command(subcommand)]
     Cluster(ClusterCommand),
+}
+
+/// `kiwi-nest upgrade …`, the server's release rolling out to the nodes (admin only).
+#[derive(Debug, Clone, Subcommand)]
+pub enum UpgradeCommand {
+    /// Show how the server's release is rolling out to the nodes, one at a time.
+    Status {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Carry on with the rollout after a node's upgrade failed (which halts it), trying that node again.
+    Nodes {
+        /// Wait until every node that can be upgraded has been, or one fails.
+        #[arg(long)]
+        wait: bool,
+    },
 }
 
 #[derive(Debug, Clone, Subcommand)]
@@ -728,6 +755,19 @@ impl Client {
             .await
     }
 
+    pub async fn upgrade_status(&self) -> anyhow::Result<kn_proto::api::UpgradeStatus> {
+        self.json(self.get("/upgrade")).await
+    }
+
+    pub async fn upgrade_retry(&self) -> anyhow::Result<kn_proto::api::UpgradeStatus> {
+        self.json(self.req(reqwest::Method::POST, "/upgrade")).await
+    }
+
+    /// The server's version (`GET /version`, which needs no token).
+    pub async fn version(&self) -> anyhow::Result<kn_proto::api::VersionInfo> {
+        self.json(self.get("/version")).await
+    }
+
     pub async fn node_prune(&self, node: &str, q: &PruneQuery) -> anyhow::Result<PruneReport> {
         self.json(
             self.req(reqwest::Method::POST, &format!("/nodes/{node}/prune"))
@@ -869,8 +909,19 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
             target,
             timeout,
             node_reads_path,
+            domain,
+            idle_timeout,
+            no_backups,
         } => {
             let timeout = duration("--timeout", &timeout)?;
+            let overrides = kn_bundle::overrides::Overrides {
+                domain,
+                idle_timeout,
+                backups: no_backups.then_some(false),
+            };
+            if node_reads_path && !overrides.is_empty() {
+                bail!("--node-reads-path can't be combined with --domain, --idle-timeout or --no-backups");
+            }
             let q = DeployQuery {
                 create_only,
                 from,
@@ -884,7 +935,7 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                     let dir = std::path::absolute(&path)?;
                     client.deploy_directory(&name, &dir, &q).await?
                 } else {
-                    let zip = read_bundle(path, kn_bundle::Limits::default()).await?;
+                    let zip = read_bundle_with(path, kn_bundle::Limits::default(), overrides).await?;
                     client.deploy_zip(&name, zip, &q).await?.json().await?
                 };
                 print_deployed(&info, None);
@@ -893,7 +944,7 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
             if node_reads_path {
                 bail!("--node-reads-path only works with a standalone node; a server takes the bundle as a ZIP");
             }
-            let zip = read_bundle(path, kn_bundle::Limits::default()).await?;
+            let zip = read_bundle_with(path, kn_bundle::Limits::default(), overrides).await?;
             let acc: Accepted = client.deploy_zip(&name, zip, &q).await?.json().await?;
             for w in &acc.warnings {
                 eprintln!("warning: {w}");
@@ -1822,6 +1873,21 @@ fn or_none(s: String) -> String {
     if s.is_empty() { "none".into() } else { s }
 }
 
+/// A bundle as a ZIP, with `x-kiwi-nest` changed as asked.
+async fn read_bundle_with(
+    path: PathBuf,
+    limits: kn_bundle::Limits,
+    overrides: kn_bundle::overrides::Overrides,
+) -> anyhow::Result<Vec<u8>> {
+    if overrides.is_empty() {
+        return read_bundle(path, limits).await;
+    }
+    tokio::task::spawn_blocking(move || {
+        kn_bundle::overrides::pack(&path, &overrides, &limits).with_context(|| format!("packing {}", path.display()))
+    })
+    .await?
+}
+
 /// A bundle as a ZIP: a ZIP file as it is, or a directory packed (refusing what a node would refuse).
 async fn read_bundle(path: PathBuf, limits: kn_bundle::Limits) -> anyhow::Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u8>> {
@@ -2043,5 +2109,133 @@ mod tests {
             ..global(d.path())
         };
         assert!(Target::resolve(&g).is_err(), "--server needs a token");
+    }
+}
+
+/// `kiwi-nest upgrade status|nodes`.
+pub async fn upgrade(global: &GlobalArgs, cmd: UpgradeCommand) -> anyhow::Result<()> {
+    let client = Client::new(&Target::resolve(global)?)?;
+    server_only(&client, "the rollout")?;
+    match cmd {
+        UpgradeCommand::Status { json } => {
+            let st = client.upgrade_status().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&st)?);
+            } else {
+                print_rollout(&st);
+            }
+        }
+        UpgradeCommand::Nodes { wait } => {
+            let st = client.upgrade_retry().await?;
+            if wait {
+                follow_rollout(&client, Duration::from_secs(8), Duration::from_secs(3600)).await?;
+            } else {
+                print_rollout(&st);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Prints the rollout, node by node.
+pub fn print_rollout(st: &kn_proto::api::UpgradeStatus) {
+    println!(
+        "server {}; releases for {}{}",
+        st.version,
+        if st.arches.is_empty() {
+            "no architecture".to_string()
+        } else {
+            st.arches.join(", ")
+        },
+        if st.halted {
+            "; halted by a failure (`kiwi-nest upgrade nodes` carries on)"
+        } else {
+            ""
+        }
+    );
+    print_table(
+        &["NODE", "VERSION", "ONLINE", "UPGRADE", "DETAIL"],
+        st.nodes
+            .iter()
+            .map(|n| {
+                vec![
+                    n.node.clone(),
+                    or_none(n.version.clone()),
+                    if n.online { "yes" } else { "no" }.into(),
+                    n.state.as_str().into(),
+                    n.detail.clone().unwrap_or_default(),
+                ]
+            })
+            .collect(),
+    );
+}
+
+/// Follows the rollout, saying when each node changes, until no node that's online is pending or being upgraded
+/// (or one failed), looking for at least `settle` (nodes reconnect to a server that has just restarted). Fails if
+/// one failed, or on `timeout`.
+pub async fn follow_rollout(client: &Client, settle: Duration, timeout: Duration) -> anyhow::Result<()> {
+    use kn_proto::api::UpgradeState;
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut seen: std::collections::BTreeMap<String, (UpgradeState, String)> = Default::default();
+    let mut unreachable_since: Option<Instant> = None;
+    loop {
+        let st = match client.upgrade_status().await {
+            Ok(st) => {
+                unreachable_since = None;
+                st
+            }
+            // The server may be restarting.
+            Err(e) if transient(&e) => {
+                let since = *unreachable_since.get_or_insert_with(Instant::now);
+                if since.elapsed() > Duration::from_secs(120) {
+                    return Err(e);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        for n in &st.nodes {
+            let now = (n.state, n.version.clone());
+            if seen.get(&n.node) != Some(&now) {
+                let detail = n.detail.as_ref().map(|d| format!(": {d}")).unwrap_or_default();
+                eprintln!(
+                    "node {}: {} ({}){detail}",
+                    n.node,
+                    n.state.as_str(),
+                    or_none(n.version.clone())
+                );
+                seen.insert(n.node.clone(), now);
+            }
+        }
+        if st.halted {
+            bail!("a node's upgrade failed, which halts the rollout; `kiwi-nest upgrade status` shows why");
+        }
+        // Waiting only on nodes that are online: an offline one is upgraded when it's back.
+        let busy = st
+            .nodes
+            .iter()
+            .any(|n| n.state == UpgradeState::Upgrading || (n.state == UpgradeState::Pending && n.online));
+        if !busy && start.elapsed() >= settle {
+            let manual: Vec<&str> = st
+                .nodes
+                .iter()
+                .filter(|n| n.state == UpgradeState::Manual)
+                .map(|n| n.node.as_str())
+                .collect();
+            if !manual.is_empty() {
+                eprintln!(
+                    "upgrade these by hand (`kiwi-nest upgrade` on each): {}",
+                    manual.join(", ")
+                );
+            }
+            println!("every node that's online and can be upgraded runs {}", st.version);
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("gave up waiting for the rollout; `kiwi-nest upgrade status` shows where it is");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }

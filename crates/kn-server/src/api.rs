@@ -17,7 +17,7 @@ use kn_proto::agent::{Action, CommandResult};
 use kn_proto::api::{
     AppInfo, AppSummary, ChangeStatus, CreateToken, CreatedToken, DeleteQuery, DeployQuery, ForgetQuery, Forgot,
     GcQuery, GcReport, LabelRequest, LogsQuery, NestInfo, NodeInfo, PruneQuery, PruneReport, RegistryInfo, TokenInfo,
-    TokenKind, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery, WhoAmI,
+    TokenKind, UpgradeStatus, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery, WhoAmI,
 };
 use kn_proto::backup::{BackupInfo, BackupQuery, BackupResult, Kind as BackupKind, ListQuery, Restore};
 use kn_proto::state::AppStatus;
@@ -40,7 +40,6 @@ const MAX_WAIT: Duration = Duration::from_secs(60);
 pub fn router() -> Router<Server> {
     let p = kn_proto::API_PREFIX;
     Router::new()
-        .route(&format!("{p}/version"), get(version))
         .route(&format!("{p}/whoami"), get(whoami))
         .route(&format!("{p}/apps"), get(list))
         .route(&format!("{p}/apps/{{name}}"), get(inspect).put(deploy).delete(delete))
@@ -77,6 +76,48 @@ pub fn router() -> Router<Server> {
         .route(&format!("{p}/registry/gc"), post(registry_gc))
         .route(&format!("{p}/tokens"), get(token_list).post(token_create))
         .route(&format!("{p}/tokens/{{id}}"), delete_route(token_revoke))
+        .route(&format!("{p}/upgrade"), get(upgrade_status).post(upgrade_retry))
+        // Every route above refuses a CLI older than the server; `/version` answers anyone, so an old CLI can see
+        // what it needs.
+        .route_layer(axum::middleware::from_fn(refuse_older_clis))
+        .route(&format!("{p}/version"), get(version))
+}
+
+/// Refuses a request from a CLI older than the server, which might not understand its answers or might send
+/// requests it reads differently (`426 Upgrade Required`). Other clients (curl, browsers) aren't checked.
+async fn refuse_older_clis(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if let Some(e) = older_cli(req.headers()) {
+        return e.into_response();
+    }
+    next.run(req).await
+}
+
+/// The error for a request from a CLI older than this server, if it is one.
+pub fn older_cli(headers: &HeaderMap) -> Option<Error> {
+    let ua = headers.get(header::USER_AGENT)?.to_str().ok()?;
+    let cli = kn_proto::version::cli_version(ua)?;
+    let me = kn_proto::version::Version::current();
+    (cli < me).then(|| {
+        Error::UpgradeRequired(format!(
+            "this server runs kiwi-nest {me}, and this CLI is {cli}: the CLI must be at least as new as the server. \
+             Install kiwi-nest {me} or later (https://github.com/{}/releases), or run `kiwi-nest upgrade` where it's \
+             installed",
+            kn_proto::REPOSITORY
+        ))
+    })
+}
+
+async fn upgrade_status(State(s): State<Server>, caller: Caller) -> Result<axum::Json<UpgradeStatus>> {
+    caller.admin()?;
+    Ok(axum::Json(s.upgrades.status(&s).await?))
+}
+
+/// Tries the nodes whose upgrade failed again, and carries on with the rollout.
+async fn upgrade_retry(State(s): State<Server>, caller: Caller) -> Result<axum::Json<UpgradeStatus>> {
+    caller.admin()?;
+    s.upgrades.retry();
+    tracing::info!(by = caller.id, "the rollout of this release to the nodes was restarted");
+    Ok(axum::Json(s.upgrades.status(&s).await?))
 }
 
 async fn version() -> axum::Json<VersionInfo> {
@@ -273,7 +314,7 @@ async fn view(s: &Server, name: &str) -> Result<View> {
 }
 
 /// A command's JSON result.
-pub(crate) fn result<T: DeserializeOwned>(o: Outcome) -> Result<T> {
+pub fn result<T: DeserializeOwned>(o: Outcome) -> Result<T> {
     match o {
         Outcome::Result(CommandResult::Ok { value }) => Ok(serde_json::from_value(value)?),
         Outcome::Result(CommandResult::Err { status, error }) => Err(Error::Node(

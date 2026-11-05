@@ -1,11 +1,16 @@
 //! `kiwi-nest`: the one binary, for the server, the node and the CLI.
+//!
+//! The `cluster` feature (on by default) holds the server, the node and installing them, which need Linux; without
+//! it the binary is only the CLI, as it's built for macOS.
+
+#[cfg(feature = "cluster")]
+mod cluster;
+#[cfg(feature = "cluster")]
+mod install;
 
 use std::io::IsTerminal;
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
 
-use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
@@ -22,394 +27,89 @@ struct Cli {
 enum Cmd {
     /// Print the version and the git commit it was built from.
     Version,
-    /// Run the server: the cluster's inventory, its API, and the link its nodes poll.
-    Server(Box<ServerArgs>),
-    /// Run a node, joined to a server (--server) or standalone; or manage the cluster's nodes (`node list`, …).
-    Node(Box<NodeArgs>),
+    /// Run the server: the cluster's inventory, its API, and the link its nodes poll; or set it up (`server init`).
+    #[cfg(feature = "cluster")]
+    Server(Box<cluster::ServerArgs>),
+    /// Run a node, joined to a server (--server) or standalone; set one up (`node join`); or manage the cluster's
+    /// nodes (`node list`, …).
+    #[cfg(feature = "cluster")]
+    Node(Box<cluster::NodeArgs>),
+    /// Upgrade kiwi-nest on this machine, as root: fetch a release and its checksums, install it beside the others,
+    /// make it current and restart; on the server's host, the server then upgrades the nodes, one at a time. Or
+    /// follow that rollout (`upgrade status`, `upgrade nodes`).
+    Upgrade(Box<UpgradeArgs>),
+    /// Go back to an earlier release installed on this machine, as root, and restart into it.
+    #[cfg(feature = "cluster")]
+    Rollback(install::RollbackArgs),
+    /// Write this release's systemd units for what's installed here (`upgrade` and `rollback` run this with the
+    /// release they switch to).
+    #[cfg(feature = "cluster")]
+    #[command(hide = true)]
+    Units,
     #[command(flatten)]
     Client(kn_cli::Command),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum IngressMode {
-    /// The server doesn't configure an ingress.
-    None,
-    /// HTTPS, with certificates from an ACME CA (Let's Encrypt and ZeroSSL by default).
-    Acme,
-    /// HTTPS, with certificates from Caddy's internal CA, for clusters reached only over a VPN.
-    Internal,
-    /// HTTPS, with the certificates in --certs-dir, obtained elsewhere (such as a DNS-01 wildcard).
-    Certs,
-    /// Plain HTTP, behind another proxy or a tunnel that handles TLS.
-    Http,
-}
-
 #[derive(clap::Args)]
 #[command(args_conflicts_with_subcommands = true)]
-struct ServerArgs {
+pub struct UpgradeArgs {
     #[command(subcommand)]
-    cmd: Option<ServerCommand>,
-    /// The address to listen on, for the CLI and the nodes (directly, or through the ingress at --api-domain).
-    #[arg(long, default_value = "127.0.0.1:7400")]
-    listen: SocketAddr,
-    /// Where the server keeps its database and bundles.
-    #[arg(
-        long,
-        env = "KIWI_NEST_SERVER_STATE_DIR",
-        default_value = "/var/lib/kiwi-nest-server"
-    )]
-    state_dir: PathBuf,
-    /// The longest a node's poll is held open, such as 25s.
-    #[arg(long, default_value = "25s")]
-    poll_timeout: String,
-    /// Memory kept back on every node when placing nests, for the system and Docker, such as 512m or 1g.
-    #[arg(long, default_value = "512m")]
-    memory_reserve: String,
-    /// The share of an idling app's `mem_limit` that placement counts against its node, from 0 to 1.
-    #[arg(long, default_value = "0.5")]
-    idle_memory_factor: f64,
-    /// A node that hasn't polled for this long is offline.
-    #[arg(long, default_value = "15s")]
-    offline_after: String,
-    /// The cluster's ingress: the Caddy the server configures, and how it gets certificates.
-    #[arg(long, value_enum, default_value = "none")]
-    ingress: IngressMode,
-    /// Caddy's admin API, on loopback.
-    #[arg(long, default_value = "http://127.0.0.1:2019", value_name = "URL")]
-    caddy_admin: String,
-    /// The domain the ingress publishes the server's API at, such as kn.example.com, for nodes and the CLI.
-    #[arg(long, value_name = "DOMAIN")]
-    api_domain: Option<String>,
-    /// The ingress's port for HTTP (in the HTTPS modes, it redirects to HTTPS).
-    #[arg(long, default_value_t = 80)]
-    http_port: u16,
-    /// The ingress's port for HTTPS.
-    #[arg(long, default_value_t = 443)]
-    https_port: u16,
-    /// With --ingress acme: the email address for the ACME account.
-    #[arg(long, value_name = "EMAIL")]
-    acme_email: Option<String>,
-    /// With --ingress acme: the ACME CA's directory URL [default: Let's Encrypt, then ZeroSSL].
-    #[arg(long, value_name = "URL")]
-    acme_ca: Option<String>,
-    /// With --ingress certs: the folder of certificates, as .pem files each holding a certificate chain and its key.
+    cmd: Option<kn_cli::UpgradeCommand>,
+    /// The release to install [default: the latest on GitHub, or the one in --from].
+    #[arg(long, value_name = "VERSION")]
+    pub version: Option<String>,
+    /// A directory of release files with their SHA256SUMS (as `make release` writes them in dist/), instead of
+    /// GitHub's releases.
     #[arg(long, value_name = "DIR")]
-    certs_dir: Option<PathBuf>,
-    /// A proxy in front of the ingress whose X-Forwarded-For is believed, as an address or CIDR range (repeatable).
-    #[arg(long = "trusted-proxy", value_name = "CIDR")]
-    trusted_proxies: Vec<String>,
-    /// How often the ingress's configuration is checked, so a restarted Caddy gets it back.
-    #[arg(long, default_value = "10s")]
-    ingress_sync: String,
-    /// Run the cluster's image registry, served by the ingress at this domain, such as registry.example.com.
-    #[arg(long, value_name = "DOMAIN")]
-    registry_domain: Option<String>,
-    /// The registry's image.
-    #[arg(long, default_value = "registry:3", value_name = "IMAGE")]
-    registry_image: String,
-    /// Where the registry's container is published, on loopback, for the ingress.
-    #[arg(long, default_value = "127.0.0.1:5000", value_name = "ADDR")]
-    registry_listen: SocketAddr,
-    /// The registry's container's name.
-    #[arg(long, default_value = "kiwi-nest-registry", value_name = "NAME")]
-    registry_container: String,
-    /// How long garbage collection keeps a tag after it was pushed, or an app stopped using it.
-    #[arg(long, default_value = "24h")]
-    registry_grace: String,
-    /// How often the registry's garbage is collected.
-    #[arg(long, default_value = "6h")]
-    registry_gc_interval: String,
-    /// The Docker CLI, for the registry's container.
-    #[arg(long, default_value = "docker")]
-    docker: PathBuf,
-    /// The backup targets: a YAML (or JSON) file of `targets:`, each with its storage (`s3`, `ssh` or `dir`),
-    /// `format`, `every` and `keep`. Nodes get them from the server.
-    #[arg(long, env = "KIWI_NEST_BACKUP_TARGETS", value_name = "FILE")]
-    backup_targets: Option<PathBuf>,
-    /// How often to look for scheduled backups that are due.
-    #[arg(long, default_value = "1m")]
-    backup_check: String,
-}
-
-#[derive(Subcommand)]
-enum ServerCommand {
-    /// Restore the server's state (its database and bundles) from a backup into an empty state directory; then
-    /// start the server on it. Nodes keep their tokens, and reconnect.
-    Restore {
-        /// The backup's key, such as server/20261106T030000Z.tar.zst (`backup list server` shows them).
-        key: String,
-        /// Where the server keeps its database and bundles.
-        #[arg(
-            long,
-            env = "KIWI_NEST_SERVER_STATE_DIR",
-            default_value = "/var/lib/kiwi-nest-server"
-        )]
-        state_dir: PathBuf,
-        /// The backup targets, as for the server.
-        #[arg(long, env = "KIWI_NEST_BACKUP_TARGETS", value_name = "FILE")]
-        backup_targets: PathBuf,
-        /// The target the key is in [default: the first that has it].
-        #[arg(long, value_name = "TARGET")]
-        target: Option<String>,
-    },
-}
-
-#[derive(clap::Args)]
-#[command(args_conflicts_with_subcommands = true)]
-struct NodeArgs {
-    #[command(subcommand)]
-    cmd: Option<kn_cli::NodeCommand>,
-    /// Run on its own, with a local API on loopback (rather than joined to a server).
+    pub from: Option<PathBuf>,
+    /// How many releases to keep installed (the current one is always kept), for rollbacks.
+    #[arg(long, default_value_t = 3)]
+    pub keep: usize,
+    /// On the server's host: don't follow the rollout to the nodes (it carries on anyway).
     #[arg(long)]
-    standalone: bool,
-    /// The one-time token that lets this node join the server (--server), the first time it starts.
-    #[arg(long, env = "KIWI_NEST_JOIN_TOKEN", hide_env_values = true)]
-    join_token: Option<String>,
-    /// The node's name in the cluster [default: the host name].
-    #[arg(long)]
-    name: Option<String>,
-    /// A label for placement, as KEY=VALUE (repeatable).
-    #[arg(long = "label", value_name = "KEY=VALUE")]
-    labels: Vec<String>,
-    /// The address of the standalone API; it must be loopback.
-    #[arg(long, default_value = "127.0.0.1:7380")]
-    listen: SocketAddr,
-    /// The address of the gateway, which proxies requests to apps by Host, on loopback.
-    #[arg(long, default_value = "127.0.0.1:7381")]
-    gateway_listen: SocketAddr,
-    /// Where the gateway listens for the cluster's ingress: the node's address on the private network, such as
-    /// 10.0.0.5:7382. Requests there need the node's ingress token, which the ingress adds.
-    #[arg(long, value_name = "ADDR")]
-    ingress_listen: Option<SocketAddr>,
-    /// Where the node keeps its state, bundles and generated files.
-    #[arg(long, env = "KIWI_NEST_STATE_DIR", default_value = "/var/lib/kiwi-nest")]
-    state_dir: PathBuf,
-    /// Where apps' volumes live, as btrfs subvolumes: a directory on btrfs, reached without symlinks
-    /// [default: STATE_DIR/volumes].
-    #[arg(long, env = "KIWI_NEST_VOLUMES_DIR")]
-    volumes_dir: Option<PathBuf>,
-    /// Put before each app's name to make its Compose project name.
-    #[arg(long, default_value = "kn-")]
-    project_prefix: String,
-    /// The loopback ports for apps, as FIRST-LAST.
-    #[arg(long, default_value = "30000-39999")]
-    ports: String,
-    /// A host directory that bundles may mount (repeatable).
-    #[arg(long = "allow-host-path", value_name = "DIR")]
-    allow_host_paths: Vec<PathBuf>,
-    /// The Docker CLI.
-    #[arg(long, default_value = "docker")]
-    docker: PathBuf,
-    /// How long a deploy waits for the app to be running and healthy, such as 90s or 5m.
-    #[arg(long, default_value = "5m")]
-    up_timeout: String,
-    /// How long starting a stopped app for a request may take, until it's healthy and its port answers.
-    #[arg(long, default_value = "2m")]
-    start_timeout: String,
-    /// After a start fails, how long requests are refused before one may try again (`resume` doesn't wait).
-    #[arg(long, default_value = "15s")]
-    start_cooldown: String,
-    /// How long an image an app stopped using (redeployed with others, or deleted) is kept, so deploying it again
-    /// doesn't pull it.
-    #[arg(long, default_value = "24h")]
-    image_grace: String,
-    /// How often images that nothing uses (beyond the grace period) are removed; 0 for never.
-    #[arg(long, default_value = "1h")]
-    prune_interval: String,
-    /// A standalone node's backup targets, as for the server (a node joined to a server uses the server's).
-    #[arg(long, env = "KIWI_NEST_BACKUP_TARGETS", value_name = "FILE")]
-    backup_targets: Option<PathBuf>,
+    pub no_wait: bool,
 }
 
-fn duration(flag: &str, value: &str) -> anyhow::Result<Duration> {
-    let secs = kn_bundle::manifest::parse_duration(value).with_context(|| format!("bad {flag} {value}"))?;
-    Ok(Duration::from_secs(secs))
+/// How the program ends.
+pub enum Exit {
+    Done,
+    /// Run this binary in this process's place, with the same arguments: a node that upgraded itself.
+    #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
+    Exec(PathBuf),
 }
 
-fn parse_ports(s: &str) -> anyhow::Result<std::ops::RangeInclusive<u16>> {
-    let (a, b) = s
-        .split_once('-')
-        .context("ports must be FIRST-LAST, such as 30000-39999")?;
-    let (a, b): (u16, u16) = (a.trim().parse()?, b.trim().parse()?);
-    if a == 0 || b < a {
-        bail!("bad port range {s}");
-    }
-    Ok(a..=b)
-}
-
-/// Makes a directory absolute without needing it to exist.
-fn absolute(p: PathBuf) -> anyhow::Result<PathBuf> {
-    Ok(std::path::absolute(&p)?)
-}
-
-/// The machine's name, as a node name: lowercase letters, digits and `-`.
-fn host_name() -> String {
-    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
-    let name: String = raw
-        .trim()
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let name = name.trim_matches('-').to_string();
-    if name.is_empty() { "node".into() } else { name }
-}
-
-/// Reads a targets file, with the files its targets name (S3 secret keys, SSH keys and known hosts) read in, so the
-/// nodes the server hands them to needn't have those files.
-fn read_targets(path: &std::path::Path) -> anyhow::Result<Vec<kn_proto::backup::TargetConfig>> {
-    let targets = kn_backup::target::read(path)?;
-    // Checked now, so a mistake stops the start rather than the first backup.
-    kn_backup::target::open_all(targets.clone())
-        .with_context(|| format!("the backup targets in {}", path.display()))?;
-    Ok(targets)
-}
-
-async fn server(args: ServerArgs) -> anyhow::Result<()> {
-    if let Some(ServerCommand::Restore {
-        key,
-        state_dir,
-        backup_targets,
-        target,
-    }) = args.cmd
-    {
-        let targets = kn_backup::target::open_all(read_targets(&backup_targets)?)?;
-        let msg = kn_server::backups::restore(&absolute(state_dir)?, &targets, target.as_deref(), &key).await?;
-        println!("{msg}");
-        return Ok(());
-    }
-    let mut cfg = kn_server::ServerConfig::new(absolute(args.state_dir)?);
-    if let Some(f) = &args.backup_targets {
-        cfg.backup_targets = read_targets(f)?;
-    }
-    cfg.backup_check_interval = duration("--backup-check", &args.backup_check)?;
-    cfg.poll_timeout = duration("--poll-timeout", &args.poll_timeout)?;
-    cfg.offline_after = duration("--offline-after", &args.offline_after)?;
-    cfg.scheduler.memory_reserve = kn_server::bundles::parse_bytes(&args.memory_reserve)
-        .with_context(|| format!("bad --memory-reserve {}", args.memory_reserve))?;
-    if !(0.0..=1.0).contains(&args.idle_memory_factor) {
-        bail!("--idle-memory-factor must be between 0 and 1");
-    }
-    cfg.scheduler.idle_factor = args.idle_memory_factor;
-    if cfg.poll_timeout.is_zero() || cfg.poll_timeout.as_secs() > kn_proto::agent::MAX_POLL_SECS {
-        bail!(
-            "--poll-timeout must be between 1s and {}s",
-            kn_proto::agent::MAX_POLL_SECS
-        );
-    }
-    let tls = match args.ingress {
-        IngressMode::None => None,
-        IngressMode::Acme => Some(kn_server::ingress::Tls::Acme {
-            email: args.acme_email.clone(),
-            ca: args.acme_ca.clone(),
-        }),
-        IngressMode::Internal => Some(kn_server::ingress::Tls::Internal),
-        IngressMode::Certs => Some(kn_server::ingress::Tls::Folder(absolute(
-            args.certs_dir.clone().context("--ingress certs needs --certs-dir")?,
-        )?)),
-        IngressMode::Http => Some(kn_server::ingress::Tls::Http),
-    };
-    if args.ingress != IngressMode::Acme && (args.acme_email.is_some() || args.acme_ca.is_some()) {
-        bail!("--acme-email and --acme-ca go with --ingress acme");
-    }
-    if args.ingress != IngressMode::Certs && args.certs_dir.is_some() {
-        bail!("--certs-dir goes with --ingress certs");
-    }
-    if let Some(tls) = tls {
-        let mut i = kn_server::ingress::IngressConfig::new(args.caddy_admin, tls);
-        i.api_domain = args.api_domain;
-        i.http_port = args.http_port;
-        i.https_port = args.https_port;
-        i.trusted_proxies = args.trusted_proxies;
-        i.sync_interval = duration("--ingress-sync", &args.ingress_sync)?;
-        if i.sync_interval.is_zero() {
-            bail!("--ingress-sync must be at least 1s");
-        }
-        i.validate()?;
-        cfg.ingress = Some(i);
-    } else if args.api_domain.is_some() {
-        bail!("--api-domain needs an --ingress");
-    }
-    if let Some(domain) = args.registry_domain {
-        if cfg.ingress.is_none() {
-            bail!("--registry-domain needs an --ingress, which serves the registry");
-        }
-        let mut r = kn_server::registry::RegistryConfig::new(domain);
-        r.image = args.registry_image;
-        r.listen = args.registry_listen;
-        r.container = args.registry_container;
-        r.docker = args.docker;
-        r.grace = duration("--registry-grace", &args.registry_grace)?;
-        r.gc_interval = duration("--registry-gc-interval", &args.registry_gc_interval)?;
-        r.validate()?;
-        cfg.registry = Some(r);
-    }
-    kn_server::run(cfg, args.listen).await
-}
-
-async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result<()> {
+async fn upgrade(global: &kn_cli::GlobalArgs, args: UpgradeArgs) -> anyhow::Result<()> {
     if let Some(cmd) = args.cmd {
-        return kn_cli::node(global, cmd).await;
+        return kn_cli::upgrade(global, cmd).await;
     }
-    let server = match (&global.server, args.standalone) {
-        (Some(_), true) => bail!("a node is either --standalone or joined to a --server, not both"),
-        (None, false) => bail!(
-            "run `kiwi-nest node --server URL --join-token TOKEN` to join a server, or `kiwi-nest node \
-             --standalone`"
-        ),
-        (s, _) => s.clone(),
-    };
-    let state_dir = absolute(args.state_dir)?;
-    let mut cfg = kn_node::NodeConfig::new(state_dir);
-    if let Some(v) = args.volumes_dir {
-        cfg.volumes_dir = absolute(v)?;
-    }
-    cfg.project_prefix = args.project_prefix;
-    cfg.ports = parse_ports(&args.ports)?;
-    cfg.allowed_host_paths = args
-        .allow_host_paths
-        .into_iter()
-        .map(absolute)
-        .collect::<Result<_, _>>()?;
-    cfg.docker = args.docker;
-    cfg.up_timeout = duration("--up-timeout", &args.up_timeout)?;
-    cfg.start_timeout = duration("--start-timeout", &args.start_timeout)?;
-    cfg.start_cooldown = duration("--start-cooldown", &args.start_cooldown)?;
-    cfg.image_grace = duration("--image-grace", &args.image_grace)?;
-    cfg.prune_interval = duration("--prune-interval", &args.prune_interval)?;
-    let Some(server) = server else {
-        cfg.backup_targets = args.backup_targets.map(absolute).transpose()?;
-        if args.ingress_listen.is_some() {
-            bail!("a standalone node has no ingress, so no --ingress-listen");
-        }
-        return kn_node::run_standalone(cfg, args.listen, args.gateway_listen).await;
-    };
-    if args.backup_targets.is_some() {
-        bail!("a node joined to a server uses the server's backup targets; give --backup-targets to the server");
-    }
-    let mut agent = kn_node::agent::AgentConfig::new(server, args.name.unwrap_or_else(host_name));
-    agent.join_token = args.join_token;
-    agent.ca_certs = global.read_ca_cert()?;
-    for l in &args.labels {
-        let (k, v) = l
-            .split_once('=')
-            .with_context(|| format!("a label is KEY=VALUE, not {l}"))?;
-        agent.labels.insert(k.trim().to_string(), v.trim().to_string());
-    }
-    kn_node::run_agent(cfg, agent, args.gateway_listen, args.ingress_listen).await
+    #[cfg(feature = "cluster")]
+    return install::upgrade(global, args).await;
+    #[cfg(not(feature = "cluster"))]
+    anyhow::bail!(
+        "this build of kiwi-nest is only the CLI: download a newer one from https://github.com/{}/releases (see \
+         docs/install.md)",
+        kn_proto::REPOSITORY
+    )
+}
+
+/// Replaces this process with `binary`, given the same arguments. Only returns if that fails.
+#[cfg(feature = "cluster")]
+fn exec(binary: &std::path::Path) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    eprintln!("kiwi-nest: restarting into {}", binary.display());
+    std::process::Command::new(binary)
+        .args(std::env::args_os().skip(1))
+        .exec()
 }
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    let default_level =
-        if matches!(&cli.command, Cmd::Node(n) if n.cmd.is_none()) || matches!(cli.command, Cmd::Server(_)) {
-            "info"
-        } else {
-            "warn"
-        };
+    #[cfg(feature = "cluster")]
+    let runs = matches!(&cli.command, Cmd::Node(n) if n.cmd.is_none())
+        || matches!(&cli.command, Cmd::Server(s) if s.cmd.is_none());
+    #[cfg(not(feature = "cluster"))]
+    let runs = false;
+    let default_level = if runs { "info" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_env("KIWI_NEST_LOG").unwrap_or_else(|_| EnvFilter::new(default_level)))
         .with_writer(std::io::stderr)
@@ -422,19 +122,37 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    let done = |r: anyhow::Result<()>| r.map(|()| Exit::Done);
     let result = rt.block_on(async {
         match cli.command {
             Cmd::Version => {
                 println!("kiwi-nest {}", kn_proto::LONG_VERSION);
-                Ok(())
+                Ok(Exit::Done)
             }
-            Cmd::Server(args) => server(*args).await,
-            Cmd::Node(args) => node(&cli.global, *args).await,
-            Cmd::Client(cmd) => kn_cli::run(&cli.global, cmd).await,
+            #[cfg(feature = "cluster")]
+            Cmd::Server(args) => done(cluster::server(&cli.global, *args).await),
+            #[cfg(feature = "cluster")]
+            Cmd::Node(args) => cluster::node(&cli.global, *args).await,
+            Cmd::Upgrade(args) => done(upgrade(&cli.global, *args).await),
+            #[cfg(feature = "cluster")]
+            Cmd::Rollback(args) => done(install::rollback(args).await),
+            #[cfg(feature = "cluster")]
+            Cmd::Units => done(install::units()),
+            Cmd::Client(cmd) => done(kn_cli::run(&cli.global, cmd).await),
         }
     });
+    // Nothing of the runtime is left running into an exec.
+    rt.shutdown_timeout(std::time::Duration::from_secs(2));
     match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(Exit::Done) => std::process::ExitCode::SUCCESS,
+        #[cfg(feature = "cluster")]
+        Ok(Exit::Exec(binary)) => {
+            let e = exec(&binary);
+            eprintln!("kiwi-nest: couldn't run {}: {e}", binary.display());
+            std::process::ExitCode::FAILURE
+        }
+        #[cfg(not(feature = "cluster"))]
+        Ok(Exit::Exec(_)) => std::process::ExitCode::FAILURE,
         Err(e) => {
             eprintln!("kiwi-nest: {e:#}");
             std::process::ExitCode::FAILURE

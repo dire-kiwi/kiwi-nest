@@ -186,13 +186,14 @@ pub fn check_ingress_listen(addr: &SocketAddr) -> anyhow::Result<()> {
 /// Prints `gateway on http://ADDR`, then `ingress gateway on http://ADDR` if it listens for the ingress
 /// (`ingress_listen`, on the node's private address), then `node NAME polling URL` once it has joined (on its
 /// first start, with `agent.join_token`). Apps keep running after the node exits, and the next node agent adopts
-/// them, unless the server forgot the node: then it takes them down, sets its data aside and fails.
+/// them, unless the server forgot the node: then it takes them down, sets its data aside and fails. Returns
+/// [`agent::Stopped::Restart`] when it upgraded itself, for the caller to run the new release in its place.
 pub async fn run_agent(
     cfg: NodeConfig,
     mut agent: agent::AgentConfig,
     gateway_listen: SocketAddr,
     ingress_listen: Option<SocketAddr>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<agent::Stopped> {
     check_loopback(&gateway_listen)?;
     if let Some(a) = &ingress_listen {
         check_ingress_listen(a)?;
@@ -251,7 +252,7 @@ pub async fn run_agent(
     });
     let polling = async {
         let r = agent.run(stop.clone()).await;
-        // Forgotten: the gateways stop too, and the node exits with why.
+        // Forgotten, or restarting into a new release: the gateways stop too.
         stop.cancel();
         r
     };
@@ -268,11 +269,16 @@ pub async fn run_agent(
         }
     };
     let (polled, served, served_ingress) = tokio::join!(polling, gateway, for_ingress);
-    polled?;
+    let stopped = polled?;
     served?;
     served_ingress?;
-    tracing::info!("stopped; apps keep running");
-    Ok(())
+    match &stopped {
+        agent::Stopped::Asked => tracing::info!("stopped; apps keep running"),
+        agent::Stopped::Restart(p) => {
+            tracing::info!(binary = %p.display(), "stopped to restart into the new release; apps keep running")
+        }
+    }
+    Ok(stopped)
 }
 
 async fn shutdown_signal() {

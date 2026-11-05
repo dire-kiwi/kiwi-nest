@@ -10,6 +10,7 @@
 //! - [`backups`] is the backup targets, the schedule, and backups (and restores) of the server's own state.
 //! - [`ingress`] configures the cluster's Caddy.
 //! - [`registry`] runs the cluster's image registry, checks its credentials and collects its garbage.
+//! - [`upgrades`] offers the server's release to older nodes, one at a time.
 //!
 //! On disk:
 //!
@@ -32,6 +33,7 @@ pub mod ingress;
 pub mod registry;
 pub mod scheduler;
 pub mod store;
+pub mod upgrades;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -81,6 +83,14 @@ pub struct ServerConfig {
     pub backup_check_interval: Duration,
     /// How long a backup on a node may take before its caller gives up (the node carries on).
     pub backup_timeout: Duration,
+    /// The server's release for each architecture, offered to older nodes. Empty: nodes aren't upgraded.
+    pub releases: Vec<upgrades::Offer>,
+    /// How long a node may take to download and check a release before it answers.
+    pub upgrade_timeout: Duration,
+    /// How long a node may take to come back, running the new release, after it said it would restart.
+    pub upgrade_restart_timeout: Duration,
+    /// How often the rollout looks for a node to upgrade.
+    pub upgrade_check_interval: Duration,
 }
 
 impl ServerConfig {
@@ -98,6 +108,10 @@ impl ServerConfig {
             backup_targets: Vec::new(),
             backup_check_interval: Duration::from_secs(60),
             backup_timeout: Duration::from_secs(6 * 3600),
+            releases: Vec::new(),
+            upgrade_timeout: Duration::from_secs(600),
+            upgrade_restart_timeout: Duration::from_secs(180),
+            upgrade_check_interval: Duration::from_secs(5),
         }
     }
 }
@@ -116,6 +130,7 @@ pub struct Inner {
     pub stop: CancellationToken,
     pub ingress: Option<Arc<ingress::Ingress>>,
     pub registry: Option<Arc<registry::Registry>>,
+    pub upgrades: Arc<upgrades::Upgrades>,
 }
 
 impl Deref for Server {
@@ -184,7 +199,9 @@ impl Server {
             })
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let upgrades = Arc::new(upgrades::Upgrades::new(cfg.releases.clone()));
         let server = Server(Arc::new(Inner {
+            upgrades,
             cfg,
             store,
             bundles,
@@ -324,12 +341,41 @@ pub async fn serve(
         let (server, stop) = (server.clone(), stop.clone());
         tokio::spawn(async move { registry.run(server, stop).await });
     }
+    tokio::spawn(upgrades::run(server.clone(), stop.clone()));
     let router = server.router();
     let graceful = axum::serve(listener, router).with_graceful_shutdown(stop.clone().cancelled_owned());
     tokio::select! {
         r = graceful => r,
         _ = async { stop.cancelled().await; tokio::time::sleep(Duration::from_secs(5)).await } => Ok(()),
     }
+}
+
+/// Makes the first admin token in a new server's state directory (creating its database), for `kiwi-nest server
+/// init`, so the token is shown to whoever runs it rather than in the server's log. `None` if there's an admin token
+/// already.
+pub async fn first_admin_token(state_dir: &std::path::Path) -> anyhow::Result<Option<String>> {
+    std::fs::create_dir_all(state_dir).with_context(|| format!("creating {}", state_dir.display()))?;
+    let store = Store::open(&state_dir.join("server.sqlite"))?;
+    store
+        .call(|c| {
+            if store::tokens::admin_count(c)? > 0 {
+                return Ok(None);
+            }
+            let token = auth::generate(TokenKind::Admin);
+            store::tokens::create(
+                c,
+                TokenKind::Admin,
+                &auth::hash(&token),
+                "first",
+                &[],
+                &[],
+                None,
+                store::now(),
+            )?;
+            Ok(Some(token))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Runs a server until interrupted. Prints `admin token: TOKEN` on the first start, then
