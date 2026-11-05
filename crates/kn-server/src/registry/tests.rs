@@ -180,6 +180,8 @@ impl FakeRegistry {
 #[derive(Default)]
 struct FakeContainer {
     calls: Mutex<Vec<String>>,
+    /// How long collecting takes; when it isn't instant, its end is recorded as `collected`.
+    collect_takes: Duration,
 }
 
 impl FakeContainer {
@@ -209,7 +211,13 @@ impl Container for FakeContainer {
             "collect"
         };
         self.calls.lock().unwrap().push(c.into());
-        Box::pin(async { Ok("0 blobs marked, 0 blobs and 0 manifests eligible for deletion".into()) })
+        Box::pin(async move {
+            if !self.collect_takes.is_zero() {
+                tokio::time::sleep(self.collect_takes).await;
+                self.calls.lock().unwrap().push("collected".into());
+            }
+            Ok("0 blobs marked, 0 blobs and 0 manifests eligible for deletion".into())
+        })
     }
 }
 
@@ -220,12 +228,18 @@ struct Setup {
 }
 
 async fn setup() -> Setup {
+    setup_with(Duration::from_secs(30), FakeContainer::default()).await
+}
+
+/// With the registry checked every `check_interval`, and `container` for its container.
+async fn setup_with(check_interval: Duration, container: FakeContainer) -> Setup {
     let registry = FakeRegistry::default();
     let addr = registry.serve().await;
     let mut cfg = RegistryConfig::new(HOST);
     cfg.listen = addr;
     cfg.idle_wait = Duration::from_millis(500);
-    let container = Arc::new(FakeContainer::default());
+    cfg.check_interval = check_interval;
+    let container = Arc::new(container);
     // Caddy isn't there; the ingress just keeps trying.
     let ingress = IngressConfig::new("http://127.0.0.1:9", Tls::Http);
     let env = Env::with_registry(Some(ingress), Some((cfg, container.clone()))).await;
@@ -673,4 +687,41 @@ fn credentials_allow_what_their_kind_may_do() {
     assert!(allowed(&ci, "POST", &Target::Catalog).is_err());
     assert!(allowed(&node, "PUT", &m).is_err());
     assert!(allowed(&admin, "DELETE", &m).is_ok());
+}
+
+#[tokio::test]
+async fn the_registry_isnt_started_again_in_the_middle_of_a_collection_asked_for_through_the_api() {
+    // The check that keeps the registry running comes round every 10 ms, and collecting takes a while.
+    let Setup {
+        env,
+        registry,
+        container,
+    } = setup_with(
+        Duration::from_millis(10),
+        FakeContainer {
+            collect_takes: Duration::from_millis(300),
+            ..Default::default()
+        },
+    )
+    .await;
+    registry.image("app", "1", "amd64");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let r = gc(&env, "grace_secs=0").await;
+    assert!(r.collected, "{r:?}");
+    let calls = container.calls();
+    let stop = calls.iter().position(|c| c == "stop").expect("stopped");
+    let done = calls.iter().position(|c| c == "collected").expect("collected");
+    assert_eq!(calls[stop + 1], "collect --delete-untagged");
+    assert!(
+        !calls[stop..done].iter().any(|c| c == "ensure"),
+        "the registry was started while it was being collected: {calls:?}"
+    );
+    // It's started again right after, and the check carries on.
+    assert_eq!(calls[done + 1], "ensure");
+    assert!(
+        calls[..stop].iter().filter(|c| *c == "ensure").count() > 5,
+        "the check was running: {calls:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(container.calls().len() > calls.len() + 3, "the check carries on");
 }

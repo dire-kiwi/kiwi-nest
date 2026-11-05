@@ -68,6 +68,8 @@ pub struct RegistryConfig {
     /// How long garbage collection waits for nothing to be pulling, before it leaves stopping the registry to free
     /// space to its next run.
     pub idle_wait: Duration,
+    /// How often the server checks that the registry is running, and starts it if it isn't.
+    pub check_interval: Duration,
 }
 
 impl RegistryConfig {
@@ -81,6 +83,7 @@ impl RegistryConfig {
             grace: Duration::from_secs(24 * 3600),
             gc_interval: Duration::from_secs(6 * 3600),
             idle_wait: Duration::from_secs(600),
+            check_interval: Duration::from_secs(30),
         }
     }
 
@@ -142,6 +145,10 @@ pub struct Registry {
     gc_lock: tokio::sync::RwLock<()>,
     /// One garbage collection at a time.
     collecting: tokio::sync::Mutex<()>,
+    /// Held while the registry is stopped for its offline collection, which mustn't run beside it, and while the
+    /// check that keeps it running starts it: the check doesn't start it under a collection (which may have been
+    /// asked for through the API, outside [`Registry::run`]).
+    offline: tokio::sync::Mutex<()>,
     /// When the ingress last asked about a request.
     last_request: Mutex<Option<Instant>>,
 }
@@ -342,6 +349,7 @@ impl Registry {
             container,
             gc_lock: tokio::sync::RwLock::new(()),
             collecting: tokio::sync::Mutex::new(()),
+            offline: tokio::sync::Mutex::new(()),
             last_request: Mutex::new(None),
         })
     }
@@ -385,13 +393,19 @@ impl Registry {
         let mut next_gc = Instant::now() + self.cfg.gc_interval;
         let mut failing: Option<String> = None;
         loop {
-            match self.container.ensure().await {
-                Ok(()) => {
+            // Not while it's stopped for collecting: that starts it again itself, once it's done.
+            let checked = match self.offline.try_lock() {
+                Ok(_offline) => Some(self.container.ensure().await),
+                Err(_) => None,
+            };
+            match checked {
+                None => {}
+                Some(Ok(())) => {
                     if failing.take().is_some() {
                         tracing::info!(container = self.cfg.container, "the registry is running again");
                     }
                 }
-                Err(e) => {
+                Some(Err(e)) => {
                     let msg = format!("{e:#}");
                     if failing.as_deref() != Some(&msg) {
                         tracing::warn!(container = self.cfg.container, error = msg, "couldn't run the registry");
@@ -414,7 +428,7 @@ impl Registry {
             }
             tokio::select! {
                 _ = stop.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                _ = tokio::time::sleep(self.cfg.check_interval) => {}
             }
         }
     }
@@ -604,6 +618,7 @@ impl Registry {
 
     /// Stops the registry, collects, and always starts it again.
     async fn collect(&self, delete_untagged: bool) -> Result<()> {
+        let _offline = self.offline.lock().await;
         tracing::info!(
             container = self.cfg.container,
             "stopping the registry to collect its garbage"
