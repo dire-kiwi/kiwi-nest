@@ -382,6 +382,12 @@ pub fn destroy(path: &Path) -> Result<()> {
     let sub = open_dir(path)?;
     let info = inspect_fd(sub.as_fd(), path)?;
     drop(sub);
+    // SAFETY: `geteuid` has no preconditions.
+    let root = unsafe { libc::geteuid() } == 0;
+    if info.read_only && !root {
+        // Without root, the kernel checks write access to the subvolume, which a read-only one refuses.
+        set_read_only(path, false)?;
+    }
     let mut args = vol_args(name);
     let Err(e) = ioctl(dir.as_fd(), IOC_SNAP_DESTROY, &mut *args) else {
         return Ok(());
@@ -394,12 +400,8 @@ pub fn destroy(path: &Path) -> Result<()> {
             }
             ioctl(dir.as_fd(), IOC_SNAP_DESTROY, &mut *args).map_err(|e| Error::io("destroying subvolume", path, e))
         }
-        // SAFETY: `geteuid` has no preconditions.
-        Some(libc::EPERM) if unsafe { libc::geteuid() } != 0 => {
+        Some(libc::EPERM) if !root => {
             // Not root, and no `user_subvol_rm_allowed`: empty it, then `rmdir` (allowed for an empty subvolume).
-            if info.read_only {
-                set_read_only(path, false)?;
-            }
             std::fs::remove_dir_all(path).map_err(|e| Error::io("removing", path, e))
         }
         _ => Err(Error::io("destroying subvolume", path, e)),
