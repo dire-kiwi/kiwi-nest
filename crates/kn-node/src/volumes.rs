@@ -540,8 +540,9 @@ mod tests {
             "{e}"
         );
 
-        // A symlink in its place, even to the right subvolume.
-        std::fs::remove_dir(&data).unwrap();
+        // A symlink in its place, even to the right subvolume. (Removed through the backend, which forgets it, since
+        // the filesystem may give a later directory the same inode.)
+        v.remove(&data).unwrap();
         std::os::unix::fs::symlink(v.app_volume("blog", "aside"), &data).unwrap();
         let e = v.check(&data, Some(id)).unwrap_err();
         assert!(matches!(e, CheckError::Btrfs(BtrfsError::Symlink(_))), "{e}");
