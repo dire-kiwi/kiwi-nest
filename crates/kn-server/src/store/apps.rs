@@ -343,6 +343,8 @@ pub struct Deploy {
     pub from: Option<String>,
     pub node: Option<String>,
     pub queue: bool,
+    /// The images the registry holds for it, with their architectures.
+    pub platforms: Vec<crate::registry::Platforms>,
 }
 
 /// Saves a deploy: reserves the name and domain, works out the nest and its node, stores the bundle and bumps the
@@ -422,6 +424,7 @@ pub fn deploy(
         arch: d.bundle.arch.clone(),
         labels: d.bundle.node_labels.clone(),
         host_paths: d.bundle.host_paths.clone(),
+        images: d.platforms.clone(),
     };
     let placed = place_nest(&tx, online, settings, &nest, d.node.as_deref(), &needs, Some(&d.name))?;
     let node_id = placed.node_id;
@@ -472,14 +475,18 @@ pub fn deploy(
     )?;
     bundles.adopt(&d.upload, &d.bundle.digest)?;
     let created_at = live.map_or(now, |a| a.created_at);
+    if live.is_some() {
+        let old = super::registry::images_of(&tx, &d.name)?;
+        super::registry::release(&tx, &old, &d.bundle.images, now)?;
+    }
     tx.execute(
         "INSERT INTO apps (name, state, node_id, domain, generation, seq, bundle_digest, from_app, shared,
                            memory_bytes, keep_data, created_at, updated_at, nest, nest_via, idle_timeout_secs,
-                           auth)
-         VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15)
+                           auth, images)
+         VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT (name) DO UPDATE SET state = 'active', node_id = ?2, domain = ?3, generation = ?4, seq = ?5,
              bundle_digest = ?6, from_app = ?7, shared = ?8, memory_bytes = ?9, keep_data = 0, created_at = ?10,
-             updated_at = ?11, nest = ?12, nest_via = ?13, idle_timeout_secs = ?14, auth = ?15",
+             updated_at = ?11, nest = ?12, nest_via = ?13, idle_timeout_secs = ?14, auth = ?15, images = ?16",
         params![
             d.name,
             node_id,
@@ -496,6 +503,7 @@ pub fn deploy(
             via,
             d.bundle.idle_timeout_secs,
             serde_json::to_string(&d.bundle.auth)?,
+            serde_json::to_string(&d.bundle.images)?,
         ],
     )?;
     tx.commit()?;
@@ -823,9 +831,11 @@ pub fn record_report(c: &mut Connection, bundles: &Bundles, node_id: u64, report
     for a in deleting {
         match report.applied.apps.get(&a.name) {
             Some(o) if o.generation >= a.generation && o.ok => {
+                // Its images are kept for the grace period, so deploying it again doesn't pull them.
+                super::registry::release(&tx, &super::registry::images_of(&tx, &a.name)?, &[], now)?;
                 tx.execute(
-                    "UPDATE apps SET state = 'deleted', domain = NULL, bundle_digest = NULL, updated_at = ?2
-                     WHERE name = ?1",
+                    "UPDATE apps SET state = 'deleted', domain = NULL, bundle_digest = NULL, images = NULL,
+                     updated_at = ?2 WHERE name = ?1",
                     params![a.name, now],
                 )?;
                 tracing::info!(app = a.name, "deleted");
@@ -904,13 +914,14 @@ pub fn gc(c: &Connection, bundles: &Bundles) -> Result<()> {
     Ok(())
 }
 
-/// Reads the basic-auth users of apps deployed before the server kept them, from their bundles. An app whose
-/// bundle can't be read keeps none recorded, and the ingress doesn't route it until it's deployed again.
-pub fn backfill_auth(c: &Connection, bundles: &Bundles, limits: &kn_bundle::Limits) -> Result<()> {
+/// Reads what the server records of each app's bundle (its basic-auth users, its images) for apps deployed before
+/// the server recorded it. An app whose bundle can't be read keeps none recorded: the ingress doesn't route it,
+/// and the registry's garbage collection deletes nothing, until it's deployed again.
+pub fn backfill(c: &Connection, bundles: &Bundles, limits: &kn_bundle::Limits) -> Result<()> {
     let missing: Vec<(String, String)> = {
         let mut st = c.prepare(
             "SELECT name, bundle_digest FROM apps
-             WHERE auth IS NULL AND state != 'deleted' AND bundle_digest IS NOT NULL",
+             WHERE (auth IS NULL OR images IS NULL) AND state != 'deleted' AND bundle_digest IS NOT NULL",
         )?;
         st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?
@@ -926,15 +937,15 @@ pub fn backfill_auth(c: &Connection, bundles: &Bundles, limits: &kn_bundle::Limi
         match checked {
             Ok(b) => {
                 c.execute(
-                    "UPDATE apps SET auth = ?2 WHERE name = ?1",
-                    params![name, serde_json::to_string(&b.auth)?],
+                    "UPDATE apps SET auth = coalesce(auth, ?2), images = coalesce(images, ?3) WHERE name = ?1",
+                    params![name, serde_json::to_string(&b.auth)?, serde_json::to_string(&b.images)?],
                 )?;
             }
             Err(e) => tracing::warn!(
                 app = name,
                 error = %e,
-                "couldn't read the app's basic-auth users from its bundle; the ingress won't route it until it's \
-                 deployed again"
+                "couldn't read the app's bundle; until it's deployed again, the ingress won't route it if its \
+                 basic-auth users aren't known, nor will the registry's garbage collection delete anything"
             ),
         }
     }

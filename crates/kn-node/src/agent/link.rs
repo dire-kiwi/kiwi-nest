@@ -124,6 +124,22 @@ impl Link {
         Ok(check(resp).await?.json::<IngressToken>().await?.ingress_token)
     }
 
+    /// A new registry credential for this node, replacing its last one; `None` if the cluster has no registry.
+    pub async fn registry_login(&self) -> Result<Option<kn_proto::agent::RegistryLogin>, LinkError> {
+        let resp = self
+            .http
+            .post(format!("{}/agent/registry", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        Ok(check(resp)
+            .await?
+            .json::<kn_proto::agent::RegistryCredential>()
+            .await?
+            .registry)
+    }
+
     pub async fn poll(&self, req: &PollRequest, wait: Duration) -> Result<PollResponse, LinkError> {
         let resp = self
             .http

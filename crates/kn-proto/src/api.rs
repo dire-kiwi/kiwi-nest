@@ -39,6 +39,10 @@
 //! | `GET /tokens` | | `Vec<`[`TokenInfo`]`>` |
 //! | `POST /tokens` | [`CreateToken`] | [`CreatedToken`] |
 //! | `DELETE /tokens/{id}` | | `204 No Content` |
+//! | `POST /nodes/{name}/prune?` [`PruneQuery`] | | [`PruneReport`] |
+//! | `GET /registry` | | [`RegistryInfo`] |
+//! | `POST /registry/gc?` [`GcQuery`] | | [`GcReport`] (admin) |
+//! | `GET /registry/auth` | | `200`, `401` or `403`: the ingress asks it about every request to the registry |
 
 use std::collections::BTreeMap;
 
@@ -383,6 +387,71 @@ pub struct Forgot {
     pub nests: Vec<String>,
     #[serde(default)]
     pub dry_run: bool,
+}
+
+/// `GET /registry`: the cluster's image registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryInfo {
+    /// The host that image references name, such as `registry.example.com` (with a port if the ingress isn't on
+    /// the default one).
+    pub host: String,
+}
+
+/// The query of `POST /registry/gc`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GcQuery {
+    /// Only say what would be deleted.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// The grace period in seconds, instead of the server's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_secs: Option<u64>,
+}
+
+/// One tag in the registry, and what garbage collection did with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcTag {
+    pub repository: String,
+    pub tag: String,
+    pub digest: String,
+    /// Why it's kept, such as `used by app blog on node a`; empty for one deleted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+}
+
+/// What `POST /registry/gc` did (or, as a dry run, would do).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GcReport {
+    pub deleted: Vec<GcTag>,
+    pub kept: Vec<GcTag>,
+    /// Whether the registry's own garbage collection ran, which frees the deleted images' layers.
+    pub collected: bool,
+    /// Why it didn't, if it was needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postponed: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// The query of `POST /nodes/{name}/prune`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PruneQuery {
+    /// The grace period in seconds, instead of the node's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_secs: Option<u64>,
+}
+
+/// What pruning a node's images did: those it removed, and those of its apps' past images it kept, with why.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneReport {
+    pub removed: Vec<String>,
+    pub kept: Vec<KeptImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptImage {
+    pub image: String,
+    pub why: String,
 }
 
 /// The kinds of token.

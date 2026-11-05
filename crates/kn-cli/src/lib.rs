@@ -9,7 +9,7 @@
 //! node is refused, saving nothing, unless `--queue` is given.
 //!
 //! `volume …` manages shared volumes; `deploy --from` and `delete --keep-data` decide what happens to an app's.
-//! `nest list` and `node list|label|cordon|uncordon|forget` need a server.
+//! `nest list`, `node list|label|cordon|uncordon|forget|prune`, `push` and `registry …` need a server.
 
 pub mod config;
 
@@ -22,8 +22,8 @@ use clap::{Args, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use kn_proto::api::{
     Accepted, AppInfo, AppSummary, ChangeStatus, CreateToken, CreatedToken, DeleteQuery, DeployDirectory, DeployQuery,
-    ErrorBody, ForgetQuery, Forgot, LabelRequest, LogsQuery, NestInfo, NodeInfo, TokenInfo, TokenKind, VolumeInfo,
-    VolumeQuery, WaitQuery, WhoAmI,
+    ErrorBody, ForgetQuery, Forgot, GcQuery, GcReport, LabelRequest, LogsQuery, NestInfo, NodeInfo, PruneQuery,
+    PruneReport, RegistryInfo, TokenInfo, TokenKind, VolumeInfo, VolumeQuery, WaitQuery, WhoAmI,
 };
 
 /// The standalone node API's default address.
@@ -152,6 +152,20 @@ pub enum Command {
         #[arg(long)]
         queue: bool,
     },
+    /// Push a local image to the cluster's registry as NAME:TAG, and print the reference to use in bundles.
+    ///
+    /// It logs Docker in to the registry with this CLI's token (a deploy or admin token), tags the image and runs
+    /// `docker push`.
+    Push {
+        /// The local image, such as `blog-deps:dev`.
+        local: String,
+        /// Its name and tag in the registry, such as `blog-deps:3`.
+        #[arg(value_name = "NAME:TAG")]
+        name: String,
+    },
+    /// The cluster's image registry.
+    #[command(subcommand)]
+    Registry(RegistryCommand),
     /// Shared volumes, which apps mount through `x-kiwi-nest.shared`.
     #[command(subcommand)]
     Volume(VolumeCommand),
@@ -220,6 +234,28 @@ pub enum VolumeCommand {
 }
 
 #[derive(Debug, Clone, Subcommand)]
+pub enum RegistryCommand {
+    /// Print the registry's host, which image references start with.
+    Host,
+    /// Log Docker in to the registry with this CLI's token, for `docker push` and `docker pull`.
+    Login,
+    /// Collect garbage now (admin only): delete the tags that no app on any node uses, and that weren't pushed or
+    /// released within the grace period (keeping any that share an image with one that's kept), then free their
+    /// layers. The registry is stopped for a moment for that, once nothing is pulling.
+    Gc {
+        /// Only say what would be deleted.
+        #[arg(long)]
+        dry_run: bool,
+        /// The grace period, such as 1h or 0, instead of the server's.
+        #[arg(long)]
+        grace: Option<String>,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
 pub enum NestCommand {
     /// List the nests: each one's node, apps, shared volumes and memory, and why it's on that node.
     List {
@@ -262,6 +298,17 @@ pub enum NodeCommand {
         /// Don't ask for confirmation.
         #[arg(long)]
         yes: bool,
+    },
+    /// Have a node remove the images its apps stopped using, once nothing uses them and they were released longer
+    /// ago than the grace period. Nodes also do this by themselves, every hour by default.
+    Prune {
+        node: String,
+        /// The grace period, such as 1h or 0, instead of the node's.
+        #[arg(long)]
+        grace: Option<String>,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -586,6 +633,23 @@ impl Client {
     pub async fn whoami(&self) -> anyhow::Result<WhoAmI> {
         self.json(self.get("/whoami")).await
     }
+
+    pub async fn registry(&self) -> anyhow::Result<RegistryInfo> {
+        self.json(self.get("/registry")).await
+    }
+
+    pub async fn registry_gc(&self, q: &GcQuery) -> anyhow::Result<GcReport> {
+        self.json(self.req(reqwest::Method::POST, "/registry/gc").query(q))
+            .await
+    }
+
+    pub async fn node_prune(&self, node: &str, q: &PruneQuery) -> anyhow::Result<PruneReport> {
+        self.json(
+            self.req(reqwest::Method::POST, &format!("/nodes/{node}/prune"))
+                .query(q),
+        )
+        .await
+    }
 }
 
 /// An error answer from the API.
@@ -878,6 +942,8 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                 println!("deleted {name}");
             }
         }
+        Command::Push { local, name } => push(&client, &local, &name).await?,
+        Command::Registry(cmd) => registry(&client, cmd).await?,
         Command::Volume(cmd) => volume(&client, cmd).await?,
         Command::Nest(cmd) => nest(&client, cmd).await?,
         Command::Token(cmd) => token(&client, cmd).await?,
@@ -1305,6 +1371,177 @@ pub async fn node(global: &GlobalArgs, cmd: NodeCommand) -> anyhow::Result<()> {
             }
             if !f.nests.is_empty() {
                 println!("  released nests: {}", f.nests.join(", "));
+            }
+        }
+        NodeCommand::Prune { node, grace, json } => {
+            let grace_secs = grace.map(|g| duration("--grace", &g)).transpose()?.map(|d| d.as_secs());
+            let r = client.node_prune(&node, &PruneQuery { grace_secs }).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            for i in &r.removed {
+                println!("removed {i}");
+            }
+            for k in &r.kept {
+                println!("kept {} ({})", k.image, k.why);
+            }
+            if r.removed.is_empty() && r.kept.is_empty() {
+                println!("node {node} has no images its apps stopped using");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` can name a repository in the registry: lowercase components of letters and digits, joined by
+/// `.`, `_` or `-`, separated by `/`.
+fn valid_repository(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name.split('/').all(|c| {
+            let b = c.as_bytes();
+            !b.is_empty()
+                && b.iter()
+                    .all(|x| x.is_ascii_lowercase() || x.is_ascii_digit() || matches!(x, b'.' | b'_' | b'-'))
+                && b[0].is_ascii_alphanumeric()
+                && b[b.len() - 1].is_ascii_alphanumeric()
+        })
+}
+
+fn valid_tag(t: &str) -> bool {
+    let b = t.as_bytes();
+    !b.is_empty()
+        && b.len() <= 128
+        && (b[0].is_ascii_alphanumeric() || b[0] == b'_')
+        && b.iter()
+            .all(|x| x.is_ascii_alphanumeric() || matches!(x, b'_' | b'.' | b'-'))
+}
+
+/// Splits `NAME:TAG`, checking both.
+fn name_and_tag(name: &str) -> anyhow::Result<(&str, &str)> {
+    let Some((repo, tag)) = name.rsplit_once(':').filter(|(_, t)| !t.contains('/')) else {
+        bail!("give the image's name in the registry with a tag, such as `blog-deps:3`, not `{name}`");
+    };
+    if !valid_repository(repo) {
+        bail!(
+            "`{repo}` can't name an image in the registry: use lowercase letters, digits, and `.`, `_` or `-` \
+             between them, with `/` between parts"
+        );
+    }
+    if !valid_tag(tag) {
+        bail!("`{tag}` isn't a tag: use up to 128 letters, digits, `_`, `.` and `-`, not starting with `.` or `-`");
+    }
+    Ok((repo, tag))
+}
+
+/// Runs `docker` with `args`, failing with its output if it fails.
+async fn docker(args: &[&str], stdin: Option<&str>) -> anyhow::Result<String> {
+    use tokio::io::AsyncWriteExt;
+    let mut c = tokio::process::Command::new("docker");
+    c.args(args)
+        .stdin(if stdin.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().context("running docker")?;
+    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        pipe.write_all(input.as_bytes()).await?;
+        drop(pipe);
+    }
+    let out = child.wait_with_output().await?;
+    if !out.status.success() {
+        bail!(
+            "`docker {}` failed: {}",
+            args.first().copied().unwrap_or_default(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Logs Docker in to the registry with the CLI's token.
+async fn docker_login(client: &Client, host: &str) -> anyhow::Result<()> {
+    let token = client
+        .token
+        .as_deref()
+        .context("logging in to the registry needs a token")?;
+    docker(
+        &["login", "--username", "kiwi-nest", "--password-stdin", host],
+        Some(token),
+    )
+    .await
+    .with_context(|| format!("logging Docker in to {host}"))?;
+    Ok(())
+}
+
+/// `kiwi-nest push LOCAL NAME:TAG`.
+async fn push(client: &Client, local: &str, name: &str) -> anyhow::Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    server_only(client, "`push`")?;
+    let (repo, tag) = name_and_tag(name)?;
+    let host = client.registry().await?.host;
+    let reference = format!("{host}/{repo}:{tag}");
+    docker_login(client, &host).await?;
+    docker(&["tag", local, &reference], None).await?;
+    eprintln!("pushing {reference}");
+    let mut child = tokio::process::Command::new("docker")
+        .args(["push", &reference])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .context("running docker")?;
+    let mut lines = tokio::io::BufReader::new(child.stdout.take().context("docker's output")?).lines();
+    let mut digest = None;
+    while let Some(line) = lines.next_line().await? {
+        if let Some(d) = line.split("digest: ").nth(1).and_then(|r| r.split_whitespace().next()) {
+            digest = Some(d.to_string());
+        }
+        eprintln!("{line}");
+    }
+    let status = child.wait().await?;
+    if !status.success() {
+        bail!("`docker push {reference}` failed ({status})");
+    }
+    if let Some(d) = digest {
+        eprintln!("pushed {reference} ({d}); use it in a bundle as `image: {reference}`");
+    }
+    println!("{reference}");
+    Ok(())
+}
+
+/// `kiwi-nest registry host|login|gc`.
+async fn registry(client: &Client, cmd: RegistryCommand) -> anyhow::Result<()> {
+    server_only(client, "`registry`")?;
+    match cmd {
+        RegistryCommand::Host => println!("{}", client.registry().await?.host),
+        RegistryCommand::Login => {
+            let host = client.registry().await?.host;
+            docker_login(client, &host).await?;
+            println!("logged Docker in to {host}");
+        }
+        RegistryCommand::Gc { dry_run, grace, json } => {
+            let grace_secs = grace.map(|g| duration("--grace", &g)).transpose()?.map(|d| d.as_secs());
+            let r = client.registry_gc(&GcQuery { dry_run, grace_secs }).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            let verb = if dry_run { "would delete" } else { "deleted" };
+            for t in &r.deleted {
+                println!("{verb} {}:{}", t.repository, t.tag);
+            }
+            for t in &r.kept {
+                println!("kept {}:{} ({})", t.repository, t.tag, t.why);
+            }
+            if r.collected {
+                println!("freed the deleted images' layers");
+            }
+            if let Some(p) = &r.postponed {
+                println!("{p}");
             }
         }
     }

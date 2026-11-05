@@ -42,6 +42,13 @@ pub struct NodeConfig {
     pub load_limits: Limits,
     /// The Docker CLI.
     pub docker: PathBuf,
+    /// The Docker configuration directory the node runs Docker with (`DOCKER_CONFIG`), if not the environment's: a
+    /// node joined to a server has its own, `STATE/docker`, holding its registry credential.
+    pub docker_config: Option<PathBuf>,
+    /// How long an image an app stopped using is kept, so deploying it again doesn't pull it.
+    pub image_grace: Duration,
+    /// How often unused images are removed; zero for never.
+    pub prune_interval: Duration,
     /// How long `docker compose up` may wait for an app's containers to be running and healthy.
     pub up_timeout: Duration,
     /// How long starting a stopped app may take, until it's healthy and its port answers.
@@ -66,6 +73,9 @@ impl NodeConfig {
             limits: Limits::default(),
             load_limits: Limits::for_volumes(),
             docker: "docker".into(),
+            docker_config: None,
+            image_grace: Duration::from_secs(24 * 3600),
+            prune_interval: Duration::from_secs(3600),
             up_timeout: Duration::from_secs(300),
             start_timeout: Duration::from_secs(120),
             start_cooldown: Duration::from_secs(15),
@@ -184,9 +194,12 @@ pub async fn run_agent(
     if let Some(a) = &ingress_listen {
         check_ingress_listen(a)?;
     }
+    // Docker runs with the node's own configuration, which holds its registry credential.
+    let mut cfg = cfg;
+    cfg.docker_config = Some(cfg.state_dir.join("docker"));
     // A node the server forgot finishes taking its apps down before it opens (and adopts) them.
     cfg.validate()?;
-    agent::prepare(&cfg, &runtime::Docker::new(&cfg.docker), agent.join_token.is_some()).await?;
+    agent::prepare(&cfg, &runtime::Docker::for_node(&cfg), agent.join_token.is_some()).await?;
     let apps = apps::Apps::open(cfg).await?;
     let gw_listener = tokio::net::TcpListener::bind(gateway_listen)
         .await

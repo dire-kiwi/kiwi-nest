@@ -884,6 +884,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "bytes",
  "futures-util",
  "http-body-util",
@@ -920,6 +921,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "bytes",
  "futures-util",
  "getrandom 0.3.4",
@@ -927,6 +929,7 @@ dependencies = [
  "humantime",
  "kn-bundle",
  "kn-proto",
+ "libc",
  "reqwest",
  "rusqlite",
  "rustls",

@@ -87,6 +87,16 @@ pub struct LogsOptions {
     pub service: Option<String>,
 }
 
+/// What removing an image came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageRemoval {
+    Removed,
+    /// There was no such image.
+    Missing,
+    /// A container uses it, so it stays.
+    InUse,
+}
+
 /// What the node needs from a container runtime: an app's Compose project, created, started, stopped and listed.
 ///
 /// [`Docker`] is the real one. Tests use a fake, so the gateway's lifecycle can be checked without Docker.
@@ -110,18 +120,33 @@ pub trait Runtime: Send + Sync + 'static {
     /// Starts `docker compose logs`, with its output piped. The caller reads it, and the process is killed when
     /// the [`Child`] is dropped.
     fn logs(&self, p: &Project, opts: &LogsOptions) -> Result<Child, RuntimeError>;
+    /// Removes an image by reference, unless a container (any container on the engine) uses it.
+    fn remove_image<'a>(&'a self, reference: &'a str) -> BoxFuture<'a, Result<ImageRemoval, RuntimeError>>;
 }
 
 /// Runs `docker compose`.
 #[derive(Debug, Clone)]
 pub struct Docker {
     docker: PathBuf,
+    /// The Docker configuration directory to use (`DOCKER_CONFIG`), rather than the environment's.
+    config: Option<PathBuf>,
 }
 
 impl Docker {
     /// `docker` is the Docker CLI to run, such as `docker` (found on `PATH`) or `/usr/bin/docker`.
     pub fn new(docker: impl Into<PathBuf>) -> Self {
-        Docker { docker: docker.into() }
+        Docker {
+            docker: docker.into(),
+            config: None,
+        }
+    }
+
+    /// Docker as the node runs it: with the node's own configuration directory, if it has one.
+    pub fn for_node(cfg: &crate::NodeConfig) -> Self {
+        Docker {
+            docker: cfg.docker.clone(),
+            config: cfg.docker_config.clone(),
+        }
     }
 
     fn base(&self) -> Command {
@@ -134,6 +159,9 @@ impl Docker {
         }
         if std::env::var_os("PATH").is_none() {
             c.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        }
+        if let Some(dir) = &self.config {
+            c.env("DOCKER_CONFIG", dir);
         }
         c.env("COMPOSE_DISABLE_ENV_FILE", "1");
         c.stdin(Stdio::null()).kill_on_drop(true);
@@ -272,6 +300,25 @@ impl Runtime for Docker {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|source| RuntimeError::Spawn { command, source })
+    }
+
+    fn remove_image<'a>(&'a self, reference: &'a str) -> BoxFuture<'a, Result<ImageRemoval, RuntimeError>> {
+        Box::pin(async move {
+            let mut c = self.base();
+            c.args(["image", "rm", reference]);
+            match self.run(c).await {
+                Ok(_) => Ok(ImageRemoval::Removed),
+                Err(RuntimeError::Failed { stderr, .. }) if stderr.contains("No such image") => {
+                    Ok(ImageRemoval::Missing)
+                }
+                Err(RuntimeError::Failed { stderr, .. })
+                    if stderr.contains("conflict") || stderr.contains("is using") || stderr.contains("being used") =>
+                {
+                    Ok(ImageRemoval::InUse)
+                }
+                Err(e) => Err(e),
+            }
+        })
     }
 }
 

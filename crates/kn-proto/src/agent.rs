@@ -9,6 +9,7 @@
 //! | --- | --- | --- |
 //! | `POST /agent/join` | [`JoinRequest`] | [`JoinResponse`] |
 //! | `GET /agent/ingress-token` | | [`IngressToken`], for a node that joined before ingress tokens |
+//! | `POST /agent/registry` | | [`RegistryCredential`]: a new credential for the registry, replacing the last |
 //! | `POST /agent/poll` | [`PollRequest`] | [`PollResponse`], once something changed or the wait is over |
 //! | `POST /agent/report` | [`Report`] | `204 No Content`, at once |
 //! | `GET /agent/bundles/{digest}` | | the bundle's ZIP |
@@ -68,6 +69,27 @@ pub struct JoinResponse {
     /// The token the ingress adds to every request it sends to the node's gateway ([`INGRESS_HEADER`]).
     #[serde(default)]
     pub ingress_token: String,
+    /// The node's read-only credential for the cluster's registry, if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryLogin>,
+}
+
+/// A login for the cluster's image registry, which the node writes into its Docker configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryLogin {
+    /// The host that image references name, such as `registry.example.com`.
+    pub host: String,
+    pub username: String,
+    /// A `knr_…` credential, which may only pull.
+    pub password: String,
+}
+
+/// `POST /agent/registry`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RegistryCredential {
+    /// `None` if the cluster has no registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryLogin>,
 }
 
 /// `GET /agent/ingress-token`.
@@ -172,6 +194,9 @@ pub struct AppReport {
     pub bundle_digest: String,
     /// What Docker reports for its containers, such as `running(2)`; `unknown` if Docker couldn't be asked.
     pub containers: String,
+    /// It's being started, or deployed, or looked at after the node agent started, so it may be pulling images.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub starting: bool,
 }
 
 /// The changes a node has finished applying, by app and by shared volume.
@@ -293,6 +318,12 @@ pub enum Action {
     VolumeInfo { name: String },
     /// Answers with `null`.
     DeleteSnapshot { name: String, app: String },
+    /// Removes the images of the node's past apps that nothing uses, and that weren't released within the grace
+    /// period (the node's own, unless given). Answers with a [`crate::api::PruneReport`].
+    PruneImages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grace_secs: Option<u64>,
+    },
 }
 
 impl Action {
@@ -303,6 +334,7 @@ impl Action {
                 app
             }
             Action::VolumeInfo { name } | Action::DeleteSnapshot { name, .. } => name,
+            Action::PruneImages { .. } => "",
         }
     }
 }
