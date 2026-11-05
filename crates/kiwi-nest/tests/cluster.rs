@@ -130,9 +130,14 @@ fn two_nodes_join_and_report_domains_are_unique_and_deploy_tokens_are_limited() 
         "a preview goes to its production's node: {out}"
     );
     assert!(out.contains("snapshotted volume `data` from `blog`"), "{out}");
+    let list = server.ok_as(&ci, &["list"]);
     assert!(
-        !server.ok_as(&ci, &["list"]).contains("blog "),
-        "the token only sees its own apps"
+        !list.lines().any(|l| l.starts_with("blog ")),
+        "the token only sees its own apps: {list}"
+    );
+    assert!(
+        list.lines().any(|l| l.starts_with("blog-pr1 ") && l.contains(" blog ")),
+        "the preview is in production's nest: {list}"
     );
 
     // Restarting the server loses nothing: apps, tokens, nodes.
@@ -264,4 +269,111 @@ fn a_deploy_to_an_offline_node_is_refused_and_saves_nothing() {
             std::thread::sleep(Duration::from_millis(250));
         }
     }
+}
+
+#[test]
+fn a_forgotten_node_never_runs_its_apps_again() {
+    if !docker_and_btrfs() {
+        return;
+    }
+    let mut server = Server::start();
+    let prefix = random_prefix();
+    let mut a = ClusterNode::join(&server, "a", &format!("{prefix}a-"));
+    let b = ClusterNode::join(&server, "b", &format!("{prefix}b-"));
+    server.wait_online("a", true);
+    server.wait_online("b", true);
+    let bundle = tempfile::tempdir().unwrap();
+    let p = bundle.path().to_str().unwrap();
+    write_bundle(bundle.path(), "blog.localhost", "blog", false);
+    let out = server.ok(&["deploy", "blog", p, "--node", "a"]);
+    assert!(out.contains("on node a"), "{out}");
+    let info = server.inspect("blog");
+    assert_eq!(info["nest"], "blog");
+    assert!(
+        info["placement"]
+            .as_str()
+            .unwrap()
+            .contains("went to node a when `blog` was deployed: --node a"),
+        "{info}"
+    );
+    let nests = server.ok(&["nest", "list"]);
+    assert!(
+        nests.lines().any(|l| l.starts_with("blog ") && l.contains(" a ")),
+        "{nests}"
+    );
+    let data = a.volumes_dir().join("apps/blog/data");
+    std::fs::write(data.join("posts"), "the only copy").unwrap();
+    let old = container_id(&format!("{prefix}a-blog"));
+    assert!(!old.is_empty());
+
+    // A plain outage takes nothing down.
+    server.down_for(Duration::from_secs(5));
+    server.wait_online("a", true);
+    assert_eq!(
+        container_id(&format!("{prefix}a-blog")),
+        old,
+        "the outage changed nothing"
+    );
+    assert!(!a.state("agent.json").contains("forgotten"));
+
+    // a is lost; it's refused while online, and then forgotten.
+    let err = server.fails(&["node", "forget", "a", "--yes"]);
+    assert!(err.contains("is online"), "{err}");
+    a.kill();
+    server.wait_online("a", false);
+    let err = server.fails(&["node", "forget", "a"]);
+    assert!(err.contains("Make sure node a is really gone first"), "{err}");
+    assert!(err.contains("pass --yes"), "{err}");
+    let out = server.ok(&["node", "forget", "a", "--yes"]);
+    assert!(
+        out.contains("forgot node a") && out.contains("released apps: blog"),
+        "{out}"
+    );
+    // Cut off from the server, its always-on app still runs (which is why you make sure the node is gone).
+    assert_eq!(container_id(&format!("{prefix}a-blog")), old);
+
+    // The app is deployed again on b.
+    let out = server.ok(&["deploy", "blog", p]);
+    assert!(out.contains("deployed blog (generation 2) on node b"), "{out}");
+    let port = server.inspect("blog")["port"].as_u64().unwrap();
+    assert_eq!(get(port), "blog");
+
+    // a comes back: it takes its app down, sets its data aside (not deleted) and stops.
+    a.start();
+    assert!(!a.exits().success());
+    assert!(
+        container_id(&format!("{prefix}a-blog")).is_empty(),
+        "a's containers are removed"
+    );
+    let aside: Vec<_> = std::fs::read_dir(a.volumes_dir().join("forgotten"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(aside.len(), 1, "{aside:?}");
+    assert_eq!(
+        std::fs::read_to_string(aside[0].join("apps/blog/data/posts")).unwrap(),
+        "the only copy"
+    );
+    assert!(aside[0].join("state.json").exists());
+    // Its agent won't start again without a fresh join token.
+    let out = a.run_once(None);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("forgot this node") && stderr.contains("fresh join token"),
+        "{stderr}"
+    );
+    // The app only ever runs on b.
+    assert!(container_id(&format!("{prefix}a-blog")).is_empty());
+    assert!(!container_id(&format!("{prefix}b-blog")).is_empty());
+    assert_eq!(server.inspect("blog")["node"], "b");
+
+    // With a fresh join token, it's a new node, with nothing on it.
+    a.join_again(&server);
+    server.wait_online("a", true);
+    let n = server.nodes().into_iter().find(|n| n["name"] == "a").unwrap();
+    assert_eq!(n["apps"], 0, "{n}");
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(container_id(&format!("{prefix}a-blog")).is_empty());
+    drop(b);
 }
