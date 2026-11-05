@@ -122,6 +122,12 @@ pub struct CheckedApp {
     pub digest: String,
     pub domain: String,
     pub arch: Option<String>,
+    /// `x-kiwi-nest.nest`.
+    pub nest: Option<String>,
+    /// The labels its node must have.
+    pub node_labels: std::collections::BTreeMap<String, String>,
+    /// 0 for an always-on app.
+    pub idle_timeout_secs: u64,
     /// The shared volumes it mounts.
     pub shared: Vec<String>,
     /// Those it mounts read-write.
@@ -173,6 +179,9 @@ pub fn check_app(zip: &Path, scratch: &Path, limits: &Limits) -> Result<CheckedA
         digest: index.digest(),
         domain: m.domain.clone(),
         arch: m.arch.map(|a| a.as_str().to_string()),
+        nest: m.nest.clone(),
+        node_labels: m.node_labels.clone(),
+        idle_timeout_secs: m.idle_timeout_secs,
         shared: m.shared.keys().cloned().collect(),
         shared_rw: m
             .shared

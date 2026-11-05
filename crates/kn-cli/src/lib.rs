@@ -9,6 +9,7 @@
 //! node is refused, saving nothing, unless `--queue` is given.
 //!
 //! `volume …` manages shared volumes; `deploy --from` and `delete --keep-data` decide what happens to an app's.
+//! `nest list` and `node list|label|cordon|uncordon|forget` need a server.
 
 pub mod config;
 
@@ -21,7 +22,8 @@ use clap::{Args, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use kn_proto::api::{
     Accepted, AppInfo, AppSummary, ChangeStatus, CreateToken, CreatedToken, DeleteQuery, DeployDirectory, DeployQuery,
-    ErrorBody, LogsQuery, NodeInfo, TokenInfo, TokenKind, VolumeInfo, VolumeQuery, WaitQuery, WhoAmI,
+    ErrorBody, ForgetQuery, Forgot, LabelRequest, LogsQuery, NestInfo, NodeInfo, TokenInfo, TokenKind, VolumeInfo,
+    VolumeQuery, WaitQuery, WhoAmI,
 };
 
 /// The standalone node API's default address.
@@ -69,7 +71,8 @@ pub enum Command {
         /// On the app's first deploy, start each named volume it shares with APP as an instant snapshot of APP's.
         #[arg(long, value_name = "APP")]
         from: Option<String>,
-        /// The node for a new app; by default the server picks the one with the most free memory.
+        /// The node for the app's nest, if the nest is new; by default the server picks the one with the most memory
+        /// headroom. A nest that exists stays on its node.
         #[arg(long, value_name = "NODE")]
         node: Option<String>,
         /// Save the deploy even if its node is offline; it's applied when the node is back. Doesn't wait.
@@ -128,6 +131,9 @@ pub enum Command {
     /// Shared volumes, which apps mount through `x-kiwi-nest.shared`.
     #[command(subcommand)]
     Volume(VolumeCommand),
+    /// Nests: the apps and shared volumes that live together on one node.
+    #[command(subcommand)]
+    Nest(NestCommand),
     /// Tokens for the CLI, CI and joining nodes (admin only).
     #[command(subcommand)]
     Token(TokenCommand),
@@ -141,7 +147,11 @@ pub enum VolumeCommand {
     /// Create an empty shared volume.
     Create {
         name: String,
-        /// Through a server: the node for it; by default the server picks one.
+        /// Through a server: the volume's nest [default: a nest named after the volume]. An existing nest's volumes
+        /// go to its node.
+        #[arg(long, value_name = "NEST")]
+        nest: Option<String>,
+        /// Through a server: the node for its nest, if the nest is new; by default the server picks one.
         #[arg(long, value_name = "NODE")]
         node: Option<String>,
         /// Save it even if its node is offline. Doesn't wait.
@@ -183,6 +193,52 @@ pub enum VolumeCommand {
     },
     /// Delete APP's snapshot of a shared volume. Refused while APP is deployed and mounts it.
     DeleteSnapshot { name: String, app: String },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum NestCommand {
+    /// List the nests: each one's node, apps, shared volumes and memory, and why it's on that node.
+    List {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `kiwi-nest node …`, the cluster's nodes (admin only).
+#[derive(Debug, Clone, Subcommand)]
+pub enum NodeCommand {
+    /// List the cluster's nodes: online or not, what they reported, and what's placed on them.
+    List {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set labels on a node for placement (`KEY=VALUE`), or remove ones set this way (`KEY-`). A node's own
+    /// `--label`s are kept; labels set here win over them.
+    Label {
+        node: String,
+        #[arg(required = true, value_name = "KEY=VALUE|KEY-")]
+        labels: Vec<String>,
+    },
+    /// Stop placing new nests on a node. Its nests stay, and still take new members.
+    Cordon { node: String },
+    /// Let a cordoned node take new nests again.
+    Uncordon { node: String },
+    /// Forget a node that's gone: revoke its token and release its apps' names and domains, its shared volumes and
+    /// its nests, so they can be deployed elsewhere. Its data stays on it.
+    ///
+    /// Make sure the node is really gone first (powered off, or its apps stopped): while it runs cut off from the
+    /// server, its always-on apps keep running. If it comes back, it takes its apps down and sets their data aside.
+    Forget {
+        node: String,
+        /// Forget it even though it's online.
+        #[arg(long)]
+        force: bool,
+        /// Don't ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -463,6 +519,32 @@ impl Client {
         self.json(self.get("/nodes")).await
     }
 
+    pub async fn nests(&self) -> anyhow::Result<Vec<NestInfo>> {
+        self.json(self.get("/nests")).await
+    }
+
+    pub async fn node_label(&self, node: &str, req: &LabelRequest) -> anyhow::Result<NodeInfo> {
+        self.json(
+            self.req(reqwest::Method::POST, &format!("/nodes/{node}/labels"))
+                .json(req),
+        )
+        .await
+    }
+
+    pub async fn node_cordon(&self, node: &str, cordoned: bool) -> anyhow::Result<NodeInfo> {
+        let action = if cordoned { "cordon" } else { "uncordon" };
+        self.json(self.req(reqwest::Method::POST, &format!("/nodes/{node}/{action}")))
+            .await
+    }
+
+    pub async fn node_forget(&self, node: &str, q: &ForgetQuery) -> anyhow::Result<Forgot> {
+        self.json(
+            self.req(reqwest::Method::POST, &format!("/nodes/{node}/forget"))
+                .query(q),
+        )
+        .await
+    }
+
     pub async fn whoami(&self) -> anyhow::Result<WhoAmI> {
         self.json(self.get("/whoami")).await
     }
@@ -622,6 +704,9 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
             }
             let zip = read_bundle(path, kn_bundle::Limits::default()).await?;
             let acc: Accepted = client.deploy_zip(&name, zip, &q).await?.json().await?;
+            for w in &acc.warnings {
+                eprintln!("warning: {w}");
+            }
             if !acc.node_online {
                 println!(
                     "queued {} (generation {}) for node {}, which is offline; it's deployed when the node is back",
@@ -630,8 +715,11 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                 return Ok(());
             }
             eprintln!(
-                "deploying {} (generation {}) on node {}",
-                acc.name, acc.generation, acc.node
+                "deploying {} (generation {}) on node {}{}",
+                acc.name,
+                acc.generation,
+                acc.node,
+                acc.nest.as_ref().map(|n| format!(", in nest {n}")).unwrap_or_default()
             );
             let st = wait_for(&client, "apps", &acc, timeout).await?;
             if st.superseded_by.is_some() {
@@ -651,7 +739,16 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&apps)?);
             } else if client.is_server() {
                 print_table(
-                    &["NAME", "STATUS", "CONTAINERS", "GEN", "NODE", "DOMAIN", "UPDATED"],
+                    &[
+                        "NAME",
+                        "STATUS",
+                        "CONTAINERS",
+                        "GEN",
+                        "NODE",
+                        "NEST",
+                        "DOMAIN",
+                        "UPDATED",
+                    ],
                     apps.iter()
                         .map(|a| {
                             vec![
@@ -660,6 +757,7 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                                 a.containers.clone(),
                                 a.generation.to_string(),
                                 a.node.clone().unwrap_or_default(),
+                                a.nest.clone().unwrap_or_default(),
                                 a.domain.clone(),
                                 a.updated_at.clone(),
                             ]
@@ -743,6 +841,7 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
             }
         }
         Command::Volume(cmd) => volume(&client, cmd).await?,
+        Command::Nest(cmd) => nest(&client, cmd).await?,
         Command::Token(cmd) => token(&client, cmd).await?,
         Command::Cluster(_) => unreachable!(),
     }
@@ -787,10 +886,29 @@ async fn follow_volume(client: &Client, resp: reqwest::Response, what: &str) -> 
 
 async fn volume(client: &Client, cmd: VolumeCommand) -> anyhow::Result<()> {
     match cmd {
-        VolumeCommand::Create { name, node, queue } => {
-            let resp = client.volume_create(&name, &VolumeQuery { node, queue }).await?;
+        VolumeCommand::Create {
+            name,
+            nest,
+            node,
+            queue,
+        } => {
+            if !client.is_server() && (nest.is_some() || node.is_some()) {
+                bail!("--nest and --node need a cluster; a standalone node is its own");
+            }
+            let resp = client.volume_create(&name, &VolumeQuery { node, nest, queue }).await?;
             if client.is_server() {
-                follow_volume(client, resp, &format!("creating shared volume {name}")).await?;
+                let acc: Accepted = resp.json().await?;
+                let nest = acc.nest.clone().unwrap_or_default();
+                if !acc.node_online {
+                    println!(
+                        "queued shared volume {name} (nest {nest}) for node {}, which is offline",
+                        acc.node
+                    );
+                    return Ok(());
+                }
+                wait_for(client, "volumes", &acc, Duration::from_secs(3600)).await?;
+                println!("created shared volume {name} on node {}, in nest {nest}", acc.node);
+                return Ok(());
             }
             println!("created shared volume {name}");
         }
@@ -801,7 +919,7 @@ async fn volume(client: &Client, cmd: VolumeCommand) -> anyhow::Result<()> {
             } else {
                 let mut headers = vec!["NAME", "MOUNTED BY", "SNAPSHOTS", "LOADED", "PROBLEM"];
                 if client.is_server() {
-                    headers.insert(1, "NODE");
+                    headers.splice(1..1, ["NODE", "NEST"]);
                 }
                 print_table(
                     &headers,
@@ -816,7 +934,10 @@ async fn volume(client: &Client, cmd: VolumeCommand) -> anyhow::Result<()> {
                                 v.problem.clone().unwrap_or_default(),
                             ];
                             if client.is_server() {
-                                row.insert(1, v.node.clone().unwrap_or_default());
+                                row.splice(
+                                    1..1,
+                                    [v.node.clone().unwrap_or_default(), v.nest.clone().unwrap_or_default()],
+                                );
                             }
                             row
                         })
@@ -832,6 +953,9 @@ async fn volume(client: &Client, cmd: VolumeCommand) -> anyhow::Result<()> {
                 println!("name:        {}", v.name);
                 if let Some(n) = &v.node {
                     println!("node:        {n}");
+                }
+                if let Some(n) = &v.nest {
+                    println!("nest:        {n}");
                 }
                 if let Some(g) = v.pending {
                     println!("pending:     generation {g}, not applied by the node yet");
@@ -859,9 +983,11 @@ async fn volume(client: &Client, cmd: VolumeCommand) -> anyhow::Result<()> {
                 client.volume_load_directory(&name, &dir).await?;
             } else {
                 let zip = read_bundle(path, kn_bundle::Limits::for_volumes()).await?;
-                let resp = client
-                    .volume_load_zip(&name, zip, &VolumeQuery { node: None, queue })
-                    .await?;
+                let q = VolumeQuery {
+                    queue,
+                    ..Default::default()
+                };
+                let resp = client.volume_load_zip(&name, zip, &q).await?;
                 if client.is_server() {
                     follow_volume(client, resp, &format!("loading shared volume {name}")).await?;
                 }
@@ -869,7 +995,11 @@ async fn volume(client: &Client, cmd: VolumeCommand) -> anyhow::Result<()> {
             println!("loaded shared volume {name}");
         }
         VolumeCommand::Delete { name, queue } => {
-            let resp = client.volume_delete(&name, &VolumeQuery { node: None, queue }).await?;
+            let q = VolumeQuery {
+                queue,
+                ..Default::default()
+            };
+            let resp = client.volume_delete(&name, &q).await?;
             if client.is_server() {
                 follow_volume(client, resp, &format!("deleting shared volume {name}")).await?;
             }
@@ -1018,48 +1148,198 @@ async fn cluster(global: &GlobalArgs, cmd: ClusterCommand) -> anyhow::Result<()>
     Ok(())
 }
 
-/// `kiwi-nest node list`.
-pub async fn node_list(global: &GlobalArgs, json: bool) -> anyhow::Result<()> {
+fn gib(b: u64) -> String {
+    format!("{:.1}G", b as f64 / f64::from(1u32 << 30))
+}
+
+fn labels(l: &std::collections::BTreeMap<String, String>) -> String {
+    l.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(",")
+}
+
+/// `kiwi-nest node list|label|cordon|uncordon|forget`.
+pub async fn node(global: &GlobalArgs, cmd: NodeCommand) -> anyhow::Result<()> {
     let client = Client::new(&Target::resolve(global)?)?;
-    server_only(&client, "`node list`")?;
-    let nodes = client.nodes().await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&nodes)?);
-        return Ok(());
+    server_only(&client, "`node`")?;
+    match cmd {
+        NodeCommand::List { json } => {
+            let nodes = client.nodes().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&nodes)?);
+                return Ok(());
+            }
+            print_table(
+                &[
+                    "NAME",
+                    "ONLINE",
+                    "CORDONED",
+                    "ARCH",
+                    "MEMORY",
+                    "APPS",
+                    "APP MEMORY",
+                    "HEADROOM",
+                    "BTRFS FREE",
+                    "UNALLOCATED",
+                    "LABELS",
+                    "VERSION",
+                    "LAST SEEN",
+                ],
+                nodes
+                    .iter()
+                    .map(|n| {
+                        let f = n.facts.clone().unwrap_or_default();
+                        let headroom = if n.headroom_bytes < 0 {
+                            format!("-{}", gib(n.headroom_bytes.unsigned_abs()))
+                        } else {
+                            gib(n.headroom_bytes as u64)
+                        };
+                        vec![
+                            n.name.clone(),
+                            if n.online { "yes" } else { "no" }.to_string(),
+                            if n.cordoned { "yes" } else { "" }.to_string(),
+                            f.arch.clone(),
+                            gib(f.memory_bytes),
+                            n.apps.to_string(),
+                            gib(n.app_memory_bytes),
+                            headroom,
+                            gib(f.volumes.free_bytes),
+                            f.volumes.unallocated_bytes.map(gib).unwrap_or_default(),
+                            labels(&n.labels),
+                            f.version.clone(),
+                            n.last_seen.clone().unwrap_or_default(),
+                        ]
+                    })
+                    .collect(),
+            );
+        }
+        NodeCommand::Label { node, labels: given } => {
+            let mut req = LabelRequest::default();
+            for l in &given {
+                if let Some((k, v)) = l.split_once('=') {
+                    req.set.insert(k.trim().to_string(), v.trim().to_string());
+                } else if let Some(k) = l.strip_suffix('-') {
+                    req.remove.push(k.trim().to_string());
+                } else {
+                    bail!("`{l}` isn't KEY=VALUE (to set a label) or KEY- (to remove one)");
+                }
+            }
+            let n = client.node_label(&node, &req).await?;
+            println!("node {node}'s labels: {}", or_none(labels(&n.labels)));
+        }
+        NodeCommand::Cordon { node } => {
+            let n = client.node_cordon(&node, true).await?;
+            println!(
+                "cordoned {node}: it gets no new nests{}",
+                if n.nests.is_empty() {
+                    String::new()
+                } else {
+                    format!("; its nests ({}) stay, and still take new members", n.nests.join(", "))
+                }
+            );
+        }
+        NodeCommand::Uncordon { node } => {
+            client.node_cordon(&node, false).await?;
+            println!("uncordoned {node}: it may take new nests again");
+        }
+        NodeCommand::Forget { node, force, yes } => {
+            let plan = client.node_forget(&node, &ForgetQuery { force, dry_run: true }).await?;
+            if plan.online && !force {
+                bail!(
+                    "node `{node}` is online, so it isn't forgotten: stop it first, or pass --force (its apps then go \
+                     down when it next hears from the server)"
+                );
+            }
+            if !yes {
+                confirm_forget(&plan)?;
+            }
+            let f = client
+                .node_forget(&node, &ForgetQuery { force, dry_run: false })
+                .await?;
+            println!("forgot node {node}");
+            if !f.apps.is_empty() {
+                println!("  released apps: {}", f.apps.join(", "));
+            }
+            if !f.volumes.is_empty() {
+                println!("  released shared volumes: {}", f.volumes.join(", "));
+            }
+            if !f.nests.is_empty() {
+                println!("  released nests: {}", f.nests.join(", "));
+            }
+        }
     }
-    let gib = |b: u64| format!("{:.1}G", b as f64 / f64::from(1u32 << 30));
-    print_table(
-        &[
-            "NAME",
-            "ONLINE",
-            "ARCH",
-            "MEMORY",
-            "APPS",
-            "APP MEMORY",
-            "BTRFS FREE",
-            "UNALLOCATED",
-            "VERSION",
-            "LAST SEEN",
-        ],
-        nodes
-            .iter()
-            .map(|n| {
-                let f = n.facts.clone().unwrap_or_default();
-                vec![
-                    n.name.clone(),
-                    if n.online { "yes" } else { "no" }.to_string(),
-                    f.arch.clone(),
-                    gib(f.memory_bytes),
-                    n.apps.to_string(),
-                    gib(n.app_memory_bytes),
-                    gib(f.volumes.free_bytes),
-                    f.volumes.unallocated_bytes.map(gib).unwrap_or_default(),
-                    f.version.clone(),
-                    n.last_seen.clone().unwrap_or_default(),
-                ]
-            })
-            .collect(),
-    );
+    Ok(())
+}
+
+/// Says what forgetting a node does, and asks for its name to go ahead.
+fn confirm_forget(plan: &Forgot) -> anyhow::Result<()> {
+    use std::io::{BufRead, IsTerminal};
+    let n = &plan.node;
+    let mut e = std::io::stderr().lock();
+    writeln!(
+        e,
+        "Forgetting node {n} revokes its token and releases what's placed on it:"
+    )?;
+    writeln!(e, "  apps (their names and domains): {}", or_none(plan.apps.join(", ")))?;
+    writeln!(e, "  shared volumes: {}", or_none(plan.volumes.join(", ")))?;
+    writeln!(e, "  nests: {}", or_none(plan.nests.join(", ")))?;
+    writeln!(
+        e,
+        "Their data stays on node {n}; deploy the apps again on another node (with --node) to bring them back."
+    )?;
+    writeln!(e)?;
+    writeln!(
+        e,
+        "Make sure node {n} is really gone first: powered off, or with its apps stopped. While it runs cut off from \
+         the server, its always-on apps keep running: requests stop reaching them once their routes move, but their \
+         background work carries on. If it reconnects, it takes its apps down and sets their data aside."
+    )?;
+    if plan.online {
+        writeln!(e, "Node {n} is online right now (--force).")?;
+    }
+    if !std::io::stdin().is_terminal() {
+        bail!("not forgetting node {n} without confirmation: pass --yes");
+    }
+    write!(e, "Type the node's name to forget it: ")?;
+    e.flush()?;
+    drop(e);
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if answer.trim() != n {
+        bail!("not forgetting node {n}");
+    }
+    Ok(())
+}
+
+async fn nest(client: &Client, cmd: NestCommand) -> anyhow::Result<()> {
+    server_only(client, "`nest`")?;
+    match cmd {
+        NestCommand::List { json } => {
+            let nests = client.nests().await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&nests)?);
+                return Ok(());
+            }
+            print_table(
+                &["NAME", "NODE", "APPS", "VOLUMES", "MEMORY", "PLACED"],
+                nests
+                    .iter()
+                    .map(|n| {
+                        vec![
+                            n.name.clone(),
+                            if n.node_online {
+                                n.node.clone()
+                            } else {
+                                format!("{} (offline)", n.node)
+                            },
+                            n.apps.join(","),
+                            n.volumes.join(","),
+                            gib(n.memory_bytes),
+                            n.placement.clone(),
+                        ]
+                    })
+                    .collect(),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1114,6 +1394,12 @@ fn print_info(i: &AppInfo) {
     println!("name:        {}", i.name);
     if let Some(n) = &i.node {
         println!("node:        {n}");
+    }
+    if let Some(n) = &i.nest {
+        println!("nest:        {n}");
+    }
+    if let Some(p) = &i.placement {
+        println!("placement:   {p}");
     }
     println!("status:      {} (generation {})", i.status, i.generation);
     if let Some(g) = i.pending {

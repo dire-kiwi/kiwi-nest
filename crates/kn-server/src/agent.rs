@@ -93,6 +93,14 @@ async fn poll(
         let ((seq, apps, volumes), reset, lost, commands) = s
             .store
             .call(move |c| {
+                // Forgotten while this poll was open (`node forget --force`): it's told at once.
+                if let Some(at) = nodes::forgotten_at(c, id)? {
+                    return Err(Error::Forgotten {
+                        node_id: id,
+                        name: nodes::get(c, id)?.name,
+                        at,
+                    });
+                }
                 // Checked again here, where nothing else can hand out commands meanwhile.
                 if superseded() {
                     return Ok(((since, Vec::new(), Vec::new()), false, Vec::new(), Vec::new()));

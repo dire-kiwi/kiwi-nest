@@ -89,6 +89,11 @@ impl Env {
     }
 
     async fn join(&self, name: &str, memory: u64) -> FakeNode {
+        self.join_with(name, facts(memory)).await
+    }
+
+    /// Joins a node that reports `facts`.
+    async fn join_with(&self, name: &str, node_facts: NodeFacts) -> FakeNode {
         let join = self.token(json!({"kind": "join"})).await;
         let r = self
             .http
@@ -96,7 +101,7 @@ impl Env {
             .json(&JoinRequest {
                 token: join.clone(),
                 name: name.into(),
-                facts: facts(memory),
+                facts: node_facts.clone(),
             })
             .send()
             .await
@@ -110,7 +115,7 @@ impl Env {
             .json(&JoinRequest {
                 token: join,
                 name: format!("{name}-again"),
-                facts: facts(memory),
+                facts: node_facts.clone(),
             })
             .send()
             .await
@@ -118,17 +123,18 @@ impl Env {
         assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
         FakeNode {
             token: j.token,
-            memory,
+            id: j.node_id,
+            facts: node_facts.clone(),
             since: 0,
             report: Report {
-                facts: facts(memory),
+                facts: node_facts,
                 ..Default::default()
             },
         }
     }
 
     async fn poll(&self, n: &mut FakeNode) -> PollResponse {
-        n.report.facts = facts(n.memory);
+        n.report.facts = n.facts.clone();
         let r = self
             .req(reqwest::Method::POST, "/agent/poll", &n.token)
             .json(&PollRequest {
@@ -190,7 +196,8 @@ impl Env {
 
 struct FakeNode {
     token: String,
-    memory: u64,
+    id: u64,
+    facts: NodeFacts,
     since: u64,
     report: Report,
 }
@@ -594,6 +601,8 @@ async fn commands_are_delivered_once_and_lost_ones_fail() {
         containers: vec![],
         open_requests: 0,
         node: None,
+        nest: None,
+        placement: None,
         pending: None,
         stale: false,
     })
@@ -676,7 +685,8 @@ async fn a_restart_loses_nothing() {
     // Tokens still work, and the node's desired state is as it was: polling from 0 gives the same changes.
     let mut again = FakeNode {
         token: a.token.clone(),
-        memory: a.memory,
+        id: a.id,
+        facts: a.facts.clone(),
         since: 0,
         report: a.report.clone(),
     };
@@ -836,4 +846,525 @@ async fn a_report_that_arrives_late_doesnt_replace_a_newer_one() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::NO_CONTENT);
     assert!(env.status("blog", 1).await.done);
+}
+
+/// A bundle ZIP of this `compose.yaml`.
+fn zip_of(yaml: &str) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("compose.yaml"), yaml).unwrap();
+    kn_bundle::dir::pack(dir.path(), &kn_bundle::Limits::default()).unwrap()
+}
+
+/// A one-service app at `domain`, with more `x-kiwi-nest` settings (such as `nest: blog`), using `mem` memory.
+fn app_yaml(domain: &str, extra: &str, mem: &str) -> String {
+    let extra = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(", {extra}")
+    };
+    format!(
+        "x-kiwi-nest: {{ domain: {domain}, service: web, port: 80{extra} }}\n\
+         services:\n  web:\n    image: x\n    mem_limit: {mem}\n"
+    )
+}
+
+impl Env {
+    async fn put(&self, name: &str, yaml: &str, query: &str) -> reqwest::Response {
+        self.req(reqwest::Method::PUT, &format!("/apps/{name}?{query}"), &self.admin)
+            .header("content-type", "application/zip")
+            .body(zip_of(yaml))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn placed(&self, name: &str, yaml: &str, query: &str) -> Accepted {
+        let r = self.put(name, yaml, query).await;
+        assert_eq!(r.status(), StatusCode::ACCEPTED, "{name}: {}", r.text().await.unwrap());
+        r.json().await.unwrap()
+    }
+
+    async fn volume(&self, name: &str, query: &str) -> reqwest::Response {
+        self.req(reqwest::Method::PUT, &format!("/volumes/{name}?{query}"), &self.admin)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn post(&self, path: &str) -> reqwest::Response {
+        self.req(reqwest::Method::POST, path, &self.admin).send().await.unwrap()
+    }
+
+    async fn nests(&self) -> Vec<kn_proto::api::NestInfo> {
+        self.req(reqwest::Method::GET, "/nests", &self.admin)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    async fn nodes(&self) -> Vec<NodeInfo> {
+        self.req(reqwest::Method::GET, "/nodes", &self.admin)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    async fn inspect(&self, name: &str) -> kn_proto::api::AppInfo {
+        let r = self
+            .req(reqwest::Method::GET, &format!("/apps/{name}"), &self.admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        r.json().await.unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_shared_volume_its_production_app_and_previews_share_a_nest_and_its_node() {
+    let env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    let mut b = env.join("b", 16 << 30).await;
+    env.poll(&mut a).await;
+    env.poll(&mut b).await;
+    // The volume goes to a (b has more room, but --node chooses), and starts a nest named after it.
+    let r = env.volume("corpus", "node=a").await;
+    let acc: Accepted = r.json().await.unwrap();
+    assert_eq!((acc.node.as_str(), acc.nest.as_deref()), ("a", Some("corpus")));
+    let mounts = "shared: { corpus: { target: /c, mode: ro } }";
+    let acc = env.placed("blog", &app_yaml("blog.test", mounts, "128m"), "").await;
+    assert_eq!((acc.node.as_str(), acc.nest.as_deref()), ("a", Some("corpus")));
+    for i in 1..=3 {
+        let acc = env
+            .placed(
+                &format!("blog-pr{i}"),
+                &app_yaml(&format!("pr{i}.test"), "idle_timeout: 10m", "128m"),
+                "from=blog",
+            )
+            .await;
+        assert_eq!(
+            (acc.node.as_str(), acc.nest.as_deref()),
+            ("a", Some("corpus")),
+            "preview {i}"
+        );
+    }
+    // They all reach a, and nothing reaches b.
+    assert_eq!(env.poll(&mut a).await.apps.len(), 4);
+    assert!(env.poll(&mut b).await.apps.is_empty());
+    let nests = env.nests().await;
+    assert_eq!(nests.len(), 1);
+    let n = &nests[0];
+    assert_eq!((n.name.as_str(), n.node.as_str()), ("corpus", "a"));
+    assert_eq!(n.apps, ["blog", "blog-pr1", "blog-pr2", "blog-pr3"]);
+    assert_eq!(n.volumes, ["corpus"]);
+    assert_eq!(n.memory_bytes, 4 * (128 << 20));
+    assert!(
+        n.placement
+            .contains("when shared volume `corpus` was created: --node a"),
+        "{}",
+        n.placement
+    );
+    // Inspect says how each got there.
+    let info = env.inspect("blog-pr2").await;
+    assert_eq!(info.nest.as_deref(), Some("corpus"));
+    let p = info.placement.unwrap();
+    assert!(p.starts_with("through --from blog; nest corpus went to node a"), "{p}");
+    let info = env.inspect("blog").await;
+    assert!(info.placement.unwrap().starts_with("through shared volume `corpus`"));
+    // A shared volume made with --nest joins that nest.
+    let acc: Accepted = env.volume("extra", "nest=corpus").await.json().await.unwrap();
+    assert_eq!((acc.node.as_str(), acc.nest.as_deref()), ("a", Some("corpus")));
+    // --node can't split a nest.
+    let (status, msg) = error(env.volume("more", "nest=corpus&node=b").await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        msg.contains("nest `corpus` is on node `a`, so --node `b` can't apply"),
+        "{msg}"
+    );
+    let (status, msg) = error(
+        env.put("blog-pr4", &app_yaml("pr4.test", "", "1m"), "from=blog&node=b")
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(msg.contains("a nest never splits"), "{msg}");
+    // A volume whose name can't name a nest needs --nest.
+    let (status, msg) = error(env.volume("Big_Data", "").await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(msg.contains("pass --nest"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_bundle_naming_two_nests_is_refused_and_nothing_is_saved() {
+    let env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    let mut b = env.join("b", 4 << 30).await;
+    env.poll(&mut a).await;
+    env.poll(&mut b).await;
+    env.volume("corpus", "node=a").await;
+    env.placed("blog", &app_yaml("blog.test", "", "128m"), "node=b").await;
+    env.poll(&mut a).await;
+    env.poll(&mut b).await;
+    let files = env.bundle_files();
+    let cases = [
+        (
+            "a shared volume and an explicit nest",
+            app_yaml("x.test", "nest: other, shared: { corpus: { target: /c } }", "1m"),
+            "",
+            "shared volume `corpus` is in nest `corpus`, but the bundle's `x-kiwi-nest.nest` is `other`",
+        ),
+        (
+            "--from and a shared volume",
+            app_yaml("x.test", "shared: { corpus: { target: /c } }", "1m"),
+            "from=blog",
+            "`--from` app `blog` is in nest `blog`, but shared volume `corpus` is in nest `corpus`",
+        ),
+        (
+            "--from and an explicit nest",
+            app_yaml("x.test", "nest: corpus", "1m"),
+            "from=blog",
+            "`--from` app `blog` is in nest `blog`, but the bundle's `x-kiwi-nest.nest` is `corpus`",
+        ),
+    ];
+    for (what, yaml, query, want) in cases {
+        let (status, msg) = error(env.put("x", &yaml, query).await).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{what}");
+        assert!(msg.contains(want), "{what}: {msg}");
+    }
+    assert_eq!(env.apps().await.len(), 1, "nothing was saved");
+    assert_eq!(env.bundle_files(), files);
+    assert!(env.poll(&mut a).await.apps.is_empty() && env.poll(&mut b).await.apps.is_empty());
+    // A redeploy can't move an app to another nest either.
+    let (status, msg) = error(env.put("blog", &app_yaml("blog.test", "nest: corpus", "1m"), "").await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(msg.contains("app `blog` is in nest `blog`"), "{msg}");
+    // An explicit nest that agrees is fine, and joins it: on its node.
+    let acc = env
+        .placed("blog-admin", &app_yaml("admin.test", "nest: blog", "1m"), "")
+        .await;
+    assert_eq!((acc.node.as_str(), acc.nest.as_deref()), ("b", Some("blog")));
+}
+
+#[tokio::test]
+async fn new_nests_spread_by_memory_and_a_full_nest_warns() {
+    let env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    let mut b = env.join("b", 4 << 30).await;
+    env.poll(&mut a).await;
+    env.poll(&mut b).await;
+    let mut on = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for i in 0..6 {
+        let name = format!("app{i}");
+        let acc = env
+            .placed(&name, &app_yaml(&format!("{name}.test"), "", "512m"), "")
+            .await;
+        assert_eq!(
+            acc.nest.as_deref(),
+            Some(name.as_str()),
+            "a nest of its own, named after it"
+        );
+        assert!(acc.warnings.is_empty(), "{:?}", acc.warnings);
+        on.entry(acc.node).or_default().push(name);
+    }
+    assert_eq!(on["a"].len(), 3, "{on:?}");
+    assert_eq!(on["b"].len(), 3, "{on:?}");
+    // Apps that idle out count for half: four idling 512m apps on b weigh what two always-on ones on a do.
+    let nodes = env.nodes().await;
+    assert_eq!(nodes[0].headroom_bytes, nodes[1].headroom_bytes);
+    assert_eq!(nodes[0].headroom_bytes, (4 << 30) - (512 << 20) - 3 * (512 << 20));
+    for i in 0..2 {
+        let acc = env
+            .placed(
+                &format!("idle{i}"),
+                &app_yaml(&format!("idle{i}.test"), "idle_timeout: 5m", "512m"),
+                "",
+            )
+            .await;
+        assert_eq!(acc.node, if i == 0 { "a" } else { "b" });
+    }
+    let nodes = env.nodes().await;
+    assert_eq!(
+        nodes[0].headroom_bytes,
+        (4 << 30) - (512 << 20) - 3 * (512 << 20) - (256 << 20)
+    );
+    // A nest's node takes a new member even when it's full, and the deploy warns.
+    let acc = env
+        .placed("app0-big", &app_yaml("big.test", "nest: app0", "4g"), "")
+        .await;
+    let node = on
+        .iter()
+        .find(|(_, apps)| apps.contains(&"app0".to_string()))
+        .unwrap()
+        .0;
+    assert_eq!(&acc.node, node);
+    assert_eq!(acc.warnings.len(), 1, "{:?}", acc.warnings);
+    assert!(
+        acc.warnings[0].contains(&format!("node `{node}` is out of memory headroom with `app0-big`"))
+            && acc.warnings[0].contains("it goes there anyway, as nest `app0` does"),
+        "{}",
+        acc.warnings[0]
+    );
+}
+
+#[tokio::test]
+async fn a_cordoned_node_gets_no_new_nests_but_keeps_its_own() {
+    let env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    let mut b = env.join("b", 64 << 30).await;
+    env.poll(&mut a).await;
+    env.poll(&mut b).await;
+    env.placed("blog", &app_yaml("blog.test", "", "128m"), "").await;
+    let r = env.post("/nodes/b/cordon").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let n: NodeInfo = r.json().await.unwrap();
+    assert!(n.cordoned);
+    assert_eq!(n.nests, ["blog"]);
+    for i in 0..3 {
+        let acc = env
+            .placed(&format!("new{i}"), &app_yaml(&format!("new{i}.test"), "", "128m"), "")
+            .await;
+        assert_eq!(acc.node, "a", "b is cordoned, however much room it has");
+    }
+    // Its nest still takes members.
+    let acc = env
+        .placed("blog-pr1", &app_yaml("pr1.test", "", "128m"), "from=blog")
+        .await;
+    assert_eq!(acc.node, "b");
+    // --node can't put a new nest on it, as the filter still applies.
+    let (status, msg) = error(env.put("forced", &app_yaml("forced.test", "", "1m"), "node=b").await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(msg.contains("node `b` can't take new nest `forced`: cordoned"), "{msg}");
+    let (status, msg) = error(env.volume("corpus", "node=b").await).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{msg}");
+    // With a cordoned too, nothing qualifies, and the deploy says why.
+    env.post("/nodes/a/cordon").await;
+    let (status, msg) = error(env.put("none", &app_yaml("none.test", "", "1m"), "").await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        msg.contains("no node can take new nest `none`: a (cordoned), b (cordoned)"),
+        "{msg}"
+    );
+    let n: NodeInfo = env.post("/nodes/b/uncordon").await.json().await.unwrap();
+    assert!(!n.cordoned);
+    assert_eq!(env.placed("none", &app_yaml("none.test", "", "1m"), "").await.node, "b");
+    assert_eq!(env.post("/nodes/zz/cordon").await.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn placement_follows_arch_labels_and_host_paths() {
+    let env = Env::new().await;
+    let mut big = env.join("big", 64 << 30).await;
+    let mut pi = env
+        .join_with(
+            "pi",
+            NodeFacts {
+                arch: "arm64".into(),
+                ..facts(2 << 30)
+            },
+        )
+        .await;
+    env.poll(&mut big).await;
+    env.poll(&mut pi).await;
+    // An arm64 app never lands on the amd64 node, however roomy.
+    for i in 0..3 {
+        let acc = env
+            .placed(
+                &format!("arm{i}"),
+                &app_yaml(&format!("arm{i}.test"), "arch: arm64", "512m"),
+                "",
+            )
+            .await;
+        assert_eq!(acc.node, "pi");
+    }
+    let (status, msg) = error(
+        env.put("forced", &app_yaml("forced.test", "arch: arm64", "1m"), "node=big")
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        msg.contains("node `big` can't take new nest `forced`: arch `amd64`, not `arm64`"),
+        "{msg}"
+    );
+    // Nor does one join an arm64 app's nest on the amd64 node.
+    env.placed("amd", &app_yaml("amd.test", "", "1m"), "node=big").await;
+    let (status, msg) = error(
+        env.put("amd-arm", &app_yaml("amd-arm.test", "arch: arm64, nest: amd", "1m"), "")
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        msg.contains("nest `amd` is on node `big`, which can't take this: arch `amd64`"),
+        "{msg}"
+    );
+    // Labels: set with `node label`, and a node's own.
+    let (status, msg) = error(
+        env.put("ssd", &app_yaml("ssd.test", "node_labels: { disk: ssd }", "1m"), "")
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        msg.contains("big (no label disk=ssd)") && msg.contains("pi (no label disk=ssd)"),
+        "{msg}"
+    );
+    let r = env
+        .req(reqwest::Method::POST, "/nodes/pi/labels", &env.admin)
+        .json(&json!({"set": {"disk": "ssd"}}))
+        .send()
+        .await
+        .unwrap();
+    let n: NodeInfo = r.json().await.unwrap();
+    assert_eq!(n.labels.get("disk").map(String::as_str), Some("ssd"));
+    assert_eq!(
+        env.placed("ssd", &app_yaml("ssd.test", "node_labels: { disk: ssd }", "1m"), "")
+            .await
+            .node,
+        "pi"
+    );
+    let r = env
+        .req(reqwest::Method::POST, "/nodes/pi/labels", &env.admin)
+        .json(&json!({"remove": ["disk"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.json::<NodeInfo>().await.unwrap().labels.is_empty());
+    big.facts.labels.insert("disk".into(), "ssd".into());
+    env.poll(&mut big).await;
+    assert_eq!(
+        env.placed("ssd2", &app_yaml("ssd2.test", "node_labels: { disk: ssd }", "1m"), "")
+            .await
+            .node,
+        "big"
+    );
+    let r = env
+        .req(reqwest::Method::POST, "/nodes/pi/labels", &env.admin)
+        .json(&json!({"set": {"bad key": "x"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    // Host paths go only where they're allowed.
+    pi.facts.allowed_host_paths = vec!["/srv/media".into()];
+    env.poll(&mut pi).await;
+    let yaml = "x-kiwi-nest: { domain: media.test, service: web, port: 80 }\n\
+                services:\n  web:\n    image: x\n    volumes: [\"/srv/media/films:/films:ro\"]\n";
+    assert_eq!(env.placed("media", yaml, "").await.node, "pi");
+}
+
+async fn poll_status(env: &Env, token: &str) -> (StatusCode, String) {
+    let r = env
+        .req(reqwest::Method::POST, "/agent/poll", token)
+        .json(&PollRequest {
+            protocol: kn_proto::agent::PROTOCOL,
+            since: 0,
+            wait_secs: Some(0),
+            report: Report::default(),
+        })
+        .send()
+        .await
+        .unwrap();
+    (r.status(), r.text().await.unwrap())
+}
+
+#[tokio::test]
+async fn a_forgotten_node_is_told_so_and_its_names_are_released() {
+    let mut env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    let mut b = env.join("b", 4 << 30).await;
+    env.poll(&mut a).await;
+    env.poll(&mut b).await;
+    env.volume("corpus", "node=a").await;
+    env.placed("blog", &app_yaml("blog.test", "", "128m"), "node=a").await;
+    env.placed("blog-pr1", &app_yaml("pr1.test", "", "128m"), "from=blog")
+        .await;
+    // A deploy follows the change: it's still waiting when the node is forgotten.
+    let st = env.status("blog", 1).await;
+    assert!(!st.done);
+
+    // Online, it's refused without --force; a dry run says what would be released, and changes nothing.
+    let (status, msg) = error(env.post("/nodes/a/forget").await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(msg.contains("is online"), "{msg}");
+    let plan: kn_proto::api::Forgot = env.post("/nodes/a/forget?dry_run=true").await.json().await.unwrap();
+    assert!(plan.online && plan.dry_run);
+    assert_eq!(plan.apps, ["blog", "blog-pr1"]);
+    assert_eq!(plan.volumes, ["corpus"]);
+    assert_eq!(plan.nests, ["blog", "corpus"]);
+    assert_eq!(env.apps().await.len(), 2);
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+    env.poll(&mut b).await;
+    let r = env.post("/nodes/a/forget").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let f: kn_proto::api::Forgot = r.json().await.unwrap();
+    assert!(!f.online && !f.dry_run);
+
+    // The forgotten node gets an explicit answer, on every route, distinct from an ordinary 401.
+    let (status, body) = poll_status(&env, &a.token).await;
+    assert_eq!(status, StatusCode::GONE);
+    let gone: kn_proto::agent::ForgottenBody = serde_json::from_str(&body).unwrap();
+    assert_eq!(gone.error, kn_proto::agent::FORGOTTEN);
+    assert_eq!((gone.node_id, gone.name.as_str()), (a.id, "a"));
+    let r = env
+        .req(reqwest::Method::POST, "/agent/report", &a.token)
+        .json(&a.report)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::GONE);
+    for token in ["knn_never-issued", &env.admin] {
+        let (status, body) = poll_status(&env, token).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(!body.contains(kn_proto::agent::FORGOTTEN), "{body}");
+    }
+    // The waiting deploy is told, rather than left waiting.
+    let st = env.status("blog", 1).await;
+    assert!(st.done && !st.ok, "{st:?}");
+    assert!(st.error.unwrap().contains("was forgotten"));
+
+    // Its names, domains, volumes and nests are free; its tombstone stays out of the listings.
+    assert!(env.apps().await.is_empty());
+    assert!(env.nests().await.is_empty());
+    let nodes = env.nodes().await;
+    assert_eq!(nodes.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["b"]);
+    let acc = env.placed("blog", &app_yaml("blog.test", "", "128m"), "").await;
+    assert_eq!((acc.node.as_str(), acc.generation), ("b", 2));
+    assert_eq!(env.volume("corpus", "").await.status(), StatusCode::ACCEPTED);
+    let tokens: Vec<kn_proto::api::TokenInfo> = env
+        .req(reqwest::Method::GET, "/tokens", &env.admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !tokens.iter().any(|t| t.node.as_deref() == Some("a")),
+        "its token is revoked"
+    );
+    assert_eq!(env.post("/nodes/a/forget").await.status(), StatusCode::NOT_FOUND);
+
+    // A fresh join may take its name, as a new node with nothing of the old one's.
+    let mut again = env.join("a", 4 << 30).await;
+    assert_ne!(again.id, a.id);
+    let resp = env.poll(&mut again).await;
+    assert!(resp.apps.is_empty() && resp.volumes.is_empty(), "{resp:?}");
+    let (status, _) = poll_status(&env, &a.token).await;
+    assert_eq!(
+        status,
+        StatusCode::GONE,
+        "the old token still gets the forgotten answer"
+    );
+    // And all of it survives a restart.
+    env.restart().await;
+    let (status, _) = poll_status(&env, &a.token).await;
+    assert_eq!(status, StatusCode::GONE);
+    assert!(env.poll(&mut again).await.apps.is_empty());
 }

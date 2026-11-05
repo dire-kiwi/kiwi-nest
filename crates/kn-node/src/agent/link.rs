@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use kn_proto::agent::{CommandResult, JoinRequest, JoinResponse, PollRequest, PollResponse};
+use kn_proto::agent::{CommandResult, FORGOTTEN, ForgottenBody, JoinRequest, JoinResponse, PollRequest, PollResponse};
 use kn_proto::api::ErrorBody;
 use tokio::io::AsyncWriteExt;
 
@@ -17,6 +17,10 @@ pub enum LinkError {
     /// The server answered with an error.
     #[error("the server answered {status}: {message}")]
     Status { status: u16, message: String },
+    /// The server says this node was forgotten: `410 Gone` with a [`ForgottenBody`] whose error is [`FORGOTTEN`].
+    /// Nothing else, not a network error nor a `401`, is ever taken for this.
+    #[error("the server forgot node `{}` (node {})", .0.name, .0.node_id)]
+    Forgotten(ForgottenBody),
     #[error("{0}")]
     Other(String),
 }
@@ -66,6 +70,12 @@ async fn check(resp: reqwest::Response) -> Result<reqwest::Response, LinkError> 
     }
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
+    if status == 410
+        && let Ok(body) = serde_json::from_str::<ForgottenBody>(&text)
+        && body.error == FORGOTTEN
+    {
+        return Err(LinkError::Forgotten(body));
+    }
     let message = match serde_json::from_str::<ErrorBody>(&text) {
         Ok(b) => b.error,
         Err(_) => text.trim().to_string(),

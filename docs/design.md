@@ -247,21 +247,38 @@ VOLUMES/                         one btrfs filesystem per node
 
 ## Nests and placement
 
-- **An app's nest** comes from its `--from` app (whose nest it joins), the shared volumes it mounts (each belongs to
-  one nest), and an explicit `nest:`. If those name two different nests, deploy is refused. With none of them, the
-  app gets a nest of its own, named after it. A shared volume created without `--nest` starts a nest named after the
-  volume.
+- **An app's nest** comes from the nest it's already in (a redeploy), its `--from` app's, the nest of each shared
+  volume it mounts, and an explicit `nest:`. If those name two different nests, the deploy is refused before
+  anything is saved, saying which two disagree. With none of them, the app is in the nest named after it. A shared
+  volume is in `--nest`, or the nest named after it (a volume whose name can't name a nest needs `--nest`). Nests
+  are known by name, so an app or volume that names a nest that exists joins it: `nest: shop` puts `shop-admin`
+  with `shop`.
+- **A nest exists while it has members**: apps and shared volumes that aren't deleted (one being deleted still
+  counts, as its data is still on the node). Once the last one is gone, the nest is only history, and the next
+  app or volume to name it places it again, maybe elsewhere.
 - **Placement only happens for a new nest**, in two steps:
   1. **Filter.** A node qualifies if it's online and not cordoned, has the right architecture, has every label the
-     bundle asks for, and allows any host paths the bundle mounts.
-  2. **Score** by memory headroom: the node's memory, minus a reserve, minus the `mem_limit` of always-on apps, minus
-     half (configurable) the `mem_limit` of apps that idle out. A service without a limit counts as 256 MiB. Ties go
-     to more free btrfs space, then to fewer apps.
+     bundle asks for (`node_labels`), and allows any host paths the bundle mounts.
+  2. **Score** by memory headroom: the node's memory, minus a reserve (`--memory-reserve`, 512 MiB by default),
+     minus the `mem_limit` of always-on apps, minus half (`--idle-memory-factor`) the `mem_limit` of apps that idle
+     out. A service without a limit counts as 256 MiB. Ties go to more free btrfs space, then to fewer apps, then
+     to the name.
 
-  `--node NAME` chooses the node outright, though the filter still applies. `inspect` shows the node, the nest, and
-  why that node was chosen.
+  `--node NAME` chooses the node outright, though the filter still applies: `--node` can't put a new nest on a
+  cordoned node or one of another architecture. Being online is the one part `--queue` waives, so a nest can be
+  queued for an offline node. If no node qualifies, the deploy says why each one doesn't. `inspect` shows the
+  node, the nest, how the app came to be in it (`through --from blog`), and why the nest's node was chosen, as
+  recorded when the nest was placed (`the most memory headroom: 3.1 GiB (others: b 1.2 GiB); not eligible: c
+  (cordoned)`).
 - **Once a nest is placed, it stays.** A new member goes to the nest's node even when that node is full; the deploy
-  warns instead of failing.
+  warns instead of failing, with the node's headroom and what it's made of. `--node` naming another node is
+  refused, as a nest never splits. A cordon only keeps new nests away: a cordoned node's nests still take new
+  members. A member must still be able to run there, though: one needing another architecture, a label the node
+  lacks, or a host path it doesn't allow is refused.
+- **Labels** come from the node itself (`kiwi-nest node --label disk=ssd`) and from the server (`kiwi-nest node
+  label NODE disk=ssd`, `disk-` to remove one); the server's win.
+- `nest list` shows each nest's node, apps, volumes and memory, and why it's where it is; `node list` shows each
+  node's headroom as placement counts it, its labels and whether it's cordoned.
 
 ## Server and nodes
 
@@ -308,11 +325,8 @@ VOLUMES/                         one btrfs filesystem per node
   create|load|delete` work the same way.
 - **The server owns names and domains.** It reserves both, in the transaction that changes the desired state, so two
   apps can never claim the same domain on different nodes. A deleted app keeps its name and domain until its node
-  reports the delete done.
-- **Choosing a node** (until nests and the full scheduler, step 5): an existing app stays where it is; a `--from` app
-  goes to its source's node, and an app mounting a shared volume to the volume's node (and those must agree);
-  otherwise `--node`, or the online node with the most memory left once its apps' `mem_limit`s are counted (256 MiB
-  for a service without one).
+  reports the delete done, or the node is forgotten.
+- **Choosing a node** is by nest: see [Nests and placement](#nests-and-placement).
 - **Storage.** The server keeps SQLite (`rusqlite` with SQLite bundled, so the static musl build needs no system
   library) for nodes, nests, apps, volumes, generations, tokens and command history, on a thread of its own, in WAL
   mode with `synchronous = FULL`, so whatever the server has answered for survives a crash. Bundles are files named by
@@ -321,8 +335,14 @@ VOLUMES/                         one btrfs filesystem per node
   leaves nothing. Each node keeps a small state file of what it has applied.
 - **Tokens**, all stored only as hashes: admin tokens; deploy tokens limited to name patterns (for example `blog-pr*`
   for a repository's previews), which may also name apps they may use as `--from` (`blog`) without being able to
-  change them, and may mount shared volumes `ro` or `snapshot` but not `rw`; node tokens, which `node forget` revokes; one-time join tokens. The first start of a server prints
-  its first admin token, once. The last admin token can't be revoked.
+  change them, and may mount shared volumes `ro` or `snapshot` but not `rw`; node tokens, which `node forget`
+  revokes; one-time join tokens. The first start of a server prints its first admin token, once. The last admin
+  token can't be revoked.
+- **A forgotten node is kept as a tombstone**: its row, marked forgotten, and its token's hash, revoked but not
+  deleted. Without them the server couldn't tell a forgotten node coming back from a request with a wrong or unknown
+  token, and so couldn't give it the explicit "forgotten" answer that makes it take its apps down. A tombstone is
+  never attached to anything again, and its name is free: node names are unique only among nodes that aren't
+  forgotten.
 - **The CLI's clusters** are in `~/.config/kiwi-nest/clusters.json` (mode 0600): each a server URL and a token, and
   which is current. CI can pass `--server` and `--token` (or `KIWI_NEST_SERVER` and `KIWI_NEST_TOKEN`) instead.
   `--node-api` still talks to a standalone node.
@@ -438,21 +458,42 @@ To bring a lost node's apps back on another node:
 1. **Make sure the old node is really gone**: powered off, or with its apps stopped. While a node runs cut off from
    the server, its always-on apps keep running. HTTP traffic no longer reaches them once their routes move, but their
    background work does.
-2. **`kiwi-nest node forget NODE`** revokes the node's token and releases its names and domains. It refuses while the
-   node is online, unless given `--force`.
-3. **Restore each app** with `--restore --node`.
+2. **`kiwi-nest node forget NODE`** says what it will release, asks for the node's name to confirm (or `--yes`),
+   and reminds you of step 1. It then revokes the node's token, keeping it as a tombstone (see [Server and
+   nodes](#server-and-nodes)), and releases what was placed on the node, all in one transaction: its apps' names and
+   domains, its shared volumes and so its nests, which can be placed again elsewhere. A change still being followed
+   for the node ends, saying the node was forgotten, and its open commands are lost. It refuses while the node is
+   online, unless given `--force` (the node then hears at once, through its open poll).
+3. **Restore each app** with `--restore --node` (step 8; until then, `deploy` it again, which starts it empty).
 
 **A forgotten node that comes back never runs its apps again**, so an app can't run twice, with one copy on stale
 data:
 
-- The server answers the node's next poll with an explicit "node forgotten" response. Network errors and ordinary
-  authentication failures never trigger what follows.
-- On that answer, the node runs `docker compose down` for every app, so no container is left for Docker to restart.
-- It then moves its state file and subvolumes aside under `VOLUMES/forgotten/TIMESTAMP/`. That's a rename within the
-  same filesystem, so nothing is copied or deleted.
-- It records that it was forgotten, and its agent stops. The agent refuses to start again until a fresh `node join`,
-  which gives the node a new identity and an empty desired state. The server never re-attaches a forgotten node's old
-  records.
+- The server answers the node's next request with `410 Gone` and a body saying `node forgotten`, with the node's ID
+  and name. The node only takes that exact answer, for its own ID, as being forgotten: network errors, `401`s
+  (a wrong token; a token never issued gets an ordinary `401`), a proxy's `410` and every other error just mean it
+  tries again later.
+- On that answer, the agent stops applying anything and waits for what's in flight to finish. It records in
+  `agent.json` that it was forgotten, and drops its token. It then closes its apps (every new operation is refused,
+  starts for requests included, and its routes are removed), and runs `docker compose down` for every app, so no
+  container is left for Docker to restart.
+- It then moves its data aside by renames within the filesystem, so nothing is copied or deleted:
+
+  ```text
+  VOLUMES/forgotten/TIMESTAMP/apps/            was VOLUMES/apps
+  VOLUMES/forgotten/TIMESTAMP/shared/          was VOLUMES/shared
+  VOLUMES/forgotten/TIMESTAMP/state.json       was STATE/state.json, with every subvolume's ID
+  VOLUMES/forgotten/TIMESTAMP/bundles/         was STATE/apps (bundles and generated Compose files)
+  VOLUMES/forgotten/TIMESTAMP/forgotten.json   which node it was, and when it was forgotten
+  ```
+
+  If the state directory is on another filesystem, `STATE/apps` goes to `STATE/forgotten/TIMESTAMP/apps` instead,
+  and `state.json` (a few kilobytes) is copied and then removed.
+- It records that all that is done, and the node exits with why. It refuses to start again until it's given a
+  fresh join token (`--join-token`), which makes it a new node with a new identity and an empty desired state; it
+  may take its old name. The server never re-attaches a forgotten node's old records.
+- Every step can be run again. A node cut off part way finishes the job when it next starts, before it opens its
+  apps, so it never adopts (and starts) an app it should have taken down.
 - The data set aside is deleted only by hand.
 
 The one gap left is the time a forgotten node spends running while it can't reach the server, which is why step 1
@@ -469,7 +510,7 @@ One Cargo workspace. A few crates keep the server and node apart and build in pa
 | `kn-bundle` | `zip`, `compose`, `manifest`, `generate` | Safe ZIP reading, validation of the Compose subset and `x-kiwi-nest`, and the generated Compose file. No I/O beyond the bundle, so plain unit tests cover it. |
 | `kn-btrfs` | | btrfs ioctls (create, snapshot, destroy, read-only snapshots), subvolume checks, paths opened without following symlinks; later, send and receive as streams. |
 | `kn-node` | `volumes`, `runtime`, `apps`, `gateway`, `agent` | The node: the volume layout and rules; `docker compose` through `tokio::process`; each app's lifecycle (one task per app, so its operations are serialized) and the state file; the `hyper` gateway; the link to the server (joining, the poll loop, the per-app applier, commands). |
-| `kn-server` | `api`, `agent`, `store`, `scheduler`, `bundles`, `auth`, `hub`, `ingress`, `registry`, `ui` | The server: `axum` APIs for the CLI (`api`) and for agents (`agent`), SQLite (`store`), placement, the bundle store, tokens, what's only in memory (`hub`: online nodes, waking polls, callers waiting on commands), Caddy sync, the registry, and the embedded UI. |
+| `kn-server` | `api`, `agent`, `store`, `scheduler`, `bundles`, `auth`, `hub`, `ingress`, `registry`, `ui` | The server: `axum` APIs for the CLI (`api`) and for agents (`agent`), SQLite (`store`, with `nests` among its tables), placing new nests (`scheduler`), the bundle store, tokens, what's only in memory (`hub`: online nodes, waking polls, callers waiting on commands), Caddy sync, the registry, and the embedded UI. |
 | `kn-backup` | `chain`, `s3`, `ssh` | Send and tar streams through zstd to S3, R2 or SSH, chains and retention, restores. Used by nodes, and by the server for its own state. |
 | `kn-cli` | | The CLI: clusters in `~/.config/kiwi-nest`, and the commands. |
 | `web/` | | The web UI (React and Vite), built by `make` and embedded in `kn-server` with `rust-embed`. |
@@ -502,6 +543,8 @@ for macOS.
 | D16 | Desired-state entries are each app's latest state, stamped with a per-node sequence number; nodes record every change they finish by generation. | Polls are then "what changed after N", a restarted node asks from 0, and repeats are harmless: nothing is queued per node, and a change cut off by a crash simply runs again. A log of steps would have to be stored, re-sent and de-duplicated, and replayed in full after an outage. |
 | D17 | Commands are handed out at most once, and a delivered command missing from the node's next report has failed. | A one-off action (resume, logs) that runs twice or late is worse than one that fails and is retried by a person. Re-sending would need idempotency keys on every action. |
 | D18 | A change is saved and answered at once; the CLI follows it on a route of its own until the node reports it. | Holding the deploy's request open would tie the result to one connection: a server restart or a proxy timeout would lose it, though the change is saved. Following it can resume. |
+| D19 | Nests are known by name and exist while they have members; an app with nothing else naming its nest is in the one named after it. | Named nests let an app join another's (`nest: shop`) without inventing IDs, and a nest that dissolves when emptied can be placed afresh rather than pinning a name to a node for ever. An explicit nest object, made and deleted by hand, would be one more thing to manage for every app. |
+| D20 | `node forget` keeps the node and its token as a tombstone, and a forgotten node acts only on an exact `410 node forgotten` for its own ID. | Deleting them would make a returning node indistinguishable from a wrong token, so it couldn't be told to stand down. Acting on anything looser (a `401`, a network error, a proxy's `410`) would let an outage or a misconfiguration take a working node's apps down. |
 
 ## Build plan
 
@@ -579,6 +622,11 @@ flowchart LR
    - its agent won't start again without a fresh `node join`;
    - the app only ever runs on the new node;
    - a plain network outage, or a wrong token, takes nothing down.
+   *Done:* the scheduler's rules in table-driven tests (`crates/kn-server/src/scheduler.rs`); nests, cordons, labels,
+   arch and forgetting through the server (`crates/kn-server/src/tests.rs`), and the backfill of a database from
+   before nests (`store/nests.rs`); the forget path on nodes against a real server, with outages, wrong tokens and
+   look-alike answers (`crates/kn-node/src/agent/tests.rs`); and end to end with Docker and btrfs
+   (`crates/kiwi-nest/tests/cluster.rs`). `scripts/dev-cluster.sh` gained `stop`, `start` and `rejoin NODE`.
 6. **Ingress.** `kn-server`'s `ingress` module generates the Caddy configuration and syncs it through the admin API;
    basic auth; the four TLS modes; the gateway listening on the private address with its ingress token; server flags
    for the ingress.

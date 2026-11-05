@@ -160,13 +160,17 @@ pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen:
 /// Runs a node joined to a server: its apps, the agent and its gateway, until interrupted.
 ///
 /// Prints `gateway on http://ADDR`, then `node NAME polling URL` once it has joined (on its first start, with
-/// `agent.join_token`). Apps keep running after the node exits, and the next node agent adopts them.
+/// `agent.join_token`). Apps keep running after the node exits, and the next node agent adopts them, unless the
+/// server forgot the node: then it takes them down, sets its data aside and fails.
 pub async fn run_agent(
     cfg: NodeConfig,
     mut agent: agent::AgentConfig,
     gateway_listen: SocketAddr,
 ) -> anyhow::Result<()> {
     check_loopback(&gateway_listen)?;
+    // A node the server forgot finishes taking its apps down before it opens (and adopts) them.
+    cfg.validate()?;
+    agent::prepare(&cfg, &runtime::Docker::new(&cfg.docker), agent.join_token.is_some()).await?;
     let apps = apps::Apps::open(cfg).await?;
     let gw_listener = tokio::net::TcpListener::bind(gateway_listen)
         .await
@@ -186,9 +190,15 @@ pub async fn run_agent(
             stop.cancel();
         }
     });
-    let polling = agent.run(stop.clone());
-    let gateway = gateway::serve(gw_listener, apps, stop.cancelled_owned());
-    let ((), served) = tokio::join!(polling, gateway);
+    let polling = async {
+        let r = agent.run(stop.clone()).await;
+        // Forgotten: the gateway stops too, and the node exits with why.
+        stop.cancel();
+        r
+    };
+    let gateway = gateway::serve(gw_listener, apps, stop.clone().cancelled_owned());
+    let (polled, served) = tokio::join!(polling, gateway);
+    polled?;
     served?;
     tracing::info!("stopped; apps keep running");
     Ok(())

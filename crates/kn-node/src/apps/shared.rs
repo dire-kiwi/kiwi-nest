@@ -134,6 +134,7 @@ impl Apps {
             snapshots,
             problem,
             node: None,
+            nest: None,
             pending: None,
         })
     }

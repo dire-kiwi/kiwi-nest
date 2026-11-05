@@ -27,6 +27,10 @@ pub enum Error {
     Refused { message: String, problems: Vec<String> },
     #[error("{0}")]
     UpgradeRequired(String),
+    /// The node making the request was forgotten (`node forget`): answered with `410 Gone` and a
+    /// [`kn_proto::agent::ForgottenBody`], which only this answers with.
+    #[error("{}", kn_proto::agent::FORGOTTEN)]
+    Forgotten { node_id: u64, name: String, at: u64 },
     /// An error from a node, passed on with the status it chose.
     #[error("{}", .1.error)]
     Node(StatusCode, ErrorBody),
@@ -66,6 +70,7 @@ impl Error {
             Error::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Refused { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Error::UpgradeRequired(_) => StatusCode::UPGRADE_REQUIRED,
+            Error::Forgotten { .. } => StatusCode::GONE,
             Error::Node(status, _) => *status,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -92,6 +97,15 @@ impl Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
+        if let Error::Forgotten { node_id, name, at } = self {
+            let body = kn_proto::agent::ForgottenBody {
+                error: kn_proto::agent::FORGOTTEN.into(),
+                node_id,
+                name,
+                forgotten_at: at,
+            };
+            return (StatusCode::GONE, axum::Json(body)).into_response();
+        }
         let status = self.status();
         if status.is_server_error() && !matches!(self, Error::Offline(_)) {
             tracing::warn!(%status, error = %self, "request failed");

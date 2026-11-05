@@ -5,7 +5,8 @@
 //! checks a name and then claims it can't race another one.
 //!
 //! The schema is built by numbered migrations ([`MIGRATIONS`]), recorded in `PRAGMA user_version`; each runs in a
-//! transaction of its own, once. A database from a newer kiwi-nest is refused.
+//! transaction of its own, once, with foreign keys checked at its end (so one may rebuild a table). A database from a
+//! newer kiwi-nest is refused.
 //!
 //! The database runs in WAL mode with `synchronous = FULL`, so a change the server has answered for survives a
 //! crash or a power cut.
@@ -13,10 +14,12 @@
 //! - [`tokens`]: admin, deploy, join and node tokens, by hash.
 //! - [`nodes`]: nodes, their facts and their last reports.
 //! - [`apps`]: apps and shared volumes, the desired state of each node, and whether a change is done.
+//! - [`nests`]: which nest each app and shared volume is in, and the node each nest is pinned to.
 //! - [`commands`]: one-off commands for nodes.
 
 pub mod apps;
 pub mod commands;
+pub mod nests;
 pub mod nodes;
 pub mod tokens;
 
@@ -29,10 +32,28 @@ use tokio::sync::oneshot;
 
 use crate::error::{Error, Result};
 
+/// One step of the schema: SQL, then (optionally) code that fills in what SQL can't, in the same transaction.
+pub struct Migration {
+    pub sql: &'static str,
+    pub then: Option<fn(&Connection) -> anyhow::Result<()>>,
+}
+
 /// The migrations, in order. Never change one that has shipped; add another.
-pub const MIGRATIONS: &[&str] = &[
+pub const MIGRATIONS: &[Migration] = &[
     // 1: tokens, nodes, bundles, apps, shared volumes and commands.
-    r#"
+    Migration {
+        sql: MIGRATION_1,
+        then: None,
+    },
+    // 2: nests; nodes can be cordoned, labelled and forgotten (kept as a tombstone, so their names are unique only
+    // among the nodes that aren't forgotten); apps record whether they idle out.
+    Migration {
+        sql: MIGRATION_2,
+        then: Some(nests::backfill),
+    },
+];
+
+const MIGRATION_1: &str = r#"
     CREATE TABLE nodes (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
@@ -102,8 +123,45 @@ pub const MIGRATIONS: &[&str] = &[
         finished_at INTEGER
     );
     CREATE INDEX commands_by_node ON commands (node_id, state);
-    "#,
-];
+    "#;
+
+const MIGRATION_2: &str = r#"
+    CREATE TABLE nodes_new (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        seq INTEGER NOT NULL DEFAULT 0,
+        facts TEXT,
+        report TEXT,
+        joined_at INTEGER NOT NULL,
+        last_seen INTEGER,
+        -- Cordoned nodes get no new nests.
+        cordoned INTEGER NOT NULL DEFAULT 0,
+        -- Labels set with `node label`, as a JSON object; they win over the node's own.
+        labels TEXT NOT NULL DEFAULT '{}',
+        -- Set by `node forget`. The row stays, as does its token's, so the node can be told it was forgotten.
+        forgotten_at INTEGER
+    );
+    INSERT INTO nodes_new (id, name, seq, facts, report, joined_at, last_seen)
+        SELECT id, name, seq, facts, report, joined_at, last_seen FROM nodes;
+    DROP TABLE nodes;
+    ALTER TABLE nodes_new RENAME TO nodes;
+    CREATE UNIQUE INDEX nodes_by_name ON nodes (name) WHERE forgotten_at IS NULL;
+    CREATE TABLE nests (
+        name TEXT PRIMARY KEY,
+        -- Where it's pinned. A nest with no apps or volumes left in it is gone, and is placed again when used.
+        node_id INTEGER NOT NULL REFERENCES nodes (id),
+        -- Why that node was chosen.
+        placement TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL
+    );
+    ALTER TABLE apps ADD COLUMN nest TEXT;
+    -- How the app came to be in its nest, such as `through --from blog`.
+    ALTER TABLE apps ADD COLUMN nest_via TEXT NOT NULL DEFAULT '';
+    ALTER TABLE apps ADD COLUMN idle_timeout_secs INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE volumes ADD COLUMN nest TEXT;
+    CREATE INDEX apps_by_nest ON apps (nest);
+    CREATE INDEX volumes_by_nest ON volumes (nest);
+    "#;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 
@@ -128,8 +186,8 @@ impl Store {
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&mut conn).with_context(|| format!("migrating {}", path.display()))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         std::thread::Builder::new().name("kn-store".into()).spawn(move || {
             for job in rx {
@@ -156,8 +214,10 @@ impl Store {
     }
 }
 
-/// Runs the migrations the database hasn't had yet.
+/// Runs the migrations the database hasn't had yet, with foreign keys off (SQLite only changes that outside a
+/// transaction) and checked at the end of each.
 pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
+    conn.pragma_update(None, "foreign_keys", "OFF")?;
     let have: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
     let have = usize::try_from(have).unwrap_or(0);
     if have > MIGRATIONS.len() {
@@ -166,9 +226,17 @@ pub fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
             MIGRATIONS.len()
         );
     }
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(have) {
+    for (i, m) in MIGRATIONS.iter().enumerate().skip(have) {
         let tx = conn.transaction()?;
-        tx.execute_batch(sql).with_context(|| format!("migration {}", i + 1))?;
+        tx.execute_batch(m.sql)
+            .with_context(|| format!("migration {}", i + 1))?;
+        if let Some(then) = m.then {
+            then(&tx).with_context(|| format!("migration {}", i + 1))?;
+        }
+        let broken: i64 = tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))?;
+        if broken > 0 {
+            anyhow::bail!("migration {} left {broken} broken foreign key(s)", i + 1);
+        }
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
         tx.commit()?;
         tracing::info!(version = i + 1, "migrated the database");
