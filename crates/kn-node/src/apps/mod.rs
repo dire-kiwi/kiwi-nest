@@ -230,6 +230,10 @@ enum Op {
     },
     /// Find out what the app's containers are doing after the node agent started.
     Adopt,
+    /// Answers once everything sent before it is done; see [`Apps::close`].
+    Barrier {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// The node's apps.
@@ -248,6 +252,8 @@ struct Inner {
     /// Each shared volume's lock: held shared by deploys and starts that mount it, exclusively by `volume` commands.
     shared_locks: Mutex<HashMap<String, Arc<RwLock<()>>>>,
     gates: Mutex<Gates>,
+    /// Set by [`Apps::close`]: no operation is taken any more. Changed with `actors` locked.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 /// Every app's gate, by name and by domain.
@@ -303,6 +309,11 @@ impl Inner {
             return Err(AppsError::InvalidName(name.to_string()));
         }
         let mut actors = self.actors.lock().expect("actors lock");
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AppsError::Busy(
+                "the server forgot this node, so it runs nothing any more".into(),
+            ));
+        }
         let mut op = Some(op);
         if let Some(tx) = actors.get(name) {
             match tx.send(op.take().expect("op")) {
@@ -473,6 +484,7 @@ impl Apps {
                 actors: Mutex::new(HashMap::new()),
                 shared_locks: Mutex::new(HashMap::new()),
                 gates: Mutex::new(Gates::default()),
+                closed: std::sync::atomic::AtomicBool::new(false),
             }),
         };
         for r in paused {
@@ -505,6 +517,32 @@ impl Apps {
 
     pub fn config(&self) -> &NodeConfig {
         &self.inner.cfg
+    }
+
+    /// Stops for good, for a node the server forgot: from now on every operation is refused (deploys, starts for
+    /// requests, idle stops, …), every route is removed, and this returns once each app's task has finished what it
+    /// was doing and what was queued before. Its containers are left as they are, for the caller to take down.
+    pub async fn close(&self) {
+        let tasks: Vec<mpsc::UnboundedSender<Op>> = {
+            let actors = self.inner.actors.lock().expect("actors lock");
+            self.inner.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            actors.values().cloned().collect()
+        };
+        for tx in tasks {
+            let (reply, done) = oneshot::channel();
+            if tx.send(Op::Barrier { reply }).is_ok() {
+                let _ = done.await;
+            }
+        }
+        let gates: Vec<Arc<Gate>> = {
+            let mut g = self.inner.gates();
+            g.by_domain.clear();
+            g.by_name.drain().map(|(_, gate)| gate).collect()
+        };
+        for g in gates {
+            g.break_leases();
+            g.set_phase(Phase::Gone);
+        }
     }
 
     pub fn runtime(&self) -> &dyn Runtime {
@@ -819,6 +857,9 @@ async fn actor(inner: Arc<Inner>, name: String, mut rx: mpsc::UnboundedReceiver<
                 let _ = reply.send(app.suspend().await);
             }
             Op::Adopt => app.adopt().await,
+            Op::Barrier { reply } => {
+                let _ = reply.send(());
+            }
         }
     }
 }

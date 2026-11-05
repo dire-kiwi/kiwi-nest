@@ -581,7 +581,7 @@ mod tests {
         };
         // An arm64 app never lands on the amd64 node, however much room it has.
         assert_eq!(place(&[amd.clone(), arm.clone()], &arm64, &s).unwrap().name, "pi");
-        let e = place(&[amd.clone()], &arm64, &s).unwrap_err();
+        let e = place(std::slice::from_ref(&amd), &arm64, &s).unwrap_err();
         assert_eq!(
             e.describe(),
             "no node can take a new nest: big (arch `amd64`, not `arm64`)"

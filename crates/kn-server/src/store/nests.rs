@@ -211,3 +211,86 @@ fn claim(c: &Connection, pinned: &mut HashMap<String, u64>, preferred: &str, nod
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_database_from_before_nests_gets_them_as_the_rules_would_have_made_them() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch(super::super::MIGRATIONS[0].sql).unwrap();
+        c.pragma_update(None, "user_version", 1).unwrap();
+        c.execute_batch(
+            "INSERT INTO nodes (id, name, joined_at) VALUES (1, 'a', 0), (2, 'b', 0);
+             INSERT INTO volumes (name, state, node_id, generation, seq, created_at, updated_at)
+                 VALUES ('corpus', 'active', 1, 1, 1, 0, 0);",
+        )
+        .unwrap();
+        let apps = [
+            // (name, node, from, shared, state)
+            ("wiki", 1, None, r#"["corpus"]"#, "active"),
+            ("blog", 2, None, "[]", "active"),
+            ("blog-pr1", 2, Some("blog"), "[]", "active"),
+            ("blog-pr1-x", 2, Some("blog-pr1"), "[]", "active"),
+            // A preview that sorts before its source.
+            ("a-preview", 1, Some("zeta"), "[]", "active"),
+            ("zeta", 1, None, "[]", "active"),
+            // Named like the volume's nest, on another node.
+            ("corpus", 2, None, "[]", "deleting"),
+            ("gone", 1, None, "[]", "deleted"),
+        ];
+        for (name, node, from, shared, state) in apps {
+            c.execute(
+                "INSERT INTO apps (name, state, node_id, generation, seq, from_app, shared, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 1, 1, ?4, ?5, 0, 0)",
+                params![name, state, node, from, shared],
+            )
+            .unwrap();
+        }
+        super::super::migrate(&mut c).unwrap();
+        let nest_of = |app: &str| -> (Option<String>, String) {
+            c.query_row("SELECT nest, nest_via FROM apps WHERE name = ?1", [app], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            nest_of("wiki"),
+            (Some("corpus".into()), "through shared volume `corpus`".into())
+        );
+        assert_eq!(nest_of("blog").0.as_deref(), Some("blog"));
+        assert_eq!(nest_of("blog-pr1"), (Some("blog".into()), "through --from blog".into()));
+        assert_eq!(nest_of("blog-pr1-x").0.as_deref(), Some("blog"));
+        assert_eq!(nest_of("a-preview").0.as_deref(), Some("zeta"));
+        assert_eq!(nest_of("corpus").0.as_deref(), Some("corpus-2"));
+        assert_eq!(nest_of("gone").0, None);
+        let volume: String = c
+            .query_row("SELECT nest FROM volumes WHERE name = 'corpus'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(volume, "corpus");
+        let pinned: Vec<(String, u64)> = list(&c)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.nest.name, m.nest.node_id))
+            .collect();
+        assert_eq!(
+            pinned,
+            [
+                ("blog".to_string(), 2),
+                ("corpus".to_string(), 1),
+                ("corpus-2".to_string(), 2),
+                ("zeta".to_string(), 1)
+            ]
+        );
+        // The rebuilt nodes table kept its rows, and names are unique only among nodes that aren't forgotten.
+        assert!(
+            c.execute("INSERT INTO nodes (name, joined_at) VALUES ('a', 0)", [])
+                .is_err()
+        );
+        c.execute("UPDATE nodes SET forgotten_at = 1 WHERE name = 'a'", [])
+            .unwrap();
+        c.execute("INSERT INTO nodes (name, joined_at) VALUES ('a', 0)", [])
+            .unwrap();
+    }
+}

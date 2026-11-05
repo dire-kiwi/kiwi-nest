@@ -293,7 +293,8 @@ fn place_nest(
     }
 }
 
-/// A warning if the node has no memory headroom left once `memory` more is placed on it.
+/// A warning if the node has no memory headroom left once `memory` more is placed on it. `joining` names the nest
+/// the app joins, if the nest was already on the node.
 fn memory_warning(
     tx: &Transaction,
     settings: &Settings,
@@ -301,8 +302,7 @@ fn memory_warning(
     except: &str,
     memory: u64,
     idles: bool,
-    nest: &str,
-    new: bool,
+    joining: Option<&str>,
 ) -> Result<Option<String>> {
     let load = scheduler::loads(tx, Some(except))?
         .get(&node.id)
@@ -325,10 +325,9 @@ fn memory_warning(
         b(load.always_on),
         settings.idle_factor,
         b(load.idle),
-        if new {
-            "it was still the best node".to_string()
-        } else {
-            format!("it goes there anyway, as nest `{nest}` does")
+        match joining {
+            None => "it was still the best node".to_string(),
+            Some(nest) => format!("it goes there anyway, as nest `{nest}` does"),
         }
     )))
 }
@@ -437,8 +436,7 @@ pub fn deploy(
         &d.name,
         d.bundle.memory_bytes,
         idles,
-        &nest,
-        placed.new.is_some(),
+        placed.new.is_none().then_some(nest.as_str()),
     )?
     .into_iter()
     .collect();
