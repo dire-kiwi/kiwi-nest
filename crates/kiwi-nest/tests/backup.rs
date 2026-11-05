@@ -249,6 +249,10 @@ fn a_lost_nodes_nest_comes_back_from_send_backups() {
         return;
     }
     if !is_root() {
+        assert!(
+            std::env::var_os("KIWI_NEST_REQUIRE_ROOT").is_none(),
+            "btrfs send needs root, and KIWI_NEST_REQUIRE_ROOT is set"
+        );
         eprintln!("skipped: btrfs send needs root");
         return;
     }

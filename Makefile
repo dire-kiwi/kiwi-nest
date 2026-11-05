@@ -30,10 +30,12 @@ integration:
 	KIWI_NEST_INTEGRATION=1 cargo test --workspace
 
 ## test-root: the tests that need root (btrfs send), built as you and run as root through sudo; with Docker, the
-## end-to-end backup tests too (set KIWI_NEST_TEST_BTRFS_DIR, and KIWI_NEST_TEST_S3 for S3)
+## end-to-end backup tests too (set KIWI_NEST_TEST_BTRFS_DIR, and KIWI_NEST_TEST_S3 for S3). A root test that
+## would skip itself fails instead (KIWI_NEST_REQUIRE_ROOT), so they can't quietly not run
 test-root:
-	CARGO_TARGET_$(HOST)_RUNNER="sudo -E" cargo test -p kn-btrfs -p kn-backup -p kn-node
-	CARGO_TARGET_$(HOST)_RUNNER="sudo -E" KIWI_NEST_INTEGRATION=1 cargo test -p kiwi-nest --test backup
+	CARGO_TARGET_$(HOST)_RUNNER="sudo -E" KIWI_NEST_REQUIRE_ROOT=1 cargo test -p kn-btrfs -p kn-backup -p kn-node
+	CARGO_TARGET_$(HOST)_RUNNER="sudo -E" KIWI_NEST_REQUIRE_ROOT=1 KIWI_NEST_INTEGRATION=1 \
+		cargo test -p kiwi-nest --test backup
 
 ## test-s3: start an S3-compatible server in Docker for the S3 tests; prints the KIWI_NEST_TEST_S3 to set
 test-s3:

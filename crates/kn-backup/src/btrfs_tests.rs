@@ -30,10 +30,18 @@ impl Drop for BtrfsDir {
 /// A fresh directory on btrfs, if this runs as root with one.
 pub(crate) fn root_btrfs() -> Option<BtrfsDir> {
     let Ok(dir) = std::env::var("KIWI_NEST_TEST_BTRFS_DIR") else {
+        assert!(
+            std::env::var_os("KIWI_NEST_REQUIRE_ROOT").is_none(),
+            "set KIWI_NEST_TEST_BTRFS_DIR to a directory on btrfs, and run as root, and KIWI_NEST_REQUIRE_ROOT is set"
+        );
         eprintln!("skipped: set KIWI_NEST_TEST_BTRFS_DIR to a directory on btrfs, and run as root");
         return None;
     };
     if !kn_btrfs::can_send() {
+        assert!(
+            std::env::var_os("KIWI_NEST_REQUIRE_ROOT").is_none(),
+            "btrfs send needs root, and KIWI_NEST_REQUIRE_ROOT is set"
+        );
         eprintln!("skipped: btrfs send needs root");
         return None;
     }

@@ -981,10 +981,18 @@ async fn shared_volumes_and_an_apps_snapshots_of_them_are_backed_up() {
 async fn send_backups_continue_chains_from_what_both_sides_have() {
     use kn_proto::backup::{Format, Kind};
     let Ok(btrfs) = std::env::var("KIWI_NEST_TEST_BTRFS_DIR") else {
+        assert!(
+            std::env::var_os("KIWI_NEST_REQUIRE_ROOT").is_none(),
+            "needs KIWI_NEST_TEST_BTRFS_DIR, as root, and KIWI_NEST_REQUIRE_ROOT is set"
+        );
         eprintln!("skipped: needs KIWI_NEST_TEST_BTRFS_DIR, as root");
         return;
     };
     if !kn_btrfs::can_send() {
+        assert!(
+            std::env::var_os("KIWI_NEST_REQUIRE_ROOT").is_none(),
+            "btrfs send needs root, and KIWI_NEST_REQUIRE_ROOT is set"
+        );
         eprintln!("skipped: btrfs send needs root");
         return;
     }
