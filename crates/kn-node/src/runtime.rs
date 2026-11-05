@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use tokio::process::{Child, Command};
 
@@ -86,16 +87,41 @@ pub struct LogsOptions {
     pub service: Option<String>,
 }
 
+/// What the node needs from a container runtime: an app's Compose project, created, started, stopped and listed.
+///
+/// [`Docker`] is the real one. Tests use a fake, so the gateway's lifecycle can be checked without Docker.
+pub trait Runtime: Send + Sync + 'static {
+    /// Creates and starts the project, waiting until its containers are running and healthy.
+    fn up<'a>(&'a self, p: &'a Project, wait_timeout: Duration) -> BoxFuture<'a, Result<(), RuntimeError>>;
+    /// Starts the project's existing containers.
+    fn start<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<(), RuntimeError>>;
+    /// Stops the project's containers, keeping them.
+    fn stop<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<(), RuntimeError>>;
+    /// Removes the project's containers and networks. The app's data is in bind mounts, so it stays.
+    fn down<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<(), RuntimeError>>;
+    fn pause<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<(), RuntimeError>>;
+    fn unpause<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<(), RuntimeError>>;
+    /// The project's containers, stopped ones included.
+    fn ps<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<Vec<ContainerState>, RuntimeError>>;
+    /// `docker inspect` of some containers.
+    fn inspect<'a>(&'a self, ids: &'a [String]) -> BoxFuture<'a, Result<serde_json::Value, RuntimeError>>;
+    /// Every Compose project on the engine whose name starts with `prefix`, stopped ones included.
+    fn projects<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<ProjectState>, RuntimeError>>;
+    /// Starts `docker compose logs`, with its output piped. The caller reads it, and the process is killed when
+    /// the [`Child`] is dropped.
+    fn logs(&self, p: &Project, opts: &LogsOptions) -> Result<Child, RuntimeError>;
+}
+
 /// Runs `docker compose`.
 #[derive(Debug, Clone)]
-pub struct Runtime {
+pub struct Docker {
     docker: PathBuf,
 }
 
-impl Runtime {
+impl Docker {
     /// `docker` is the Docker CLI to run, such as `docker` (found on `PATH`) or `/usr/bin/docker`.
     pub fn new(docker: impl Into<PathBuf>) -> Self {
-        Runtime { docker: docker.into() }
+        Docker { docker: docker.into() }
     }
 
     fn base(&self) -> Command {
@@ -155,79 +181,80 @@ impl Runtime {
             message: e.to_string(),
         })
     }
+}
 
-    /// Creates and starts the project, waiting until its containers are running and healthy.
-    pub async fn up(&self, p: &Project, wait_timeout: Duration) -> Result<(), RuntimeError> {
-        let timeout = wait_timeout.as_secs().max(1).to_string();
-        let args = [
-            "up",
-            "--detach",
-            "--wait",
-            "--wait-timeout",
-            &timeout,
-            "--remove-orphans",
-            "--quiet-pull",
-        ];
-        self.run(self.compose(p, &args)).await.map(drop)
-    }
-
-    /// Starts the project's existing containers.
-    pub async fn start(&self, p: &Project) -> Result<(), RuntimeError> {
-        self.run(self.compose(p, &["start"])).await.map(drop)
-    }
-
-    /// Stops the project's containers, keeping them.
-    pub async fn stop(&self, p: &Project) -> Result<(), RuntimeError> {
-        self.run(self.compose(p, &["stop"])).await.map(drop)
-    }
-
-    /// Removes the project's containers and networks. The app's data is in bind mounts, so it stays.
-    pub async fn down(&self, p: &Project) -> Result<(), RuntimeError> {
-        self.run(self.compose(p, &["down", "--remove-orphans"])).await.map(drop)
-    }
-
-    pub async fn pause(&self, p: &Project) -> Result<(), RuntimeError> {
-        self.run(self.compose(p, &["pause"])).await.map(drop)
-    }
-
-    pub async fn unpause(&self, p: &Project) -> Result<(), RuntimeError> {
-        self.run(self.compose(p, &["unpause"])).await.map(drop)
-    }
-
-    /// The project's containers, stopped ones included.
-    pub async fn ps(&self, p: &Project) -> Result<Vec<ContainerState>, RuntimeError> {
-        let c = self.compose(p, &["ps", "--all", "--format", "json"]);
-        let command = describe(&c);
-        let out = self.run(c).await?;
-        parse_json_lines(&out).map_err(|message| RuntimeError::Output { command, message })
-    }
-
-    /// `docker inspect` of some containers.
-    pub async fn inspect(&self, ids: &[String]) -> Result<serde_json::Value, RuntimeError> {
-        let mut c = self.base();
-        c.arg("inspect").args(ids);
-        let command = describe(&c);
-        let out = self.run(c).await?;
-        serde_json::from_str(&out).map_err(|e| RuntimeError::Output {
-            command,
-            message: e.to_string(),
+impl Runtime for Docker {
+    fn up<'a>(&'a self, p: &'a Project, wait_timeout: Duration) -> BoxFuture<'a, Result<(), RuntimeError>> {
+        Box::pin(async move {
+            let timeout = wait_timeout.as_secs().max(1).to_string();
+            let args = [
+                "up",
+                "--detach",
+                "--wait",
+                "--wait-timeout",
+                &timeout,
+                "--remove-orphans",
+                "--quiet-pull",
+            ];
+            self.run(self.compose(p, &args)).await.map(drop)
         })
     }
 
-    /// Every Compose project on the engine whose name starts with `prefix`, stopped ones included.
-    pub async fn projects(&self, prefix: &str) -> Result<Vec<ProjectState>, RuntimeError> {
-        let mut c = self.base();
-        c.args(["compose", "ls", "--all", "--format", "json"]);
-        let command = describe(&c);
-        let out = self.run(c).await?;
-        let all: Vec<ProjectState> =
-            parse_json_lines(&out).map_err(|message| RuntimeError::Output { command, message })?;
-        Ok(all.into_iter().filter(|p| p.name.starts_with(prefix)).collect())
+    fn start<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<(), RuntimeError>> {
+        Box::pin(async move { self.run(self.compose(p, &["start"])).await.map(drop) })
     }
 
-    /// Starts `docker compose logs`, with its output piped. The caller reads it, and the process is killed when
-    /// the [`Child`] is dropped.
-    pub fn logs(&self, p: &Project, opts: &LogsOptions) -> Result<Child, RuntimeError> {
+    fn stop<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<(), RuntimeError>> {
+        Box::pin(async move { self.run(self.compose(p, &["stop"])).await.map(drop) })
+    }
+
+    fn down<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<(), RuntimeError>> {
+        Box::pin(async move { self.run(self.compose(p, &["down", "--remove-orphans"])).await.map(drop) })
+    }
+
+    fn pause<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<(), RuntimeError>> {
+        Box::pin(async move { self.run(self.compose(p, &["pause"])).await.map(drop) })
+    }
+
+    fn unpause<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<(), RuntimeError>> {
+        Box::pin(async move { self.run(self.compose(p, &["unpause"])).await.map(drop) })
+    }
+
+    fn ps<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<Vec<ContainerState>, RuntimeError>> {
+        Box::pin(async move {
+            let c = self.compose(p, &["ps", "--all", "--format", "json"]);
+            let command = describe(&c);
+            let out = self.run(c).await?;
+            parse_json_lines(&out).map_err(|message| RuntimeError::Output { command, message })
+        })
+    }
+
+    fn inspect<'a>(&'a self, ids: &'a [String]) -> BoxFuture<'a, Result<serde_json::Value, RuntimeError>> {
+        Box::pin(async move {
+            let mut c = self.base();
+            c.arg("inspect").args(ids);
+            let command = describe(&c);
+            let out = self.run(c).await?;
+            serde_json::from_str(&out).map_err(|e| RuntimeError::Output {
+                command,
+                message: e.to_string(),
+            })
+        })
+    }
+
+    fn projects<'a>(&'a self, prefix: &'a str) -> BoxFuture<'a, Result<Vec<ProjectState>, RuntimeError>> {
+        Box::pin(async move {
+            let mut c = self.base();
+            c.args(["compose", "ls", "--all", "--format", "json"]);
+            let command = describe(&c);
+            let out = self.run(c).await?;
+            let all: Vec<ProjectState> =
+                parse_json_lines(&out).map_err(|message| RuntimeError::Output { command, message })?;
+            Ok(all.into_iter().filter(|p| p.name.starts_with(prefix)).collect())
+        })
+    }
+
+    fn logs(&self, p: &Project, opts: &LogsOptions) -> Result<Child, RuntimeError> {
         let tail = opts.tail.map_or_else(|| "all".to_string(), |n| n.to_string());
         let mut args = vec!["logs", "--no-color", "--tail", &tail];
         if opts.follow {
@@ -296,7 +323,7 @@ mod tests {
             file: file.clone(),
             dir: dir.path().into(),
         };
-        let rt = Runtime::new("docker");
+        let rt = Docker::new("docker");
         let c = rt.compose(&p, &["up"]);
         let d = describe(&c);
         assert!(

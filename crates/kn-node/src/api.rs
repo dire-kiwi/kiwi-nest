@@ -11,7 +11,7 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use kn_proto::api::{AppInfo, AppSummary, DeployDirectory, DeployQuery, ErrorBody, LogsQuery, VersionInfo};
@@ -49,10 +49,11 @@ impl From<AppsError> for ApiError {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
             AppsError::NotFound(_) | AppsError::NotFoundOther(_) => StatusCode::NOT_FOUND,
-            AppsError::Exists(_) | AppsError::DomainTaken { .. } => StatusCode::CONFLICT,
-            AppsError::DeployFailed { .. } | AppsError::Runtime(_) | AppsError::Internal(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            AppsError::Exists(_) | AppsError::DomainTaken { .. } | AppsError::Busy(_) => StatusCode::CONFLICT,
+            AppsError::DeployFailed { .. }
+            | AppsError::StartFailed { .. }
+            | AppsError::Runtime(_)
+            | AppsError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         match e {
             AppsError::Refused(problems) => ApiError(
@@ -86,6 +87,8 @@ pub fn router(apps: Apps) -> Router {
         .route(&format!("{p}/apps"), get(list))
         .route(&format!("{p}/apps/{{name}}"), get(inspect).put(deploy).delete(delete))
         .route(&format!("{p}/apps/{{name}}/logs"), get(logs))
+        .route(&format!("{p}/apps/{{name}}/suspend"), post(suspend))
+        .route(&format!("{p}/apps/{{name}}/resume"), post(resume))
         // Uploads are streamed to disk under the bundle limits instead.
         .layer(DefaultBodyLimit::disable())
         .layer(axum::middleware::from_fn(loopback_only))
@@ -159,6 +162,14 @@ async fn list(State(apps): State<Apps>) -> ApiResult<axum::Json<Vec<AppSummary>>
 
 async fn inspect(State(apps): State<Apps>, Path(name): Path<String>) -> ApiResult<axum::Json<AppInfo>> {
     Ok(axum::Json(apps.inspect(&name).await?))
+}
+
+async fn suspend(State(apps): State<Apps>, Path(name): Path<String>) -> ApiResult<axum::Json<AppInfo>> {
+    Ok(axum::Json(apps.suspend(&name).await?))
+}
+
+async fn resume(State(apps): State<Apps>, Path(name): Path<String>) -> ApiResult<axum::Json<AppInfo>> {
+    Ok(axum::Json(apps.resume(&name).await?))
 }
 
 async fn delete(State(apps): State<Apps>, Path(name): Path<String>) -> ApiResult<StatusCode> {

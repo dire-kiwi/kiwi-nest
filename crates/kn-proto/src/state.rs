@@ -10,9 +10,14 @@ use serde::{Deserialize, Serialize};
 pub enum AppStatus {
     /// A deploy is in progress.
     Deploying,
-    /// The last deploy succeeded and the app was started.
+    /// The app was deployed or started, and is running.
     Running,
-    /// The last deploy failed; see the app's error.
+    /// The app was stopped for being idle, or its last start failed (see its error). A request starts it.
+    Idle,
+    /// The app was stopped on purpose: suspended, or found partly running when the node agent started. Requests
+    /// don't start it; `resume` does.
+    Suspended,
+    /// The last deploy failed; see the app's error. Requests don't start it; a deploy or `resume` does.
     Failed,
 }
 
@@ -21,6 +26,8 @@ impl std::fmt::Display for AppStatus {
         f.write_str(match self {
             AppStatus::Deploying => "deploying",
             AppStatus::Running => "running",
+            AppStatus::Idle => "idle",
+            AppStatus::Suspended => "suspended",
             AppStatus::Failed => "failed",
         })
     }

@@ -64,6 +64,10 @@ pub enum Command {
         #[arg(long, short)]
         service: Option<String>,
     },
+    /// Stop an app until it's resumed; requests don't start it meanwhile. Refused while it has open requests.
+    Suspend { name: String },
+    /// Start an app (suspended, idle or failed) and wait until it's ready.
+    Resume { name: String },
     /// Delete an app: its containers, its bundle and its volumes.
     Delete { name: String },
 }
@@ -150,6 +154,22 @@ impl Client {
             .await
     }
 
+    pub async fn suspend(&self, name: &str) -> anyhow::Result<AppInfo> {
+        Ok(self
+            .send(self.http.post(self.url(&format!("/apps/{name}/suspend"))))
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub async fn resume(&self, name: &str) -> anyhow::Result<AppInfo> {
+        Ok(self
+            .send(self.http.post(self.url(&format!("/apps/{name}/resume"))))
+            .await?
+            .json()
+            .await?)
+    }
+
     pub async fn delete(&self, name: &str) -> anyhow::Result<()> {
         self.send(self.http.delete(self.url(&format!("/apps/{name}")))).await?;
         Ok(())
@@ -234,6 +254,14 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                 out.flush()?;
             }
         }
+        Command::Suspend { name } => {
+            let info = client.suspend(&name).await?;
+            println!("suspended {}", info.name);
+        }
+        Command::Resume { name } => {
+            let info = client.resume(&name).await?;
+            println!("resumed {}: {}", info.name, info.status);
+        }
         Command::Delete { name } => {
             client.delete(&name).await?;
             println!("deleted {name}");
@@ -290,6 +318,7 @@ fn print_info(i: &AppInfo) {
         i.service, i.container_port, i.port
     );
     println!("idle:        {idle}");
+    println!("open:        {} request(s)", i.open_requests);
     println!("project:     {}", i.project);
     println!("bundle:      {}", i.bundle_digest);
     println!(

@@ -3,180 +3,14 @@
 //! The tests that need Docker only run with `KIWI_NEST_INTEGRATION=1`. Each uses a random Compose project prefix,
 //! so concurrent runs don't collide, and removes only the projects with its own prefix.
 
-use std::collections::hash_map::RandomState;
-use std::hash::BuildHasher;
-use std::io::{BufRead, BufReader, Read, Write};
+mod common;
+
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime};
+use std::process::Command;
 
-const BIN: &str = env!("CARGO_BIN_EXE_kiwi-nest");
-
-fn integration() -> bool {
-    if std::env::var("KIWI_NEST_INTEGRATION").as_deref() == Ok("1") {
-        true
-    } else {
-        eprintln!("skipped: set KIWI_NEST_INTEGRATION=1 to run the tests that need Docker");
-        false
-    }
-}
-
-fn random_prefix() -> String {
-    let n = RandomState::new().hash_one((std::process::id(), SystemTime::now()));
-    format!("knit{:08x}-", n as u32)
-}
-
-/// Removes the Compose projects whose names start with a prefix, when dropped.
-struct Cleanup(String);
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let Ok(out) = Command::new("docker")
-            .args(["compose", "ls", "--all", "--format", "json"])
-            .output()
-        else {
-            return;
-        };
-        let Ok(projects) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
-            return;
-        };
-        for p in projects {
-            if let Some(name) = p["Name"].as_str().filter(|n| n.starts_with(&self.0)) {
-                eprintln!("cleaning up project {name}");
-                let _ = Command::new("docker")
-                    .args(["compose", "-p", name, "down", "--remove-orphans"])
-                    .status();
-            }
-        }
-    }
-}
-
-/// A standalone node running in the background, killed when dropped.
-struct Node {
-    child: Child,
-    url: String,
-    prefix: String,
-    dir: tempfile::TempDir,
-}
-
-impl Node {
-    fn start(prefix: &str) -> Node {
-        let dir = tempfile::tempdir().unwrap();
-        let mut child = Command::new(BIN)
-            .args(["node", "--standalone", "--listen", "127.0.0.1:0", "--up-timeout", "2m"])
-            .arg("--state-dir")
-            .arg(dir.path().join("state"))
-            .arg("--volumes-dir")
-            .arg(dir.path().join("volumes"))
-            .arg("--project-prefix")
-            .arg(prefix)
-            .env(
-                "KIWI_NEST_LOG",
-                std::env::var("KIWI_NEST_LOG").unwrap_or_else(|_| "warn".into()),
-            )
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut lines = BufReader::new(stdout).lines();
-            if let Some(Ok(line)) = lines.next() {
-                let _ = tx.send(line);
-            }
-            for _ in lines {}
-        });
-        let line = rx.recv_timeout(Duration::from_secs(20)).expect("the node should start");
-        let url = line
-            .strip_prefix("listening on ")
-            .expect("the node should print its address")
-            .to_string();
-        Node {
-            child,
-            url,
-            prefix: prefix.to_string(),
-            dir,
-        }
-    }
-
-    fn cli(&self, args: &[&str]) -> Output {
-        Command::new(BIN)
-            .arg("--node-api")
-            .arg(&self.url)
-            .args(args)
-            .output()
-            .unwrap()
-    }
-
-    /// Runs the CLI and returns its stdout, failing the test if it fails.
-    fn ok(&self, args: &[&str]) -> String {
-        let out = self.cli(args);
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert!(
-            out.status.success(),
-            "kiwi-nest {args:?} failed\nstdout: {stdout}\nstderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        stdout
-    }
-
-    /// Runs the CLI, expecting it to fail, and returns its stderr.
-    fn fails(&self, args: &[&str]) -> String {
-        let out = self.cli(args);
-        assert!(!out.status.success(), "kiwi-nest {args:?} should fail");
-        String::from_utf8_lossy(&out.stderr).into_owned()
-    }
-
-    fn inspect(&self, app: &str) -> serde_json::Value {
-        serde_json::from_str(&self.ok(&["inspect", app, "--json"])).unwrap()
-    }
-}
-
-impl Drop for Node {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// GETs `/` on a loopback port, retrying for a while; returns the body.
-fn get(port: u64) -> String {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let attempt = (|| -> std::io::Result<String> {
-            let mut s = TcpStream::connect(("127.0.0.1", port as u16))?;
-            s.set_read_timeout(Some(Duration::from_secs(5)))?;
-            s.write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")?;
-            let mut resp = String::new();
-            s.read_to_string(&mut resp)?;
-            match resp.split_once("\r\n\r\n") {
-                Some((head, body)) if head.starts_with("HTTP/1.0 200") || head.starts_with("HTTP/1.1 200") => {
-                    Ok(body.to_string())
-                }
-                _ => Err(std::io::Error::other(format!("unexpected response: {resp}"))),
-            }
-        })();
-        match attempt {
-            Ok(body) => return body,
-            Err(e) if Instant::now() > deadline => panic!("GET on port {port} failed: {e}"),
-            Err(_) => std::thread::sleep(Duration::from_millis(250)),
-        }
-    }
-}
-
-fn unreachable(port: u64) -> bool {
-    TcpStream::connect(("127.0.0.1", port as u16)).is_err()
-}
-
-fn uid_gid() -> String {
-    let out = Command::new("id").arg("-u").output().unwrap();
-    let uid = String::from_utf8(out.stdout).unwrap().trim().to_string();
-    let out = Command::new("id").arg("-g").output().unwrap();
-    let gid = String::from_utf8(out.stdout).unwrap().trim().to_string();
-    format!("{uid}:{gid}")
-}
+use common::*;
 
 /// A web service (busybox httpd serving `./site` from the bundle) and a database (Redis with a named volume).
 ///
@@ -243,15 +77,6 @@ fn redis(project: &str, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout).unwrap().trim().to_string()
-}
-
-fn project_exists(project: &str) -> bool {
-    let out = Command::new("docker")
-        .args(["compose", "ls", "--all", "--format", "json"])
-        .output()
-        .unwrap();
-    let projects: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap_or_default();
-    projects.iter().any(|p| p["Name"] == project)
 }
 
 #[test]
