@@ -722,6 +722,83 @@ async fn a_missing_volumes_directory_is_refused_not_made_again() {
     env.deploy("prod", &["data"], None).await.unwrap();
 }
 
+/// Deploys `name` with one service running `image`, on the fake runtime.
+async fn deploy_image(apps: &Apps, root: &Path, name: &str, image: &str) {
+    let b = root.join(format!("bundle-{name}-{}", image.replace(['/', ':'], "-")));
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(
+        b.join("compose.yaml"),
+        format!("x-kiwi-nest: {{ domain: {name}.localhost, service: web, port: 80 }}\nservices:\n  web:\n    image: {image}\n"),
+    )
+    .unwrap();
+    let staged = apps.stage_dir(b).await.unwrap();
+    apps.deploy(name, staged, DeployOptions::default()).await.unwrap();
+}
+
+fn kept(r: &PruneReport, image: &str) -> String {
+    r.kept
+        .iter()
+        .find(|k| k.image == image)
+        .map(|k| k.why.clone())
+        .unwrap_or_else(|| panic!("{image} should be kept: {r:?}"))
+}
+
+#[tokio::test]
+async fn pruning_removes_images_apps_stopped_using_once_unused_after_the_grace_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let mut cfg = NodeConfig::new(root.join("state"));
+    cfg.prune_interval = Duration::ZERO;
+    let rt = crate::testing::Fake::new();
+    let volumes = Arc::new(Fake::default());
+    let apps = Apps::open_with_runtime(cfg.clone(), volumes.clone(), rt.clone())
+        .await
+        .unwrap();
+    let (one, two) = ("r.test/blog:1", "r.test/blog:2");
+    let hour = Duration::from_secs(3600);
+
+    deploy_image(&apps, &root, "blog", one).await;
+    assert!(rt.has_image(one));
+    // Nothing was released: nothing to do, and images apps never used aren't touched.
+    assert_eq!(apps.prune_images(Duration::ZERO).await.unwrap(), PruneReport::default());
+
+    // A redeploy with another image releases the first, which is kept for the grace period.
+    deploy_image(&apps, &root, "blog", two).await;
+    let r = apps.prune_images(hour).await.unwrap();
+    assert!(r.removed.is_empty(), "{r:?}");
+    assert!(kept(&r, one).contains("within the grace period"), "{r:?}");
+    assert!(rt.has_image(one));
+
+    // Used again by another app, it stays whatever the grace period.
+    deploy_image(&apps, &root, "shop", one).await;
+    let r = apps.prune_images(Duration::ZERO).await.unwrap();
+    assert_eq!(kept(&r, one), "used by app shop");
+
+    // Deleted: released again, and kept across a restart.
+    apps.delete("shop", false).await.unwrap();
+    drop(apps);
+    let apps = Apps::open_with_runtime(cfg.clone(), volumes.clone(), rt.clone())
+        .await
+        .unwrap();
+    assert!(kept(&apps.prune_images(hour).await.unwrap(), one).contains("within the grace period"));
+    let r = apps.prune_images(Duration::ZERO).await.unwrap();
+    assert_eq!(r.removed, vec![one.to_string()]);
+    assert!(!rt.has_image(one));
+    assert!(rt.has_image(two), "blog still uses it");
+    // Once removed, it's forgotten.
+    assert_eq!(apps.prune_images(Duration::ZERO).await.unwrap(), PruneReport::default());
+
+    // A delete then a deploy within the grace period finds the image still there.
+    apps.delete("blog", false).await.unwrap();
+    assert!(apps.prune_images(hour).await.unwrap().removed.is_empty());
+    assert!(rt.has_image(two));
+    deploy_image(&apps, &root, "blog", two).await;
+    assert_eq!(
+        kept(&apps.prune_images(Duration::ZERO).await.unwrap(), two),
+        "used by app blog"
+    );
+}
+
 /// A local directory target, in `format`, keeping the last `keep` backups.
 fn dir_target(dir: &Path, name: &str, format: kn_proto::backup::Format, keep: u32) -> kn_backup::Target {
     kn_backup::Target::open(kn_proto::backup::TargetConfig {

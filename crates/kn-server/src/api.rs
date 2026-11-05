@@ -16,8 +16,8 @@ use axum::routing::{delete as delete_route, get, post, put};
 use kn_proto::agent::{Action, CommandResult};
 use kn_proto::api::{
     AppInfo, AppSummary, ChangeStatus, CreateToken, CreatedToken, DeleteQuery, DeployQuery, ForgetQuery, Forgot,
-    LabelRequest, LogsQuery, NestInfo, NodeInfo, TokenInfo, TokenKind, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery,
-    WhoAmI,
+    GcQuery, GcReport, LabelRequest, LogsQuery, NestInfo, NodeInfo, PruneQuery, PruneReport, RegistryInfo, TokenInfo,
+    TokenKind, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery, WhoAmI,
 };
 use kn_proto::backup::{BackupInfo, BackupQuery, BackupResult, Kind as BackupKind, ListQuery, Restore};
 use kn_proto::state::AppStatus;
@@ -72,6 +72,9 @@ pub fn router() -> Router<Server> {
         .route(&format!("{p}/nodes/{{name}}/cordon"), post(node_cordon))
         .route(&format!("{p}/nodes/{{name}}/uncordon"), post(node_uncordon))
         .route(&format!("{p}/nodes/{{name}}/forget"), post(node_forget))
+        .route(&format!("{p}/nodes/{{name}}/prune"), post(node_prune))
+        .route(&format!("{p}/registry"), get(registry_info))
+        .route(&format!("{p}/registry/gc"), post(registry_gc))
         .route(&format!("{p}/tokens"), get(token_list).post(token_create))
         .route(&format!("{p}/tokens/{{id}}"), delete_route(token_revoke))
 }
@@ -382,6 +385,16 @@ async fn deploy(
             checked.shared_rw.join(", ")
         )));
     }
+    // Garbage collection doesn't decide what to delete, nor stop the registry, while a deploy is checked and saved.
+    let hold = match &s.registry {
+        Some(r) => Some(r.hold().await),
+        None => None,
+    };
+    // The platforms of the images the registry holds, so the app only goes to a node that can run them.
+    let platforms = match &s.registry {
+        Some(r) => r.platforms(&checked.images).await,
+        None => Vec::new(),
+    };
     let (b, online, settings) = (s.bundles.clone(), s.online(), s.cfg.scheduler);
     let d = apps::Deploy {
         name: name.clone(),
@@ -392,12 +405,14 @@ async fn deploy(
         from: q.from,
         node: q.node,
         queue: q.queue,
+        platforms,
         restore,
     };
     let saved = s
         .store
         .call(move |c| apps::deploy(c, &b, &online, &settings, d, store::now()))
         .await?;
+    drop(hold);
     drop(upload);
     tracing::info!(
         app = name,
@@ -840,6 +855,63 @@ async fn node_forget(
         tracing::warn!(node = f.forgot.node, released = gone, by = caller.id, "forgot a node");
     }
     Ok(axum::Json(f.forgot))
+}
+
+/// Has a node remove the images of its past apps that nothing uses (beyond the grace period).
+async fn node_prune(
+    State(s): State<Server>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Query(q): Query<PruneQuery>,
+) -> Result<axum::Json<PruneReport>> {
+    caller.admin()?;
+    let n = name.clone();
+    let node = s.store.call(move |c| nodes::by_name(c, &n)).await?;
+    nodes::require_registry(&node)?;
+    let report = result(
+        s.command(
+            node.id,
+            &node.name,
+            Action::PruneImages {
+                grace_secs: q.grace_secs,
+            },
+        )
+        .await?,
+    )?;
+    Ok(axum::Json(report))
+}
+
+fn registry_of(s: &Server) -> Result<std::sync::Arc<crate::registry::Registry>> {
+    s.registry.clone().ok_or_else(|| {
+        Error::NotFound("this cluster has no image registry (start the server with --registry-domain)".into())
+    })
+}
+
+async fn registry_info(State(s): State<Server>, _caller: Caller) -> Result<axum::Json<RegistryInfo>> {
+    let r = registry_of(&s)?;
+    Ok(axum::Json(RegistryInfo {
+        host: r.host().to_string(),
+    }))
+}
+
+async fn registry_gc(
+    State(s): State<Server>,
+    caller: Caller,
+    Query(q): Query<GcQuery>,
+) -> Result<axum::Json<GcReport>> {
+    caller.admin()?;
+    let r = registry_of(&s)?;
+    let report = r.gc(&s, q.dry_run, q.grace_secs.map(Duration::from_secs)).await?;
+    if !q.dry_run {
+        tracing::info!(
+            deleted = report.deleted.len(),
+            kept = report.kept.len(),
+            collected = report.collected,
+            by = caller.id,
+            "collected the registry's garbage"
+        );
+    }
+    Ok(axum::Json(report))
 }
 
 async fn nest_list(State(s): State<Server>, caller: Caller) -> Result<axum::Json<Vec<NestInfo>>> {

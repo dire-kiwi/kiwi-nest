@@ -172,6 +172,8 @@ pub struct CheckedApp {
     pub backups: bool,
     /// Its basic-auth users, checked by the ingress.
     pub auth: Vec<crate::ingress::BasicAuth>,
+    /// Its services' images, as the bundle names them.
+    pub images: Vec<String>,
 }
 
 fn bundle_error(e: kn_bundle::BundleError) -> Error {
@@ -199,7 +201,11 @@ pub fn check_app(zip: &Path, scratch: &Path, limits: &Limits) -> Result<CheckedA
     let m = &bundle.manifest;
     let mut host_paths = Vec::new();
     let mut memory_bytes = 0;
+    let mut images: Vec<String> = Vec::new();
     for s in &bundle.services {
+        if !s.image.is_empty() && !images.contains(&s.image) {
+            images.push(s.image.clone());
+        }
         for mount in &s.mounts {
             if let Mount::Host { path, .. } = mount {
                 host_paths.push(path.clone());
@@ -236,6 +242,7 @@ pub fn check_app(zip: &Path, scratch: &Path, limits: &Limits) -> Result<CheckedA
                 hash: a.hash.clone(),
             })
             .collect(),
+        images,
     })
 }
 

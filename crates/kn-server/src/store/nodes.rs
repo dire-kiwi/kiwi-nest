@@ -269,6 +269,21 @@ pub fn require_backups(n: &Node) -> Result<()> {
     )))
 }
 
+/// Refuses a command for the node's images if the node is too old for it (see
+/// [`kn_proto::agent::REGISTRY_PROTOCOL`]).
+pub fn require_registry(n: &Node) -> Result<()> {
+    if n.facts
+        .as_ref()
+        .is_some_and(|f| f.protocol >= kn_proto::agent::REGISTRY_PROTOCOL)
+    {
+        return Ok(());
+    }
+    Err(Error::Conflict(format!(
+        "node `{}` runs a kiwi-nest from before the image registry; upgrade it first",
+        n.name
+    )))
+}
+
 /// The node's labels: those it reports, with those set by `node label` over them.
 pub fn labels_of(n: &Node) -> BTreeMap<String, String> {
     let mut labels = n.facts.as_ref().map(|f| f.labels.clone()).unwrap_or_default();
@@ -339,6 +354,7 @@ pub fn forget(
             lost_commands: Vec::new(),
         });
     }
+    super::registry::release_node(&tx, n.id, now)?;
     tx.execute("UPDATE nodes SET forgotten_at = ?2 WHERE id = ?1", params![n.id, now])?;
     tx.execute(
         "UPDATE tokens SET revoked_at = ?2 WHERE node_id = ?1 AND revoked_at IS NULL",

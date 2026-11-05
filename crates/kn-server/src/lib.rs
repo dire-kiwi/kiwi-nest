@@ -9,6 +9,7 @@
 //! - [`api`] is the API for the CLI, and [`agent`] the link for nodes.
 //! - [`backups`] is the backup targets, the schedule, and backups (and restores) of the server's own state.
 //! - [`ingress`] configures the cluster's Caddy.
+//! - [`registry`] runs the cluster's image registry, checks its credentials and collects its garbage.
 //!
 //! On disk:
 //!
@@ -17,6 +18,7 @@
 //! STATE/bundles/          bundles by digest; see [`bundles`]
 //! STATE/ingress-ca.crt    the ingress's internal CA's root certificate, with `--ingress internal`
 //! STATE/bundles/tmp/      uploads being checked, and the server's state being copied for a backup
+//! STATE/registry/         the image registry's configuration and storage; see [`registry::container`]
 //! ```
 
 pub mod agent;
@@ -27,6 +29,7 @@ pub mod bundles;
 pub mod error;
 pub mod hub;
 pub mod ingress;
+pub mod registry;
 pub mod scheduler;
 pub mod store;
 
@@ -70,6 +73,8 @@ pub struct ServerConfig {
     pub ingress: Option<ingress::IngressConfig>,
     /// How placement counts memory.
     pub scheduler: scheduler::Settings,
+    /// The image registry to run, if any. It needs the ingress.
+    pub registry: Option<registry::RegistryConfig>,
     /// Where backups go: handed to nodes, and used for the server's own.
     pub backup_targets: Vec<kn_proto::backup::TargetConfig>,
     /// How often the schedule looks for backups that are due.
@@ -89,6 +94,7 @@ impl ServerConfig {
             load_limits: Limits::for_volumes(),
             ingress: None,
             scheduler: scheduler::Settings::default(),
+            registry: None,
             backup_targets: Vec::new(),
             backup_check_interval: Duration::from_secs(60),
             backup_timeout: Duration::from_secs(6 * 3600),
@@ -109,6 +115,7 @@ pub struct Inner {
     /// Cancelled when the server shuts down, so open polls answer at once.
     pub stop: CancellationToken,
     pub ingress: Option<Arc<ingress::Ingress>>,
+    pub registry: Option<Arc<registry::Registry>>,
 }
 
 impl Deref for Server {
@@ -123,8 +130,33 @@ impl Server {
     /// Opens the server's state, creating it if needed. On the first start (no admin token yet) it makes an admin
     /// token and returns it: the only time it's shown.
     pub async fn open(cfg: ServerConfig) -> anyhow::Result<(Server, Option<String>)> {
+        Server::open_with(cfg, None).await
+    }
+
+    /// Opens the server, with the registry's container run by `container` if given (a fake, in tests).
+    pub async fn open_with(
+        mut cfg: ServerConfig,
+        container: Option<Arc<dyn registry::container::Container>>,
+    ) -> anyhow::Result<(Server, Option<String>)> {
         std::fs::create_dir_all(&cfg.state_dir).with_context(|| format!("creating {}", cfg.state_dir.display()))?;
         let backups = Arc::new(backups::Backups::new(cfg.backup_targets.clone()).context("the backup targets")?);
+        let registry = match (&cfg.registry, &mut cfg.ingress) {
+            (None, _) => None,
+            (Some(_), None) => anyhow::bail!("the registry is served by the ingress, so it needs one"),
+            (Some(r), Some(i)) => {
+                if i.api_domain.as_deref() == Some(r.domain.as_str()) {
+                    anyhow::bail!("the registry and the server's API need different domains");
+                }
+                i.registry = Some(ingress::RegistryRoute {
+                    domain: r.domain.clone(),
+                    upstream: r.listen,
+                });
+                Some(Arc::new(match container {
+                    Some(c) => registry::Registry::with_container(r.clone(), i, c)?,
+                    None => registry::Registry::new(r.clone(), i, &cfg.state_dir)?,
+                }))
+            }
+        };
         let ingress = cfg
             .ingress
             .clone()
@@ -142,7 +174,7 @@ impl Server {
                     tracing::info!(lost, "commands open when the server stopped won't be answered");
                 }
                 store::apps::sweep(c, &b)?;
-                store::apps::backfill_auth(c, &b, &limits)?;
+                store::apps::backfill(c, &b, &limits)?;
                 if store::tokens::admin_count(c)? > 0 {
                     return Ok(None);
                 }
@@ -160,6 +192,7 @@ impl Server {
             backups,
             stop: CancellationToken::new(),
             ingress,
+            registry,
         }));
         Ok((server, first))
     }
@@ -168,6 +201,7 @@ impl Server {
     pub fn router(&self) -> axum::Router {
         api::router()
             .merge(agent::router())
+            .merge(registry::router())
             // JSON bodies (reports, tokens, joins) are small; uploads are streamed under their own limits.
             .layer(axum::extract::DefaultBodyLimit::max(MAX_JSON))
             .with_state(self.clone())
@@ -180,10 +214,14 @@ impl Server {
         }
     }
 
-    /// What a domain is kept for, if apps can't use it: the server's own API.
+    /// What a domain is kept for, if apps can't use it: the server's own API, or the registry.
     pub fn reserved_domain(&self, domain: &str) -> Option<&'static str> {
         let i = self.ingress.as_ref()?;
-        (i.config().api_domain.as_deref() == Some(domain)).then_some("the server's API domain")
+        if i.config().api_domain.as_deref() == Some(domain) {
+            return Some("the server's API domain");
+        }
+        let r = i.config().registry.as_ref()?;
+        (r.domain == domain).then_some("the image registry's domain")
     }
 
     /// Whether a node is online, for the store's transactions.
@@ -281,6 +319,10 @@ pub async fn serve(
         let api = ingress::reachable(listener.local_addr()?);
         let (server, stop) = (server.clone(), stop.clone());
         tokio::spawn(async move { ingress.run(server, api, stop).await });
+    }
+    if let Some(registry) = server.registry.clone() {
+        let (server, stop) = (server.clone(), stop.clone());
+        tokio::spawn(async move { registry.run(server, stop).await });
     }
     let router = server.router();
     let graceful = axum::serve(listener, router).with_graceful_shutdown(stop.clone().cancelled_owned());

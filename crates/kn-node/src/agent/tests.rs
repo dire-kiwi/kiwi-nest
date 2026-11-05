@@ -4,6 +4,7 @@
 //! was) and start it again on the same state, as a node restart would. The fake runtime stands for Docker, so it
 //! outlives the node.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,15 +25,47 @@ struct Cluster {
     http: reqwest::Client,
 }
 
+/// The registry's container, for a server whose registry isn't really there.
+struct NoContainer;
+
+impl kn_server::registry::container::Container for NoContainer {
+    fn ensure(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn stop(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn collect(&self, _: bool) -> futures_util::future::BoxFuture<'_, anyhow::Result<String>> {
+        Box::pin(async { Ok(String::new()) })
+    }
+}
+
 impl Cluster {
     async fn start() -> Cluster {
+        Cluster::start_with(false).await
+    }
+
+    /// A server, with a registry at `registry.test` (served by an ingress that isn't there) if `registry`.
+    async fn start_with(registry: bool) -> Cluster {
         install_tls();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = kn_server::ServerConfig::new(dir.path().join("server"));
         cfg.poll_timeout = Duration::from_secs(1);
         cfg.offline_after = Duration::from_millis(1500);
         cfg.command_timeout = Duration::from_secs(20);
-        let (server, admin) = kn_server::Server::open(cfg).await.unwrap();
+        let container: Option<Arc<dyn kn_server::registry::container::Container>> = if registry {
+            cfg.ingress = Some(kn_server::ingress::IngressConfig::new(
+                "http://127.0.0.1:9",
+                kn_server::ingress::Tls::Http,
+            ));
+            let mut r = kn_server::registry::RegistryConfig::new("registry.test");
+            r.listen = "127.0.0.1:9".parse().unwrap();
+            cfg.registry = Some(r);
+            Some(Arc::new(NoContainer))
+        } else {
+            None
+        };
+        let (server, admin) = kn_server::Server::open_with(cfg, container).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(kn_server::serve(listener, server, std::future::pending()));
@@ -199,7 +232,29 @@ impl Node {
         cfg.project_prefix = format!("kn-{}-", self.name);
         cfg.ports = self.ports.clone();
         cfg.start_timeout = Duration::from_secs(5);
+        cfg.docker_config = Some(self.dir.join("state/docker"));
+        cfg.prune_interval = Duration::ZERO;
         cfg
+    }
+
+    /// The registry logins in the node's Docker configuration: host → `user:password`.
+    fn docker_logins(&self) -> BTreeMap<String, String> {
+        use base64::Engine;
+        let Ok(bytes) = std::fs::read(self.dir.join("state/docker/config.json")) else {
+            return BTreeMap::new();
+        };
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        v["auths"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(host, a)| {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(a["auth"].as_str().unwrap())
+                    .unwrap();
+                (host.clone(), String::from_utf8(raw).unwrap())
+            })
+            .collect()
     }
 
     fn project(&self, app: &str) -> String {
@@ -876,4 +931,66 @@ async fn an_outage_a_wrong_token_or_a_look_alike_answer_takes_nothing_down() {
     a.start(None).await;
     c.online("a", true).await;
     assert_eq!(c.info("blog").await.node.as_deref(), Some("a"));
+}
+
+#[tokio::test]
+async fn a_node_writes_its_registry_credential_into_its_own_docker_config_and_replaces_it_each_start() {
+    use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
+    let cluster = Cluster::start_with(true).await;
+    let mut a = cluster.node("a", 41500..=41599);
+    a.start(Some(cluster.join_token().await)).await;
+    let logins = a.docker_logins();
+    let first = logins.get("registry.test").expect("a login for the registry").clone();
+    assert!(first.starts_with("node-a:knr_"), "{first}");
+    let path = a.dir.join("state/docker/config.json");
+    assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    let ask = |login: String| {
+        let http = cluster.http.clone();
+        let url = format!("{}{}/registry/auth", cluster.url, kn_proto::API_PREFIX);
+        async move {
+            http.get(url)
+                .header("x-forwarded-method", "GET")
+                .header("x-forwarded-uri", "/v2/app/manifests/1")
+                .header(
+                    "authorization",
+                    format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(login)),
+                )
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(ask(first.clone()).await, StatusCode::OK);
+
+    // A login added for another registry is kept; the node's own is replaced when it starts again.
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["auths"]["other.example.com"] = json!({ "auth": base64::engine::general_purpose::STANDARD.encode("me:pw") });
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    a.kill();
+    a.start(None).await;
+    let logins = a.docker_logins();
+    let second = logins["registry.test"].clone();
+    assert_ne!(second, first);
+    assert_eq!(logins["other.example.com"], "me:pw");
+    assert_eq!(ask(first).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(ask(second).await, StatusCode::OK);
+
+    // Pruning through the server: nothing was used, so nothing to do.
+    cluster.online("a", true).await;
+    let r = cluster
+        .req(Method::POST, "/nodes/a/prune?grace_secs=0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
+    let report: kn_proto::api::PruneReport = r.json().await.unwrap();
+    assert_eq!(report, kn_proto::api::PruneReport::default());
+
+    // Without a registry, a node has no login.
+    let plain = Cluster::start().await;
+    let mut b = plain.node("b", 41600..=41699);
+    b.start(Some(plain.join_token().await)).await;
+    assert!(b.docker_logins().is_empty());
 }

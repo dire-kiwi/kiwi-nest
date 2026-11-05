@@ -3,6 +3,10 @@
 //! - **Joining.** The first start swaps a join token for the node's own token and its ingress token (which the
 //!   gateway expects from the ingress), kept in `STATE/agent.json` (mode 0600) with the server's URL, so later starts
 //!   need neither. A node that joined before the server gave out ingress tokens asks for its own.
+//! - **The registry.** The node runs Docker with a configuration directory of its own, `STATE/docker`, and writes
+//!   its read-only credential for the cluster's registry there: from the join, and a new one (replacing it) every
+//!   time it starts. Credentials for other registries can be added there with `DOCKER_CONFIG=STATE/docker docker
+//!   login`, and are kept.
 //! - **Polling.** One loop long-polls the server with a report of the node (its facts, its apps and volumes, the
 //!   changes it has finished, the commands it's running), and hands what comes back to the applier and to command
 //!   tasks. It never waits for either, so it never stalls. When a change finishes, a reporter sends a report at
@@ -269,7 +273,7 @@ impl Agent {
     /// Starts the agent's state: reads `agent.json`, or joins the server with the join token and writes it.
     pub async fn start(apps: Apps, cfg: AgentConfig) -> anyhow::Result<Agent> {
         let path = apps.config().state_dir.join("agent.json");
-        let file = match read_file(&path)? {
+        let (file, logged_in) = match read_file(&path)? {
             Some(f) if f.forgotten.is_none() => {
                 if f.server.trim_end_matches('/') != cfg.server.trim_end_matches('/') {
                     anyhow::bail!(
@@ -279,7 +283,7 @@ impl Agent {
                         path.display()
                     );
                 }
-                f
+                (f, false)
             }
             existing => {
                 if let Some(rec) = existing.and_then(|f| f.forgotten) {
@@ -326,10 +330,24 @@ impl Agent {
                 let p = path.clone();
                 tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await??;
                 tracing::info!(server = cfg.server, node = f.name, "joined the server");
-                f
+                if let Some(login) = &joined.registry {
+                    write_registry_login(apps.config(), login)?;
+                }
+                (f, joined.registry.is_some())
             }
         };
         let link = Link::new(&cfg.server, &file.token, cfg.ca_certs.as_deref())?;
+        if !logged_in {
+            // A new credential every start; if the server can't be reached, the last one still works.
+            match link.registry_login().await {
+                Ok(Some(login)) => write_registry_login(apps.config(), &login)?,
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "couldn't get a new registry credential from the server; using the last one, if any"
+                ),
+            }
+        }
         let mut file = file;
         if file.ingress_token.is_none() && !cfg.ingress.is_empty() {
             let t = link
@@ -901,6 +919,10 @@ impl Inner {
             Action::Resume { app } => Some(json(self.apps.resume(&app).await)),
             Action::VolumeInfo { name } => Some(json(self.apps.volume_info(&name).await)),
             Action::DeleteSnapshot { name, app } => Some(json(self.apps.volume_delete_snapshot(&name, &app).await)),
+            Action::PruneImages { grace_secs } => {
+                let grace = grace_secs.map_or(self.apps.config().image_grace, Duration::from_secs);
+                Some(json(self.apps.prune_images(grace).await))
+            }
             Action::Backup {
                 what,
                 name,
@@ -951,6 +973,43 @@ impl Inner {
             }
         }
     }
+}
+
+/// Writes the registry's credential into the node's Docker configuration (`STATE/docker/config.json`, mode 0600),
+/// keeping whatever else is there, such as logins to other registries.
+fn write_registry_login(cfg: &NodeConfig, login: &kn_proto::agent::RegistryLogin) -> anyhow::Result<()> {
+    use base64::Engine;
+    let Some(dir) = &cfg.docker_config else { return Ok(()) };
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("config.json");
+    let mut config: serde_json::Value = match std::fs::read(&path) {
+        Ok(b) => serde_json::from_slice(&b).with_context(|| format!("reading {}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if !config.is_object() {
+        config = serde_json::json!({});
+    }
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", login.username, login.password));
+    if !config["auths"].is_object() {
+        config["auths"] = serde_json::json!({});
+    }
+    config["auths"][&login.host] = serde_json::json!({ "auth": auth });
+    // The CLI plugins (Compose) of the configuration the node would otherwise use are still found.
+    let usual = std::env::var_os("DOCKER_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".docker")))
+        .map(|d| d.join("cli-plugins"))
+        .filter(|d| d.is_dir() && !d.starts_with(dir));
+    if let Some(p) = usual {
+        config["cliPluginsExtraDirs"] = serde_json::json!([p]);
+    }
+    write_atomic(&path, &serde_json::to_vec_pretty(&config)?)?;
+    tracing::info!(
+        registry = login.host,
+        "wrote the registry's credential into the node's Docker configuration"
+    );
+    Ok(())
 }
 
 /// The server's backup targets, fetched for each backup and restore (so a change to them on the server needs no

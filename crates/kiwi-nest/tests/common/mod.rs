@@ -10,7 +10,7 @@
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
@@ -270,6 +270,8 @@ pub struct Server {
     extra: Vec<String>,
     /// The CLI's configuration directory, empty, so the tests never use the user's clusters.
     pub config: tempfile::TempDir,
+    /// More environment for the CLI, such as its own `DOCKER_CONFIG`.
+    pub env: Vec<(String, PathBuf)>,
 }
 
 /// Reads a child's first `n` lines of stdout, then keeps draining it.
@@ -351,6 +353,7 @@ impl Server {
             dir,
             extra,
             config: tempfile::tempdir().unwrap(),
+            env: Vec::new(),
         }
     }
 
@@ -369,6 +372,7 @@ impl Server {
             dir,
             extra,
             config: tempfile::tempdir().unwrap(),
+            env: Vec::new(),
         }
     }
 
@@ -419,6 +423,9 @@ impl Server {
             .env_remove("KIWI_NEST_CA_CERT");
         if let Some(ca) = &self.ca_cert {
             cmd.env("KIWI_NEST_CA_CERT", ca);
+        }
+        for (k, v) in &self.env {
+            cmd.env(k, v);
         }
         cmd.output().unwrap()
     }
@@ -642,6 +649,11 @@ impl Drop for ClusterNode {
 /// A Python web app that takes two seconds to start listening, answers `/` with `hello`, and echoes bytes on a
 /// WebSocket at `/ws`, at `domain`, with more of `x-kiwi-nest` in `extra` (such as `, auth: [...]`).
 pub fn write_python_bundle(dir: &Path, domain: &str, idle_timeout: &str, extra: &str) {
+    write_python_bundle_with(dir, domain, idle_timeout, extra, "python:3.13-alpine")
+}
+
+/// [`write_python_bundle`], running `image` (which must have Python).
+pub fn write_python_bundle_with(dir: &Path, domain: &str, idle_timeout: &str, extra: &str, image: &str) {
     std::fs::create_dir_all(dir.join("app")).unwrap();
     std::fs::write(
         dir.join("app/server.py"),
@@ -687,7 +699,7 @@ http.server.ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
             r#"x-kiwi-nest: {{ domain: {domain}, service: web, port: 8080, idle_timeout: {idle_timeout}{extra} }}
 services:
   web:
-    image: python:3.13-alpine
+    image: {image}
     command: ["python", "-u", "/app/server.py"]
     user: "{}"
     init: true
@@ -702,4 +714,110 @@ services:
         ),
     )
     .unwrap();
+}
+
+/// The Caddy binary, or `None` (and a note) if there isn't one.
+pub fn caddy_bin() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("KIWI_NEST_TEST_CADDY") {
+        return Some(PathBuf::from(p));
+    }
+    let found = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|d| d.join("caddy"))
+            .find(|p| p.is_file())
+    });
+    if found.is_none() {
+        eprintln!("skipped: set KIWI_NEST_TEST_CADDY, or put caddy on the PATH, to run the tests with real Caddy");
+    }
+    found
+}
+
+/// A free loopback port (free when asked, at least).
+pub fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// Caddy, started with nothing but its admin API, as it would be by its own service; the server configures the
+/// rest. Killed when dropped.
+pub struct Caddy {
+    bin: PathBuf,
+    child: Option<Child>,
+    pub admin: u16,
+    pub dir: tempfile::TempDir,
+}
+
+impl Caddy {
+    pub fn start(bin: PathBuf) -> Caddy {
+        let mut c = Caddy {
+            bin,
+            child: None,
+            admin: free_port(),
+            dir: tempfile::tempdir().unwrap(),
+        };
+        c.spawn();
+        c
+    }
+
+    fn spawn(&mut self) {
+        let boot = self.dir.path().join("boot.json");
+        std::fs::write(&boot, format!(r#"{{"admin":{{"listen":"127.0.0.1:{}"}}}}"#, self.admin)).unwrap();
+        let log = std::fs::File::create(self.dir.path().join("caddy.log")).unwrap();
+        let child = Command::new(&self.bin)
+            .args(["run", "--config"])
+            .arg(&boot)
+            .env("HOME", self.dir.path())
+            .env("XDG_DATA_HOME", self.dir.path().join("data"))
+            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        self.child = Some(child);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while TcpStream::connect(("127.0.0.1", self.admin)).is_err() {
+            assert!(Instant::now() < deadline, "Caddy should start: {}", self.log());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Kills Caddy and starts it again, empty.
+    pub fn restart(&mut self) {
+        self.kill();
+        self.spawn();
+    }
+
+    pub fn kill(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("caddy.log")).unwrap_or_default()
+    }
+
+    /// A bcrypt hash of `password`, from `caddy hash-password`.
+    pub fn hash(&self, password: &str) -> String {
+        let out = Command::new(&self.bin)
+            .args(["hash-password", "--plaintext", password])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+}
+
+impl Drop for Caddy {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+pub fn wait_for(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !f() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }

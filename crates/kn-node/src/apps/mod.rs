@@ -39,7 +39,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kn_bundle::manifest::{Arch, is_valid_app_name};
 use kn_bundle::{BundleError, CheckOptions, CheckedBundle, Problems};
-use kn_proto::api::{AppInfo, AppSummary, ContainerInfo, LogsQuery, SharedMountInfo};
+use kn_proto::api::{AppInfo, AppSummary, ContainerInfo, KeptImage, LogsQuery, PruneReport, SharedMountInfo};
 use kn_proto::backup::Restore;
 use kn_proto::state::{AppStatus, SharedMode};
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedRwLockReadGuard, RwLock, mpsc, onesh
 
 use crate::NodeConfig;
 use crate::gateway::gate::{Gate, Phase};
-use crate::runtime::{Docker, LogsOptions, Project, Runtime, RuntimeError};
+use crate::runtime::{Docker, ImageRemoval, LogsOptions, Project, Runtime, RuntimeError};
 use crate::volumes::{Backend, Btrfs, VolumeError, Volumes};
 
 pub use backup::{StaticTargets, TargetSource, Targets};
@@ -94,6 +94,9 @@ pub struct AppRecord {
     /// Set while the app's containers are paused for a snapshot, so a restarted node unpauses them.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub paused: bool,
+    /// Its services' images.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
     /// Unix seconds.
     pub created_at: u64,
     pub updated_at: u64,
@@ -129,6 +132,31 @@ struct StateFile {
     apps: BTreeMap<String, AppRecord>,
     #[serde(default)]
     shared: BTreeMap<String, SharedRecord>,
+    /// Images that apps stopped using (redeployed with others, or deleted), and when: pruning removes them once
+    /// nothing uses them and the grace period is over.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    released_images: BTreeMap<String, u64>,
+}
+
+impl StateFile {
+    /// Stamps the images in `old` that aren't in `new` as released now.
+    fn release(&mut self, old: &[String], new: &[String]) {
+        let t = now();
+        for i in old.iter().filter(|i| !new.contains(i)) {
+            self.released_images.insert(i.clone(), t);
+        }
+    }
+}
+
+/// The images of a bundle's services.
+fn images_of(bundle: &CheckedBundle) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in &bundle.services {
+        if !s.image.is_empty() && !out.contains(&s.image) {
+            out.push(s.image.clone());
+        }
+    }
+    out
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -445,7 +473,7 @@ impl Apps {
 
     /// Opens the node's state with a given subvolume backend, and Docker.
     pub async fn open_with(cfg: NodeConfig, backend: Arc<dyn Backend>) -> anyhow::Result<Apps> {
-        let runtime = Arc::new(Docker::new(&cfg.docker));
+        let runtime = Arc::new(Docker::for_node(&cfg));
         Self::open_with_runtime(cfg, backend, runtime).await
     }
 
@@ -544,6 +572,10 @@ impl Apps {
             apps.inner.send(&r.name, Op::Adopt)?;
         }
         tokio::spawn(reaper(Arc::downgrade(&apps.inner), idle_check));
+        let (every, grace) = (apps.inner.cfg.prune_interval, apps.inner.cfg.image_grace);
+        if !every.is_zero() {
+            tokio::spawn(pruner(Arc::downgrade(&apps.inner), every, grace));
+        }
         Ok(apps)
     }
 
@@ -766,6 +798,10 @@ impl Apps {
         records
             .into_iter()
             .map(|r| kn_proto::agent::AppReport {
+                starting: self
+                    .inner
+                    .gate(&r.name)
+                    .is_some_and(|g| matches!(g.phase(), Phase::Starting | Phase::Busy)),
                 containers: match &live {
                     Some(l) => l.get(&r.project).cloned().unwrap_or_else(|| "absent".into()),
                     None => "unknown".into(),
@@ -779,6 +815,67 @@ impl Apps {
                 bundle_digest: r.bundle_digest,
             })
             .collect()
+    }
+
+    /// Removes the images that apps stopped using (redeployed with others, or deleted) and that nothing uses now,
+    /// once they were released more than `grace` ago. Docker refuses to remove an image a container uses, so a
+    /// stopped (idle) app's images stay, as do those of anything else on the engine. Images the node's apps never
+    /// used aren't touched.
+    pub async fn prune_images(&self, grace: Duration) -> Result<PruneReport> {
+        let mut report = PruneReport::default();
+        let candidates = {
+            let state = self.inner.state.lock().await;
+            let in_use: BTreeMap<&str, &str> = state
+                .apps
+                .values()
+                .flat_map(|a| a.images.iter().map(|i| (i.as_str(), a.name.as_str())))
+                .collect();
+            let t = now();
+            let mut candidates = Vec::new();
+            for (image, at) in &state.released_images {
+                let age = t.saturating_sub(*at);
+                let why = if let Some(app) = in_use.get(image.as_str()) {
+                    format!("used by app {app}")
+                } else if age < grace.as_secs() {
+                    format!("released {}s ago, within the grace period", age)
+                } else {
+                    candidates.push(image.clone());
+                    continue;
+                };
+                report.kept.push(KeptImage {
+                    image: image.clone(),
+                    why,
+                });
+            }
+            candidates
+        };
+        let mut gone = Vec::new();
+        for image in candidates {
+            match self.inner.runtime.remove_image(&image).await {
+                Ok(ImageRemoval::Removed) => {
+                    tracing::info!(image, "removed an unused image");
+                    report.removed.push(image.clone());
+                    gone.push(image);
+                }
+                Ok(ImageRemoval::Missing) => gone.push(image),
+                Ok(ImageRemoval::InUse) => report.kept.push(KeptImage {
+                    image,
+                    why: "a container uses it".into(),
+                }),
+                Err(e) => report.kept.push(KeptImage {
+                    image,
+                    why: format!("couldn't remove it: {e}"),
+                }),
+            }
+        }
+        if !gone.is_empty() {
+            let mut state = self.inner.state.lock().await;
+            for g in &gone {
+                state.released_images.remove(g);
+            }
+            self.inner.persist(&state).await?;
+        }
+        Ok(report)
     }
 }
 
@@ -927,6 +1024,22 @@ async fn reaper(inner: Weak<Inner>, every: Duration) {
             if let Err(e) = inner.send(&name, Op::IdleStop) {
                 tracing::warn!(app = name, error = %e, "couldn't stop an idle app");
             }
+        }
+    }
+}
+
+/// Removes unused images every `every`.
+async fn pruner(inner: Weak<Inner>, every: Duration, grace: Duration) {
+    loop {
+        tokio::time::sleep(every).await;
+        let Some(inner) = inner.upgrade() else { return };
+        if inner.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        match (Apps { inner }).prune_images(grace).await {
+            Ok(r) if !r.removed.is_empty() => tracing::info!(removed = ?r.removed, "removed unused images"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "couldn't remove unused images"),
         }
     }
 }
@@ -1138,9 +1251,13 @@ impl App<'_> {
                     .map(|p| p.restored_snapshots.clone())
                     .unwrap_or_default(),
                 paused: false,
+                images: images_of(&staged.bundle),
                 created_at: previous.as_ref().map_or(t, |p| p.created_at),
                 updated_at: t,
             };
+            if let Some(p) = &previous {
+                state.release(&p.images, &record.images);
+            }
             state.apps.insert(self.name.to_string(), record.clone());
             self.inner.persist(&state).await?;
             (record, previous)
@@ -1193,6 +1310,7 @@ impl App<'_> {
                     .set_route(self.name, &prev.domain, prev.port, prev.idle_timeout_secs);
                 gate.set_phase(resting_phase(prev.status));
                 let mut state = self.inner.state.lock().await;
+                state.release(&record.images, &prev.images);
                 state.apps.insert(self.name.to_string(), prev);
                 self.inner.persist(&state).await?;
                 return Err(AppsError::DeployFailed {
@@ -1894,7 +2012,10 @@ impl App<'_> {
         }
         removed?;
         let mut state = self.inner.state.lock().await;
-        state.apps.remove(self.name);
+        if let Some(r) = state.apps.remove(self.name) {
+            // Kept for the grace period, so deploying it again doesn't pull them.
+            state.release(&r.images, &[]);
+        }
         if let Some(g) = self.inner.remove_route(self.name) {
             g.set_phase(Phase::Gone);
         }
