@@ -1541,7 +1541,7 @@ async fn the_servers_backup_is_consistent_while_deploys_write() {
     // A server started on a restored state has the apps, and its admin token still works.
     let (key, before) = checks.last().unwrap();
     let dir = env.restore_server(key).await;
-    std::mem::swap(&mut env.dir, &mut { dir });
+    env.dir = dir;
     env.restart().await;
     let names: Vec<String> = env.apps().await.into_iter().map(|a| a.name).collect();
     for n in before {
