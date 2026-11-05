@@ -1229,3 +1229,56 @@ async fn deleting_a_volume_sets_its_backup_snapshots_aside() {
     env.restart().await;
     assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
 }
+
+#[tokio::test]
+async fn the_volumes_space_is_measured_in_groups_that_can_share_data() {
+    let env = Env::new().await;
+    assert!(env.apps.usage().is_none(), "nothing measured yet");
+    env.deploy("blog", &["data", "cache"], None).await.unwrap();
+    std::fs::write(env.vols().app_volume("blog", "data").join("db"), vec![7u8; 64 * 1024]).unwrap();
+    env.deploy("blog-pr1", &["data"], Some("blog")).await.unwrap();
+    env.deploy("notes", &["data"], None).await.unwrap();
+    env.apps.volume_create("corpus").await.unwrap();
+    std::fs::write(env.vols().shared_data("corpus").join("words"), vec![1u8; 32 * 1024]).unwrap();
+    let yaml = compose("r.localhost", &[], "{ corpus: { target: /c, mode: snapshot } }");
+    env.deploy_yaml("reader", &yaml, None).await.unwrap();
+
+    let m = env.apps.measure_usage().await;
+    assert!(m.usage.measured_at > 0);
+    let groups: Vec<(Vec<String>, Vec<String>)> = m
+        .usage
+        .groups
+        .iter()
+        .map(|g| (g.apps.clone(), g.volumes.clone()))
+        .collect();
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        groups,
+        vec![
+            (s(&["blog", "blog-pr1"]), s(&[])),
+            (s(&["notes"]), s(&[])),
+            (s(&["reader"]), s(&["corpus"])),
+        ],
+        "an app is with those made --from it, and with the shared volumes it mounts"
+    );
+    // The fake backend copies a snapshot, so here nothing is shared: blog's file and its preview's copy both count.
+    let blog = &m.apps["blog"];
+    assert_eq!(blog.keys().collect::<Vec<_>>(), ["cache", "data"]);
+    assert!(blog["data"].bytes >= 64 * 1024 && blog["data"].exclusive_bytes == blog["data"].bytes);
+    assert!(m.apps["blog-pr1"]["data"].bytes >= 64 * 1024);
+    assert!(m.usage.groups[0].bytes >= 128 * 1024);
+    let (corpus, snaps) = &m.shared["corpus"];
+    assert!(corpus.bytes >= 32 * 1024);
+    assert!(snaps["reader"].bytes >= 32 * 1024);
+
+    // It goes into the reports, the app list, inspect and the volume's info.
+    let reports = env.apps.reports().await;
+    let r = reports.iter().find(|r| r.name == "blog").unwrap();
+    assert_eq!(r.space, *blog);
+    assert_eq!(env.apps.inspect("blog").await.unwrap().space, *blog);
+    let listed = env.apps.list().await.unwrap();
+    assert_eq!(listed.iter().find(|a| a.name == "blog").unwrap().space, *blog);
+    let v = env.apps.volume_info("corpus").await.unwrap();
+    assert_eq!(v.space, Some(*corpus));
+    assert_eq!(v.snapshot_space, *snaps);
+}

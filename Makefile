@@ -6,15 +6,29 @@ VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
 # The host's target, as Cargo spells it in CARGO_TARGET_<TRIPLE>_RUNNER.
 HOST := $(shell rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
 
-.PHONY: all build check fmt clippy test integration test-root test-btrfs test-s3 release clean
+.PHONY: all build web web-check check fmt clippy test integration test-root test-btrfs test-s3 release clean
 
 all: build
 
-build:
+build: web
 	cargo build
 
-## check: formatting, lints and tests (what CI runs)
-check: fmt clippy test
+# The web UI's dependencies, installed from its lockfile when it changes.
+WEB_DEPS := web/node_modules/.package-lock.json
+
+$(WEB_DEPS): web/package-lock.json
+	cd web && npm ci
+
+## web: build the web UI into web/dist, which the server embeds (without it, the server serves a page saying so)
+web: $(WEB_DEPS)
+	cd web && npm run build
+
+## web-check: typecheck the web UI
+web-check: $(WEB_DEPS)
+	cd web && npm run check
+
+## check: formatting, lints and tests, and the web UI's typecheck (what CI runs)
+check: fmt clippy test web-check
 
 fmt:
 	cargo fmt --all --check
@@ -46,7 +60,7 @@ test-btrfs:
 	scripts/test-btrfs.sh
 
 ## release: static binaries for both musl targets, in dist/ (needs zig and cargo-zigbuild)
-release:
+release: web
 	rustup target add $(TARGETS)
 	cargo zigbuild --release --locked -p kiwi-nest $(foreach t,$(TARGETS),--target $(t))
 	mkdir -p dist
@@ -55,4 +69,4 @@ release:
 
 clean:
 	cargo clean
-	rm -rf dist
+	rm -rf dist web/dist

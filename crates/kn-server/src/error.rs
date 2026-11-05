@@ -27,6 +27,9 @@ pub enum Error {
     Refused { message: String, problems: Vec<String> },
     #[error("{0}")]
     UpgradeRequired(String),
+    /// Too many failed logins.
+    #[error("{0}")]
+    TooManyRequests(String),
     /// The node making the request was forgotten (`node forget`): answered with `410 Gone` and a
     /// [`kn_proto::agent::ForgottenBody`], which only this answers with.
     #[error("{}", kn_proto::agent::FORGOTTEN)]
@@ -70,6 +73,7 @@ impl Error {
             Error::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Error::Refused { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Error::UpgradeRequired(_) => StatusCode::UPGRADE_REQUIRED,
+            Error::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Error::Forgotten { .. } => StatusCode::GONE,
             Error::Node(status, _) => *status,
             Error::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

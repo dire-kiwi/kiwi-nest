@@ -11,6 +11,7 @@ clap.workspace = true
 futures-util.workspace = true
 kn-bundle.workspace = true
 kn-proto.workspace = true
+libc.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true

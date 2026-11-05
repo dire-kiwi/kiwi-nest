@@ -13,10 +13,18 @@ jobs:
       - name: Install the toolchain from rust-toolchain.toml
         run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: Mount a btrfs filesystem for the tests
         run: |
           command -v mkfs.btrfs || { sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs; }
           scripts/test-btrfs.sh
+      # The server's tests then serve the built UI.
+      - name: Build the web UI
+        run: make web
       - run: make check
 
   integration:

@@ -15,6 +15,10 @@
 //!   is told it was forgotten (`410 Gone`) rather than that its token is wrong (`401`), which a token that was
 //!   never issued gets.
 //!
+//! The web UI's users log in with a password, and get a session cookie ([`crate::ui`]); a request with one is an
+//! admin's, as long as it passes [`crate::ui::check_cookie_request`] (from the server's own origin, and JSON if it
+//! changes anything). A request with a token is judged by its token alone, cookie or not.
+//!
 //! Each node also has an ingress token (`kni_…`), given to it when it joins, which the ingress adds to every request
 //! it passes to the node's gateway; see [`crate::ingress`].
 
@@ -86,17 +90,30 @@ pub fn matches(pattern: &str, name: &str) -> bool {
     p[pi..].iter().all(|&c| c == b'*')
 }
 
-/// Whoever made a request to the CLI API: an admin or deploy token.
+/// Whoever made a request to the CLI API: an admin or deploy token, or a web UI user's session (an admin).
 #[derive(Debug, Clone)]
 pub struct Caller {
+    /// The token's ID; 0 for a session.
     pub id: u64,
     pub kind: TokenKind,
     pub name: String,
     pub patterns: Vec<String>,
     pub from: Vec<String>,
+    /// The web UI's user, for a session.
+    pub user: Option<String>,
 }
 
 impl Caller {
+    /// Who this is, as a command's history shows it: `user NAME` or `token NAME` (`admin token 3` for one
+    /// without a name).
+    pub fn by(&self) -> String {
+        match (&self.user, self.name.as_str()) {
+            (Some(u), _) => format!("user {u}"),
+            (None, "") => format!("{} token {}", self.kind, self.id),
+            (None, n) => format!("token {n}"),
+        }
+    }
+
     pub fn is_admin(&self) -> bool {
         self.kind == TokenKind::Admin
     }
@@ -142,6 +159,7 @@ impl Caller {
         WhoAmI {
             kind: self.kind,
             name: self.name.clone(),
+            user: self.user.clone(),
             patterns: self.patterns.clone(),
             from: self.from.clone(),
         }
@@ -167,6 +185,18 @@ impl FromRequestParts<Server> for Caller {
     type Rejection = Error;
 
     async fn from_request_parts(parts: &mut Parts, server: &Server) -> Result<Self> {
+        if !parts.headers.contains_key(header::AUTHORIZATION)
+            && let Some(session) = crate::ui::session(parts, server).await?
+        {
+            return Ok(Caller {
+                id: 0,
+                kind: TokenKind::Admin,
+                name: String::new(),
+                patterns: Vec::new(),
+                from: Vec::new(),
+                user: Some(session.user.name),
+            });
+        }
         let h = hash(bearer(parts)?);
         let token = server.store.call(move |c| crate::store::tokens::lookup(c, &h)).await?;
         match token {
@@ -176,6 +206,7 @@ impl FromRequestParts<Server> for Caller {
                 name: t.name,
                 patterns: t.patterns,
                 from: t.from,
+                user: None,
             }),
             Some(_) => Err(Error::Forbidden("this token is for nodes, not the CLI".into())),
             None => Err(Error::Unauthorized("the token isn't valid".into())),
@@ -253,6 +284,7 @@ mod tests {
             name: "ci".into(),
             patterns: vec!["blog-pr*".into()],
             from: vec!["blog".into()],
+            user: None,
         };
         assert!(c.manage("blog-pr3").is_ok());
         assert!(c.manage("blog").is_err());

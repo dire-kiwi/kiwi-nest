@@ -347,15 +347,29 @@ async fn a_client_that_goes_away_cancels_only_its_own_wait() {
 async fn an_open_websocket_keeps_the_app_awake() {
     let env = Env::new().await;
     env.deploy("blog", "1s").await;
+    assert_eq!(
+        env.apps.inspect("blog").await.unwrap().last_request_at,
+        None,
+        "no requests yet"
+    );
     let mut ws = env.websocket("blog.test").await;
     echo(&mut ws, b"kia ora").await;
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(env.stops("blog"), 0, "the WebSocket is open");
-    assert_eq!(env.apps.inspect("blog").await.unwrap().open_requests, 1);
+    let info = env.apps.inspect("blog").await.unwrap();
+    assert_eq!(info.open_requests, 1);
+    let began = info.last_request_at.expect("the WebSocket's request is activity");
+    // The reports and the list say so too.
+    let report = env.apps.reports().await.into_iter().find(|r| r.name == "blog").unwrap();
+    assert_eq!(report.open_requests, 1);
+    assert!(report.last_request_at.is_some());
+    assert_eq!(env.apps.list().await.unwrap()[0].open_requests, 1);
     echo(&mut ws, b"still here").await;
     drop(ws);
     env.until_stopped("blog").await;
-    assert_eq!(env.apps.inspect("blog").await.unwrap().open_requests, 0);
+    let info = env.apps.inspect("blog").await.unwrap();
+    assert_eq!(info.open_requests, 0);
+    assert!(info.last_request_at.unwrap() > began, "its end is the last activity");
 }
 
 #[tokio::test]

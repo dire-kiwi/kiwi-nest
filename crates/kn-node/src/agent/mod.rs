@@ -476,6 +476,7 @@ impl Inner {
             applied: self.applied(),
             running_commands: self.running.lock().expect("running").iter().copied().collect(),
             serial: self.serial.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            usage: self.apps.usage().map(|u| u.usage.clone()),
         }
     }
 

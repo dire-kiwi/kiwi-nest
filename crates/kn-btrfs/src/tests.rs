@@ -173,3 +173,86 @@ fn reports_space() {
     let unallocated = unallocated(&root).unwrap();
     assert!(unallocated <= total * 2, "{unallocated} unallocated of {total}");
 }
+
+/// Bytes that won't compress, so their extents keep their length on a filesystem mounted with compression.
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+fn write_synced(path: &Path, data: &[u8]) {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path).unwrap();
+    f.write_all(data).unwrap();
+    f.sync_all().unwrap();
+}
+
+#[test]
+fn measures_what_snapshots_share() {
+    const MIB: u64 = 1024 * 1024;
+    let Some(d) = btrfs_dir() else { return };
+    let root = std::fs::canonicalize(d.path()).unwrap();
+    let a = root.join("a");
+    create(&a).unwrap();
+    std::fs::create_dir(a.join("dir")).unwrap();
+    write_synced(&a.join("dir/data"), &noise(MIB as usize, 1));
+    std::fs::hard_link(a.join("dir/data"), a.join("link")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", a.join("symlink")).unwrap();
+    // A nested subvolume is measured on its own, not as part of this one.
+    create(&a.join("nested")).unwrap();
+    write_synced(&a.join("nested/x"), &noise(MIB as usize, 2));
+
+    let u = usage(&a).unwrap();
+    assert_eq!((u.bytes, u.exclusive_bytes), (MIB, MIB), "hard links count once: {u:?}");
+    assert!(u.shared.is_empty());
+
+    // A snapshot shares all of it.
+    let b = root.join("b");
+    snapshot(&a, &b, false).unwrap();
+    let (mut ua, mut ub) = (usage(&a).unwrap(), usage(&b).unwrap());
+    assert_eq!((ua.bytes, ua.exclusive_bytes), (MIB, 0), "{ua:?}");
+    assert_eq!((ub.bytes, ub.exclusive_bytes), (MIB, 0), "{ub:?}");
+    let mut both: Vec<_> = ua.shared.drain(..).chain(ub.shared.drain(..)).collect();
+    assert_eq!(union_bytes(&mut both), MIB, "shared data counts once");
+
+    // Rewriting half of the snapshot's file makes that half its own.
+    {
+        use std::io::{Seek, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(b.join("dir/data"))
+            .unwrap();
+        f.seek(std::io::SeekFrom::Start(MIB / 2)).unwrap();
+        f.write_all(&noise(MIB as usize / 2, 3)).unwrap();
+        f.sync_all().unwrap();
+    }
+    let ub = usage(&b).unwrap();
+    assert_eq!((ub.bytes, ub.exclusive_bytes), (MIB, MIB / 2), "{ub:?}");
+    let ua = usage(&a).unwrap();
+    assert_eq!(ua.bytes, MIB);
+    assert!(ua.exclusive_bytes <= MIB / 2, "{ua:?}");
+
+    // A symlink isn't followed.
+    std::os::unix::fs::symlink(&a, root.join("to-a")).unwrap();
+    assert!(matches!(usage(&root.join("to-a")), Err(Error::Symlink(_))));
+    for p in [&a.join("nested"), &a, &b] {
+        destroy(p).unwrap();
+    }
+}
+
+#[test]
+fn measures_plain_directories_by_their_blocks() {
+    let d = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(d.path()).unwrap();
+    std::fs::write(root.join("f"), noise(64 * 1024, 4)).unwrap();
+    let u = usage(&root).unwrap();
+    assert!(u.bytes >= 64 * 1024, "{u:?}");
+    assert!(u.exclusive_bytes <= u.bytes);
+}
