@@ -131,6 +131,8 @@ impl Apps {
             mounts,
             snapshots,
             problem,
+            node: None,
+            pending: None,
         })
     }
 

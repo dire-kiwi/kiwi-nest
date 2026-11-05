@@ -106,6 +106,7 @@ impl Env {
         let opts = DeployOptions {
             create_only: false,
             from: from.map(str::to_string),
+            generation: None,
         };
         self.apps.deploy(name, staged, opts).await
     }

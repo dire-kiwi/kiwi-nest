@@ -4,10 +4,10 @@
 //! - [`runtime`] runs `docker compose` for each app's project.
 //! - [`apps`] handles each app's lifecycle, one task per app, its volumes, shared volumes, and the node's state file.
 //! - [`gateway`] proxies requests to apps by Host, starts stopped apps for them, and lets idle ones be stopped.
+//! - [`agent`] is the link to the server: joining, polling, applying the desired state, and commands.
 //! - [`api`] is the standalone node's loopback HTTP API.
-//!
-//! Later steps add the link to the server.
 
+pub mod agent;
 pub mod api;
 pub mod apps;
 pub mod gateway;
@@ -153,6 +153,39 @@ pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen:
         api::serve(listener, apps.clone(), stop.clone().cancelled_owned()),
         gateway::serve(gw_listener, apps, stop.cancelled_owned()),
     )?;
+    tracing::info!("stopped; apps keep running");
+    Ok(())
+}
+
+/// Runs a node joined to a server: its apps, the agent and its gateway, until interrupted.
+///
+/// Prints `gateway on http://ADDR`, then `node NAME polling URL` once it has joined (on its first start, with
+/// `agent.join_token`). Apps keep running after the node exits, and the next node agent adopts them.
+pub async fn run_agent(cfg: NodeConfig, mut agent: agent::AgentConfig, gateway_listen: SocketAddr) -> anyhow::Result<()> {
+    check_loopback(&gateway_listen)?;
+    let apps = apps::Apps::open(cfg).await?;
+    let gw_listener = tokio::net::TcpListener::bind(gateway_listen)
+        .await
+        .with_context(|| format!("listening on {gateway_listen}"))?;
+    let gw_addr = gw_listener.local_addr()?;
+    println!("gateway on http://{gw_addr}");
+    agent.gateway = gw_addr.to_string();
+    let server = agent.server.clone();
+    let agent = agent::Agent::start(apps.clone(), agent).await?;
+    println!("node {} polling {server}", agent.name());
+    tracing::info!(node = agent.name(), server, gateway = %gw_addr, "node agent running");
+    let stop = tokio_util::sync::CancellationToken::new();
+    tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            shutdown_signal().await;
+            stop.cancel();
+        }
+    });
+    let polling = agent.run(stop.clone());
+    let gateway = gateway::serve(gw_listener, apps, stop.cancelled_owned());
+    let ((), served) = tokio::join!(polling, gateway);
+    served?;
     tracing::info!("stopped; apps keep running");
     Ok(())
 }

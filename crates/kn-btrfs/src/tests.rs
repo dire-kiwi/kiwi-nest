@@ -28,6 +28,8 @@ fn ioctl_numbers_match_the_kernel_headers() {
     assert_eq!(IOC_INO_LOOKUP, 0xd000_9412);
     assert_eq!(IOC_SNAP_CREATE_V2, 0x5000_9417);
     assert_eq!(IOC_SUBVOL_GETFLAGS, 0x8008_9419);
+    assert_eq!(IOC_DEV_INFO, 0xd000_941e);
+    assert_eq!(size_of::<DevInfoArgs>(), 4096);
     assert_eq!(IOC_SUBVOL_SETFLAGS, 0x4008_941a);
     assert_eq!(IOC_FS_INFO, 0x8400_941f);
     assert_eq!(std::mem::offset_of!(VolArgsV2, flags), 16);
@@ -151,4 +153,18 @@ fn subvolumes_snapshots_and_destroy() {
         destroy(p).unwrap();
         assert!(!p.exists(), "{}", p.display());
     }
+}
+
+#[test]
+fn reports_space() {
+    let (total, free) = disk_space(Path::new("/")).unwrap();
+    assert!(total > 0 && free <= total);
+    if let Some(p) = plain_dir() {
+        assert!(matches!(unallocated(&std::fs::canonicalize(p.path()).unwrap()), Err(Error::NotBtrfs(_))));
+    }
+    let Some(dir) = btrfs_dir() else { return };
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let (total, _) = disk_space(&root).unwrap();
+    let unallocated = unallocated(&root).unwrap();
+    assert!(unallocated <= total * 2, "{unallocated} unallocated of {total}");
 }

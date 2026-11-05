@@ -184,6 +184,8 @@ pub struct DeployOptions {
     pub create_only: bool,
     /// On the first deploy, snapshot the named volumes this app shares with that one.
     pub from: Option<String>,
+    /// The generation to record, as the server numbers it; by default the previous one plus one.
+    pub generation: Option<u64>,
 }
 
 /// An app's logs: all of it, or a running `docker compose logs --follow` to stream.
@@ -664,8 +666,40 @@ impl Apps {
                 domain: r.domain,
                 port: r.port,
                 updated_at: rfc3339(r.updated_at),
+                node: None,
+                pending: None,
             })
             .collect())
+    }
+
+    /// Every app as the node records it, for the server, with what Docker reports for its containers (or
+    /// `unknown`, if Docker can't be asked).
+    pub async fn reports(&self) -> Vec<kn_proto::agent::AppReport> {
+        let records: Vec<AppRecord> = self.inner.state.lock().await.apps.values().cloned().collect();
+        let live: Option<HashMap<String, String>> = self
+            .inner
+            .runtime
+            .projects(&self.inner.cfg.project_prefix)
+            .await
+            .map_err(|e| tracing::warn!(error = %e, "couldn't list the apps' containers"))
+            .ok()
+            .map(|ps| ps.into_iter().map(|p| (p.name, p.status)).collect());
+        records
+            .into_iter()
+            .map(|r| kn_proto::agent::AppReport {
+                containers: match &live {
+                    Some(l) => l.get(&r.project).cloned().unwrap_or_else(|| "absent".into()),
+                    None => "unknown".into(),
+                },
+                name: r.name,
+                status: r.status,
+                generation: r.generation,
+                error: r.error,
+                domain: r.domain,
+                port: r.port,
+                bundle_digest: r.bundle_digest,
+            })
+            .collect()
     }
 }
 
@@ -978,7 +1012,9 @@ impl App<'_> {
             let record = AppRecord {
                 name: self.name.to_string(),
                 status: AppStatus::Deploying,
-                generation: previous.as_ref().map_or(1, |p| p.generation + 1),
+                generation: opts
+                    .generation
+                    .unwrap_or_else(|| previous.as_ref().map_or(1, |p| p.generation + 1)),
                 error: None,
                 project: format!("{}{}", cfg.project_prefix, self.name),
                 port,
@@ -1593,6 +1629,9 @@ impl App<'_> {
             updated_at: rfc3339(r.updated_at),
             containers,
             open_requests,
+            node: None,
+            pending: None,
+            stale: false,
         })
     }
 
