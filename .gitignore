@@ -1,0 +1,61 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+secrets/
+*.secret
+*.age
+kubeconfig*
+
+# Dependencies
+node_modules/
+vendor/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Build output
+bin/
+dist/
+build/
+out/
+target/
+coverage/
+*.test
+*.out
+
+# Infrastructure state
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Local runtime data
+data/
+tmp/
+*.log
+*.pid
+*.sqlite
+*.sqlite3
+*.db
+
+# Editors & OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local Claude settings
+.claude/settings.local.json
