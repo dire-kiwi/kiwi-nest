@@ -30,6 +30,12 @@
 #
 #   curl --cacert .dev-cluster/server/ingress-ca.crt https://blog.localhost:7443/
 #
+# With the ingress there's also the image registry: a registry:3 container, kn-dev-registry, published on
+# 127.0.0.1:7495 and served at localhost:7443, which Docker reaches without checking its certificate, as it does any
+# registry on loopback. `down` stops it and `clean` removes it:
+#
+#   kiwi-nest push blog-deps:dev blog-deps:1     # prints localhost:7443/blog-deps:1, for the bundle's `image:`
+#
 # To skip the loop mounts (and sudo), set KIWI_NEST_DEV_BTRFS to a directory on a btrfs filesystem you own; each
 # node then keeps its volumes in a directory there. Logs are in .dev-cluster/*.log; KIWI_NEST_LOG sets the level.
 set -euo pipefail
@@ -144,7 +150,8 @@ up() {
   if [ -n "$caddy" ]; then
     start_caddy
     ingress=(--ingress internal --caddy-admin "http://$caddy_admin" --api-domain "$api_domain"
-      --http-port "$http_port" --https-port "$https_port" --ingress-sync 2s)
+      --http-port "$http_port" --https-port "$https_port" --ingress-sync 2s
+      --registry-domain localhost --registry-listen 127.0.0.1:7495 --registry-container kn-dev-registry)
   fi
   if ! running server; then
     : >"$dir/server.log"
@@ -187,6 +194,7 @@ up() {
   echo "server on http://$server; nodes a (gateway 127.0.0.1:7481) and b (gateway 127.0.0.1:7482)"
   if [ -n "$caddy" ]; then
     echo "ingress: https://DOMAIN:$https_port (CA $dir/server/ingress-ca.crt); the server's API at $url"
+    echo "registry: localhost:$https_port (kiwi-nest push LOCAL NAME:TAG)"
   else
     echo "no ingress: put caddy on the PATH (or set KIWI_NEST_DEV_CADDY) for one"
   fi
@@ -269,8 +277,9 @@ down() {
     fi
     rm -f "$dir/$p.pid"
   done
-  # The nodes leave their apps running when they stop; remove them.
+  # The nodes leave their apps running when they stop; remove them. The registry stays, stopped.
   if command -v docker >/dev/null; then
+    if docker stop kn-dev-registry >/dev/null 2>&1; then echo "stopped the registry"; fi
     { docker compose ls --all --format json 2>/dev/null || true; } |
       { grep -o '"Name":"kn-dev-[ab]-[^"]*"' || true; } | cut -d'"' -f4 |
       while read -r project; do
@@ -290,6 +299,9 @@ down() {
 
 clean() {
   down
+  if command -v docker >/dev/null && docker rm -f kn-dev-registry >/dev/null 2>&1; then
+    echo "removed the registry"
+  fi
   rm -rf "$dir"
   if [ -n "${KIWI_NEST_DEV_BTRFS:-}" ]; then
     for n in "${nodes[@]}"; do rm -rf "$(volumes_dir "$n")"; done

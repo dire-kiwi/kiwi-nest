@@ -92,6 +92,16 @@ pub struct IngressConfig {
     pub trusted_proxies: Vec<String>,
     /// How often the configuration is checked, so a restarted Caddy gets it back.
     pub sync_interval: Duration,
+    /// The image registry, if the server runs one.
+    pub registry: Option<RegistryRoute>,
+}
+
+/// The image registry's route: its domain, to the registry on loopback, once the server has checked the request's
+/// credentials (see [`crate::registry`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryRoute {
+    pub domain: String,
+    pub upstream: SocketAddr,
 }
 
 impl IngressConfig {
@@ -104,6 +114,7 @@ impl IngressConfig {
             api_domain: None,
             trusted_proxies: Vec::new(),
             sync_interval: Duration::from_secs(10),
+            registry: None,
         }
     }
 
@@ -274,6 +285,21 @@ pub fn forbidden_upstream(upstream: SocketAddr, admin_listen: &str, api: SocketA
     }
 }
 
+/// [`forbidden_upstream`], and the registry too, which checks no credentials itself.
+pub fn forbidden(
+    cfg: &IngressConfig,
+    upstream: SocketAddr,
+    admin_listen: &str,
+    api: SocketAddr,
+) -> Option<&'static str> {
+    forbidden_upstream(upstream, admin_listen, api).or_else(|| {
+        let reg = cfg.registry.as_ref()?.upstream;
+        let same =
+            upstream == reg || (upstream.port() == reg.port() && upstream.ip().is_loopback() && reg.ip().is_loopback());
+        same.then_some("the image registry")
+    })
+}
+
 /// Caddy's whole configuration: the admin API at `admin_listen`, the server's API at `api` (if it has a domain),
 /// and `routes` (bar any whose upstream is [`forbidden_upstream`]).
 pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, routes: &[Route]) -> Value {
@@ -291,9 +317,13 @@ pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, ro
             "terminal": true,
         }));
     }
+    if let Some(reg) = &cfg.registry {
+        handlers.push(registry_route(reg, api));
+    }
     for r in routes {
         if cfg.api_domain.as_deref() == Some(r.domain.as_str())
-            || forbidden_upstream(r.upstream, admin_listen, api).is_some()
+            || cfg.registry.as_ref().is_some_and(|reg| reg.domain == r.domain)
+            || forbidden(cfg, r.upstream, admin_listen, api).is_some()
         {
             continue;
         }
@@ -396,6 +426,41 @@ pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, ro
             "config": { "persist": false },
         },
         "apps": apps,
+    })
+}
+
+/// The registry's route. Like Caddy's `forward_auth`: each request is first sent to the server's
+/// `/registry/auth` as a `GET` (without its body), with its method and path in headers; a 2xx answer lets it go on
+/// to the registry, and any other answer (a 401 with the login challenge, a 403) goes back to the client as it is.
+fn registry_route(reg: &RegistryRoute, api: SocketAddr) -> Value {
+    json!({
+        "match": [{ "host": [reg.domain] }],
+        "handle": [
+            {
+                "handler": "reverse_proxy",
+                "upstreams": [{ "dial": api.to_string() }],
+                "rewrite": { "method": "GET", "uri": format!("{}/registry/auth", kn_proto::API_PREFIX) },
+                "headers": { "request": {
+                    "set": {
+                        "X-Forwarded-Method": ["{http.request.method}"],
+                        "X-Forwarded-Uri": ["{http.request.uri}"],
+                    },
+                    "delete": [INGRESS_HEADER],
+                } },
+                "handle_response": [{
+                    "match": { "status_code": [2] },
+                    "routes": [{ "handle": [{ "handler": "vars" }] }],
+                }],
+            },
+            {
+                "handler": "reverse_proxy",
+                "upstreams": [{ "dial": reg.upstream.to_string() }],
+                "headers": { "request": { "delete": ["Authorization", INGRESS_HEADER] } },
+                // Layers stream both ways.
+                "flush_interval": -1,
+            },
+        ],
+        "terminal": true,
     })
 }
 
@@ -533,7 +598,7 @@ impl Ingress {
             match server.store.call(|c| routes(c)).await {
                 Ok((routes, mut warnings)) => {
                     for r in &routes {
-                        if let Some(what) = forbidden_upstream(r.upstream, &self.admin_listen, api) {
+                        if let Some(what) = forbidden(&self.cfg, r.upstream, &self.admin_listen, api) {
                             warnings.push(format!(
                                 "`{}` isn't routed: its node reported {what}'s address as its ingress address",
                                 r.domain

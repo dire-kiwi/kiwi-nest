@@ -13,12 +13,14 @@ use rusqlite::{Connection, params};
 use super::rfc3339;
 use crate::error::Result;
 
-/// What a command acts on: `app` or `volume`, and its name.
+/// What a command acts on: `app`, `volume` or `node`, and its name (none for a node's).
 fn target(action: &Action) -> (&'static str, &str) {
     let kind = match action {
         Action::Inspect { .. } | Action::Logs { .. } | Action::Suspend { .. } | Action::Resume { .. } => "app",
         Action::Backup { what: Kind::App, .. } => "app",
         Action::Backup { .. } | Action::VolumeInfo { .. } | Action::DeleteSnapshot { .. } => "volume",
+        // The node's own, not an app's or a volume's.
+        Action::PruneImages { .. } => "node",
     };
     (kind, action.target())
 }
@@ -34,7 +36,7 @@ pub fn insert(c: &Connection, node_id: u64, action: &Action, caller: &str, now: 
     Ok(c.last_insert_rowid() as u64)
 }
 
-/// Migration 5: what earlier commands act on, from their actions.
+/// Migration 6: what earlier commands act on, from their actions.
 pub fn backfill(c: &Connection) -> anyhow::Result<()> {
     let rows: Vec<(u64, String)> = {
         let mut st = c.prepare("SELECT id, action FROM commands")?;
@@ -127,6 +129,10 @@ fn describe(action: &Action) -> (String, String) {
         Action::Resume { .. } => ("resume".into(), String::new()),
         Action::VolumeInfo { .. } => ("volume info".into(), String::new()),
         Action::DeleteSnapshot { app, .. } => ("delete snapshot".into(), format!("of {app}")),
+        Action::PruneImages { grace_secs } => (
+            "prune images".into(),
+            grace_secs.map_or_else(String::new, |g| format!("grace {g}s")),
+        ),
         Action::Backup { targets, full, .. } => {
             let mut d = Vec::new();
             if targets.is_empty() {

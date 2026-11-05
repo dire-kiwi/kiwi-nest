@@ -12,6 +12,7 @@ use axum::routing::{get, post};
 use futures_util::StreamExt;
 use kn_proto::agent::{
     CommandResult, IngressToken, JoinRequest, JoinResponse, OLDEST_PROTOCOL, PROTOCOL, PollRequest, PollResponse,
+    RegistryCredential, RegistryLogin,
 };
 use kn_proto::api::TokenKind;
 use tokio::sync::mpsc;
@@ -28,6 +29,7 @@ pub fn router() -> Router<Server> {
     Router::new()
         .route(&format!("{p}/agent/join"), post(join))
         .route(&format!("{p}/agent/ingress-token"), get(ingress_token))
+        .route(&format!("{p}/agent/registry"), post(registry_credential))
         .route(&format!("{p}/agent/poll"), post(poll))
         .route(&format!("{p}/agent/report"), post(report))
         .route(&format!("{p}/agent/bundles/{{digest}}"), get(bundle))
@@ -53,11 +55,35 @@ async fn join(State(s): State<Server>, axum::Json(req): axum::Json<JoinRequest>)
         .await?;
     tracing::info!(node = name, node_id, "a node joined");
     s.ingress_changed();
+    let registry = new_registry_login(&s, node_id, &name).await?;
     Ok(axum::Json(JoinResponse {
         node_id,
         name,
         token,
         ingress_token,
+        registry,
+    }))
+}
+
+/// Makes a node a new registry credential, replacing its last one; `None` if the cluster has no registry.
+async fn new_registry_login(s: &Server, node_id: u64, name: &str) -> Result<Option<RegistryLogin>> {
+    let Some(r) = &s.registry else { return Ok(None) };
+    let password = crate::registry::generate_credential();
+    let h = auth::hash(&password);
+    s.store
+        .call(move |c| store::registry::set_node_credential(c, node_id, &h))
+        .await?;
+    Ok(Some(RegistryLogin {
+        host: r.host().to_string(),
+        username: format!("node-{name}"),
+        password,
+    }))
+}
+
+/// A new registry credential for the node, which it writes into its Docker configuration when it starts.
+async fn registry_credential(State(s): State<Server>, node: NodeCaller) -> Result<axum::Json<RegistryCredential>> {
+    Ok(axum::Json(RegistryCredential {
+        registry: new_registry_login(&s, node.node_id, &node.name).await?,
     }))
 }
 

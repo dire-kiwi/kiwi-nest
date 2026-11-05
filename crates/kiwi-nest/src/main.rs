@@ -101,6 +101,27 @@ struct ServerArgs {
     /// How often the ingress's configuration is checked, so a restarted Caddy gets it back.
     #[arg(long, default_value = "10s")]
     ingress_sync: String,
+    /// Run the cluster's image registry, served by the ingress at this domain, such as registry.example.com.
+    #[arg(long, value_name = "DOMAIN")]
+    registry_domain: Option<String>,
+    /// The registry's image.
+    #[arg(long, default_value = "registry:3", value_name = "IMAGE")]
+    registry_image: String,
+    /// Where the registry's container is published, on loopback, for the ingress.
+    #[arg(long, default_value = "127.0.0.1:5000", value_name = "ADDR")]
+    registry_listen: SocketAddr,
+    /// The registry's container's name.
+    #[arg(long, default_value = "kiwi-nest-registry", value_name = "NAME")]
+    registry_container: String,
+    /// How long garbage collection keeps a tag after it was pushed, or an app stopped using it.
+    #[arg(long, default_value = "24h")]
+    registry_grace: String,
+    /// How often the registry's garbage is collected.
+    #[arg(long, default_value = "6h")]
+    registry_gc_interval: String,
+    /// The Docker CLI, for the registry's container.
+    #[arg(long, default_value = "docker")]
+    docker: PathBuf,
     /// The backup targets: a YAML (or JSON) file of `targets:`, each with its storage (`s3`, `ssh` or `dir`),
     /// `format`, `every` and `keep`. Nodes get them from the server.
     #[arg(long, env = "KIWI_NEST_BACKUP_TARGETS", value_name = "FILE")]
@@ -188,6 +209,13 @@ struct NodeArgs {
     /// After a start fails, how long requests are refused before one may try again (`resume` doesn't wait).
     #[arg(long, default_value = "15s")]
     start_cooldown: String,
+    /// How long an image an app stopped using (redeployed with others, or deleted) is kept, so deploying it again
+    /// doesn't pull it.
+    #[arg(long, default_value = "24h")]
+    image_grace: String,
+    /// How often images that nothing uses (beyond the grace period) are removed; 0 for never.
+    #[arg(long, default_value = "1h")]
+    prune_interval: String,
     /// A standalone node's backup targets, as for the server (a node joined to a server uses the server's).
     #[arg(long, env = "KIWI_NEST_BACKUP_TARGETS", value_name = "FILE")]
     backup_targets: Option<PathBuf>,
@@ -308,6 +336,20 @@ async fn server(args: ServerArgs) -> anyhow::Result<()> {
     } else if args.api_domain.is_some() {
         bail!("--api-domain needs an --ingress");
     }
+    if let Some(domain) = args.registry_domain {
+        if cfg.ingress.is_none() {
+            bail!("--registry-domain needs an --ingress, which serves the registry");
+        }
+        let mut r = kn_server::registry::RegistryConfig::new(domain);
+        r.image = args.registry_image;
+        r.listen = args.registry_listen;
+        r.container = args.registry_container;
+        r.docker = args.docker;
+        r.grace = duration("--registry-grace", &args.registry_grace)?;
+        r.gc_interval = duration("--registry-gc-interval", &args.registry_gc_interval)?;
+        r.validate()?;
+        cfg.registry = Some(r);
+    }
     kn_server::run(cfg, args.listen).await
 }
 
@@ -339,6 +381,8 @@ async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result<()>
     cfg.up_timeout = duration("--up-timeout", &args.up_timeout)?;
     cfg.start_timeout = duration("--start-timeout", &args.start_timeout)?;
     cfg.start_cooldown = duration("--start-cooldown", &args.start_cooldown)?;
+    cfg.image_grace = duration("--image-grace", &args.image_grace)?;
+    cfg.prune_interval = duration("--prune-interval", &args.prune_interval)?;
     cfg.usage_interval = duration("--usage-interval", &args.usage_interval)?;
     let Some(server) = server else {
         cfg.backup_targets = args.backup_targets.map(absolute).transpose()?;

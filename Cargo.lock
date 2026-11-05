@@ -1013,6 +1013,7 @@ name = "kiwi-nest"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "kn-backup",
  "kn-btrfs",
@@ -1105,6 +1106,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "bytes",
  "futures-util",
  "http-body-util",
@@ -1143,6 +1145,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "axum",
+ "base64",
  "bytes",
  "futures-util",
  "getrandom 0.3.4",
@@ -1151,6 +1154,7 @@ dependencies = [
  "kn-backup",
  "kn-bundle",
  "kn-proto",
+ "libc",
  "reqwest",
  "rusqlite",
  "rust-embed",

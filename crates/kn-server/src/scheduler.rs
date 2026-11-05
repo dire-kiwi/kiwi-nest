@@ -1,7 +1,8 @@
 //! Placing a new nest on a node. (A nest that exists stays where it is: see [`crate::store::apps`].)
 //!
-//! 1. **Filter.** A node qualifies if it's online and not cordoned, has the architecture the bundle asks for, has
-//!    every label in its `node_labels`, and allows every host path it mounts. `--node` names the node outright, but
+//! 1. **Filter.** A node qualifies if it's online and not cordoned, has the architecture the bundle asks for (and
+//!    one that every image the registry holds for it is built for), has every label in its `node_labels`, and allows
+//!    every host path it mounts. `--node` names the node outright, but
 //!    the filter still applies (apart from being online, which `--queue` may waive).
 //! 2. **Score** by memory headroom: the node's memory, less a reserve, less the `mem_limit`s of its always-on apps,
 //!    less a share (half, by default) of those of its apps that idle out. A service without a limit counts as
@@ -80,6 +81,8 @@ pub struct Needs {
     pub arch: Option<String>,
     pub labels: BTreeMap<String, String>,
     pub host_paths: Vec<String>,
+    /// The images in the cluster's registry, with the architectures each is built for.
+    pub images: Vec<crate::registry::Platforms>,
 }
 
 /// The node chosen, and why.
@@ -121,6 +124,14 @@ pub fn unfit(c: &Candidate, needs: &Needs, online: bool) -> Option<String> {
         && &c.facts.arch != a
     {
         return Some(format!("arch `{}`, not `{a}`", c.facts.arch));
+    }
+    if let Some(i) = needs.images.iter().find(|i| !i.archs.contains(&c.facts.arch)) {
+        return Some(format!(
+            "arch `{}`, and image `{}` is only built for {}",
+            c.facts.arch,
+            i.image,
+            i.archs.join(", ")
+        ));
     }
     let missing: Vec<String> = needs
         .labels
@@ -393,6 +404,32 @@ mod tests {
                 },
                 true,
                 Some("arch `amd64`, not `arm64`"),
+            ),
+            (
+                "an image built for other architectures",
+                base.clone(),
+                Needs {
+                    images: vec![crate::registry::Platforms {
+                        image: "r.example.com/app:1".into(),
+                        archs: vec!["arm64".into(), "riscv64".into()],
+                    }],
+                    ..Default::default()
+                },
+                true,
+                Some("arch `amd64`, and image `r.example.com/app:1` is only built for arm64, riscv64"),
+            ),
+            (
+                "an image built for this one",
+                base.clone(),
+                Needs {
+                    images: vec![crate::registry::Platforms {
+                        image: "r.example.com/app:1".into(),
+                        archs: vec!["amd64".into(), "arm64".into()],
+                    }],
+                    ..Default::default()
+                },
+                true,
+                None,
             ),
             (
                 "the right arch",

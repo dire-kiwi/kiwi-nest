@@ -551,3 +551,52 @@ fn a_node_cant_point_an_app_at_caddys_admin_api_or_the_servers_api() {
     assert!(forbidden_upstream(up("10.0.0.5:2019"), "127.0.0.1:2019", api).is_none());
     assert!(forbidden_upstream(up("10.0.0.5:7400"), "127.0.0.1:2019", api).is_none());
 }
+
+#[test]
+fn the_registry_is_routed_once_the_server_has_checked_each_request() {
+    let mut c = cfg(Tls::Internal);
+    c.registry = Some(RegistryRoute {
+        domain: "registry.example.com".into(),
+        upstream: "127.0.0.1:5000".parse().unwrap(),
+    });
+    let config = generate(
+        &c,
+        &[
+            route("blog.example.com", "10.0.0.5:7382", false),
+            // Neither an app on the registry's domain, nor one whose node reports the registry's address, is routed:
+            // the registry checks no credentials itself.
+            route("registry.example.com", "10.0.0.5:7382", false),
+            route("sneaky.example.com", "127.0.0.1:5000", false),
+        ],
+    );
+    let text = config.to_string();
+    assert!(!text.contains("sneaky") && text.contains("blog.example.com"), "{text}");
+    let routes = server(&config)["routes"].as_array().unwrap();
+    assert_eq!(routes.len(), 4, "the API, the registry, blog and the catch-all");
+    let h = handlers(&config, "registry.example.com");
+    assert_eq!(h.len(), 2);
+    // First the server is asked, with a GET (so without the body) to its auth route, carrying the request's
+    // method and URI.
+    assert_eq!(h[0]["handler"], "reverse_proxy");
+    assert_eq!(h[0]["upstreams"][0]["dial"], "127.0.0.1:7400");
+    assert_eq!(h[0]["rewrite"]["method"], "GET");
+    assert_eq!(h[0]["rewrite"]["uri"], "/v1/registry/auth");
+    assert_eq!(
+        h[0]["headers"]["request"]["set"]["X-Forwarded-Method"][0],
+        "{http.request.method}"
+    );
+    assert_eq!(
+        h[0]["headers"]["request"]["set"]["X-Forwarded-Uri"][0],
+        "{http.request.uri}"
+    );
+    // A 2xx answer lets the request go on; anything else goes back to the client.
+    assert_eq!(h[0]["handle_response"][0]["match"]["status_code"][0], 2);
+    assert_eq!(h[0]["handle_response"][0]["routes"][0]["handle"][0]["handler"], "vars");
+    // Then the registry, streaming both ways, without the credentials.
+    assert_eq!(h[1]["upstreams"][0]["dial"], "127.0.0.1:5000");
+    assert_eq!(h[1]["flush_interval"], -1);
+    assert_eq!(h[1]["headers"]["request"]["delete"][0], "Authorization");
+    let up = "127.0.0.1:5000".parse().unwrap();
+    assert_eq!(forbidden(&c, up, "127.0.0.1:2019", api()), Some("the image registry"));
+    assert_eq!(forbidden(&cfg(Tls::Internal), up, "127.0.0.1:2019", api()), None);
+}

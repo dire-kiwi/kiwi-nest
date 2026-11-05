@@ -5,7 +5,7 @@
 //! headers (`name: value` lines, sorted), `/stream?n=N` with N lines a tenth of a second apart, and `/ws` (an
 //! upgrade) by echoing bytes back.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::convert::Infallible;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::task::JoinHandle;
 
-use crate::runtime::{ContainerState, LogsOptions, Project, ProjectState, Runtime, RuntimeError};
+use crate::runtime::{ContainerState, ImageRemoval, LogsOptions, Project, ProjectState, Runtime, RuntimeError};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -41,11 +41,14 @@ pub struct Fake {
     projects: Mutex<HashMap<String, FakeProject>>,
     calls: Mutex<Vec<(&'static str, String)>>,
     pub behaviour: Mutex<Behaviour>,
+    /// The images on the engine: those `up` pulled.
+    images: Mutex<BTreeSet<String>>,
 }
 
 struct FakeProject {
     port: u16,
     routed: String,
+    images: Vec<String>,
     containers: Vec<ContainerState>,
     server: Option<JoinHandle<()>>,
 }
@@ -82,11 +85,12 @@ fn container(project: &str, service: &str, state: &str, exit_code: i64) -> Conta
     }
 }
 
-/// The services, the routed one and its published port, from a generated Compose file.
-fn read_compose(file: &Path) -> (Vec<String>, String, u16) {
+/// The services, the routed one and its published port, and the images, from a generated Compose file.
+fn read_compose(file: &Path) -> (Vec<String>, String, u16, Vec<String>) {
     let text = std::fs::read_to_string(file).expect("the generated Compose file");
     let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).unwrap();
     let mut services = Vec::new();
+    let mut images = Vec::new();
     let (mut routed, mut port) = (String::new(), 0);
     for (name, svc) in doc["services"].as_mapping().unwrap() {
         let name = name.as_str().unwrap().to_string();
@@ -94,9 +98,12 @@ fn read_compose(file: &Path) -> (Vec<String>, String, u16) {
             routed = name.clone();
             port = p.parse().unwrap();
         }
+        if let Some(i) = svc["image"].as_str() {
+            images.push(i.to_string());
+        }
         services.push(name);
     }
-    (services, routed, port)
+    (services, routed, port, images)
 }
 
 impl Fake {
@@ -128,6 +135,7 @@ impl Fake {
         let mut p = FakeProject {
             port,
             routed: states[0].0.to_string(),
+            images: Vec::new(),
             containers: states
                 .iter()
                 .map(|(s, state, code)| container(project, s, state, *code))
@@ -138,6 +146,11 @@ impl Fake {
             p.server = Some(spawn_server(project.to_string(), port));
         }
         self.projects.lock().unwrap().insert(project.to_string(), p);
+    }
+
+    /// Whether the engine has an image.
+    pub fn has_image(&self, reference: &str) -> bool {
+        self.images.lock().unwrap().contains(reference)
     }
 
     /// The state of one service's container.
@@ -177,18 +190,21 @@ impl Runtime for Fake {
             self.log("up", &p.name);
             let delay = self.behaviour.lock().unwrap().up_delay;
             tokio::time::sleep(delay).await;
-            let (services, routed, port) = read_compose(&p.file);
+            let (services, routed, port, images) = read_compose(&p.file);
+            self.images.lock().unwrap().extend(images.iter().cloned());
             {
                 let mut projects = self.projects.lock().unwrap();
                 let fp = projects.entry(p.name.clone()).or_insert_with(|| FakeProject {
                     port,
                     routed: routed.clone(),
+                    images: Vec::new(),
                     containers: Vec::new(),
                     server: None,
                 });
                 fp.stop_server();
                 fp.port = port;
                 fp.routed = routed;
+                fp.images = images;
                 fp.containers = services.iter().map(|s| container(&p.name, s, "running", 0)).collect();
             }
             self.run(&p.name);
@@ -274,6 +290,24 @@ impl Runtime for Fake {
             command: format!("logs {}", p.name),
             message: "the fake runtime has no logs".into(),
         })
+    }
+
+    fn remove_image<'a>(&'a self, reference: &'a str) -> BoxFuture<'a, Result<ImageRemoval, RuntimeError>> {
+        self.log("rmi", reference);
+        let used = self
+            .projects
+            .lock()
+            .unwrap()
+            .values()
+            .any(|p| p.images.iter().any(|i| i == reference));
+        let r = if used {
+            ImageRemoval::InUse
+        } else if self.images.lock().unwrap().remove(reference) {
+            ImageRemoval::Removed
+        } else {
+            ImageRemoval::Missing
+        };
+        Box::pin(async move { Ok(r) })
     }
 }
 

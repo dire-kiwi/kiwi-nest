@@ -21,6 +21,9 @@
 //!
 //! Each node also has an ingress token (`kni_…`), given to it when it joins, which the ingress adds to every request
 //! it passes to the node's gateway; see [`crate::ingress`].
+//!
+//! And a registry credential (`knr_…`, stored as a hash), which may only pull from the cluster's registry, where
+//! admin and deploy tokens may also push; see [`crate::registry`].
 
 use axum::extract::FromRequestParts;
 use axum::http::header;

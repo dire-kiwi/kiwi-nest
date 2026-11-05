@@ -7,119 +7,12 @@
 
 mod common;
 
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::net::SocketAddr;
+use std::path::Path;
+use std::time::Duration;
 
 use common::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-/// The Caddy binary, or `None` (and a note) if there isn't one.
-fn caddy_bin() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("KIWI_NEST_TEST_CADDY") {
-        return Some(PathBuf::from(p));
-    }
-    let found = std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|d| d.join("caddy"))
-            .find(|p| p.is_file())
-    });
-    if found.is_none() {
-        eprintln!("skipped: set KIWI_NEST_TEST_CADDY, or put caddy on the PATH, to run the tests with real Caddy");
-    }
-    found
-}
-
-/// A free loopback port (free when asked, at least).
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
-/// Caddy, started with nothing but its admin API, as it would be by its own service; the server configures the
-/// rest. Killed when dropped.
-struct Caddy {
-    bin: PathBuf,
-    child: Option<Child>,
-    admin: u16,
-    dir: tempfile::TempDir,
-}
-
-impl Caddy {
-    fn start(bin: PathBuf) -> Caddy {
-        let mut c = Caddy {
-            bin,
-            child: None,
-            admin: free_port(),
-            dir: tempfile::tempdir().unwrap(),
-        };
-        c.spawn();
-        c
-    }
-
-    fn spawn(&mut self) {
-        let boot = self.dir.path().join("boot.json");
-        std::fs::write(&boot, format!(r#"{{"admin":{{"listen":"127.0.0.1:{}"}}}}"#, self.admin)).unwrap();
-        let log = std::fs::File::create(self.dir.path().join("caddy.log")).unwrap();
-        let child = Command::new(&self.bin)
-            .args(["run", "--config"])
-            .arg(&boot)
-            .env("HOME", self.dir.path())
-            .env("XDG_DATA_HOME", self.dir.path().join("data"))
-            .env("XDG_CONFIG_HOME", self.dir.path().join("config"))
-            .stdout(Stdio::null())
-            .stderr(log)
-            .spawn()
-            .unwrap();
-        self.child = Some(child);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while TcpStream::connect(("127.0.0.1", self.admin)).is_err() {
-            assert!(Instant::now() < deadline, "Caddy should start: {}", self.log());
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    /// Kills Caddy and starts it again, empty.
-    fn restart(&mut self) {
-        self.kill();
-        self.spawn();
-    }
-
-    fn kill(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.dir.path().join("caddy.log")).unwrap_or_default()
-    }
-
-    /// A bcrypt hash of `password`, from `caddy hash-password`.
-    fn hash(&self, password: &str) -> String {
-        let out = Command::new(&self.bin)
-            .args(["hash-password", "--plaintext", password])
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
-    }
-}
-
-impl Drop for Caddy {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
-fn wait_for(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
-    while !f() {
-        assert!(Instant::now() < deadline, "timed out waiting until {what}");
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
 
 /// An HTTPS client for the ingress at `https`, trusting its CA, with the test's domains resolved to it.
 fn client(ca: &Path, https: u16) -> reqwest::Client {

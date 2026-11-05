@@ -14,18 +14,20 @@ use serde_json::json;
 
 use super::*;
 
-struct Env {
-    dir: tempfile::TempDir,
+pub(crate) struct Env {
+    pub(crate) dir: tempfile::TempDir,
     /// Backup targets the server is given.
     targets: Vec<kn_proto::backup::TargetConfig>,
     /// The running server, for what tests reach into.
     server: Option<Server>,
     ingress: Option<ingress::IngressConfig>,
-    url: String,
-    admin: String,
+    /// The registry, and a fake for its container.
+    registry: Option<(registry::RegistryConfig, Arc<dyn registry::container::Container>)>,
+    pub(crate) url: String,
+    pub(crate) admin: String,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
 }
 
 fn config(dir: &std::path::Path, targets: &[kn_proto::backup::TargetConfig]) -> ServerConfig {
@@ -40,18 +42,30 @@ fn config(dir: &std::path::Path, targets: &[kn_proto::backup::TargetConfig]) -> 
 
 impl Env {
     async fn new() -> Env {
-        Env::build(None, Vec::new()).await
+        Env::build(None, Vec::new(), None).await
     }
 
     async fn with_ingress(ingress: Option<ingress::IngressConfig>) -> Env {
-        Env::build(ingress, Vec::new()).await
+        Env::build(ingress, Vec::new(), None).await
     }
 
     async fn with_targets(targets: Vec<kn_proto::backup::TargetConfig>) -> Env {
-        Env::build(None, targets).await
+        Env::build(None, targets, None).await
     }
 
-    async fn build(ingress: Option<ingress::IngressConfig>, targets: Vec<kn_proto::backup::TargetConfig>) -> Env {
+    /// A server with an ingress and a registry, whose container is a fake.
+    pub(crate) async fn with_registry(
+        ingress: Option<ingress::IngressConfig>,
+        registry: Option<(registry::RegistryConfig, Arc<dyn registry::container::Container>)>,
+    ) -> Env {
+        Env::build(ingress, Vec::new(), registry).await
+    }
+
+    async fn build(
+        ingress: Option<ingress::IngressConfig>,
+        targets: Vec<kn_proto::backup::TargetConfig>,
+        registry: Option<(registry::RegistryConfig, Arc<dyn registry::container::Container>)>,
+    ) -> Env {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env {
@@ -59,6 +73,7 @@ impl Env {
             targets,
             server: None,
             ingress,
+            registry,
             url: String::new(),
             admin: String::new(),
             stop: None,
@@ -73,7 +88,10 @@ impl Env {
     async fn start(&mut self) -> Option<String> {
         let mut cfg = config(self.dir.path(), &self.targets);
         cfg.ingress = self.ingress.clone();
-        let (server, first) = Server::open(cfg).await.unwrap();
+        cfg.registry = self.registry.as_ref().map(|r| r.0.clone());
+        let (server, first) = Server::open_with(cfg, self.registry.as_ref().map(|r| r.1.clone()))
+            .await
+            .unwrap();
         self.server = Some(server.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.url = format!("http://{}{}", listener.local_addr().unwrap(), kn_proto::API_PREFIX);
@@ -96,13 +114,13 @@ impl Env {
         assert!(self.start().await.is_none(), "a restart makes no new admin token");
     }
 
-    fn req(&self, method: reqwest::Method, path: &str, token: &str) -> reqwest::RequestBuilder {
+    pub(crate) fn req(&self, method: reqwest::Method, path: &str, token: &str) -> reqwest::RequestBuilder {
         self.http
             .request(method, format!("{}{path}", self.url))
             .bearer_auth(token)
     }
 
-    async fn token(&self, body: serde_json::Value) -> String {
+    pub(crate) async fn token(&self, body: serde_json::Value) -> String {
         let r = self
             .req(reqwest::Method::POST, "/tokens", &self.admin)
             .json(&body)
@@ -113,12 +131,12 @@ impl Env {
         r.json::<CreatedToken>().await.unwrap().token
     }
 
-    async fn join(&self, name: &str, memory: u64) -> FakeNode {
+    pub(crate) async fn join(&self, name: &str, memory: u64) -> FakeNode {
         self.join_with(name, facts(memory)).await
     }
 
     /// Joins a node that reports `facts`.
-    async fn join_with(&self, name: &str, node_facts: NodeFacts) -> FakeNode {
+    pub(crate) async fn join_with(&self, name: &str, node_facts: NodeFacts) -> FakeNode {
         let join = self.token(json!({"kind": "join"})).await;
         let r = self
             .http
@@ -148,6 +166,7 @@ impl Env {
         assert_eq!(again.status(), StatusCode::UNAUTHORIZED);
         assert!(j.ingress_token.starts_with("kni_") && j.ingress_token.len() == 68);
         FakeNode {
+            registry: j.registry,
             ingress_token: j.ingress_token,
             token: j.token,
             id: j.node_id,
@@ -160,7 +179,7 @@ impl Env {
         }
     }
 
-    async fn poll(&self, n: &mut FakeNode) -> PollResponse {
+    pub(crate) async fn poll(&self, n: &mut FakeNode) -> PollResponse {
         n.report.facts = n.facts.clone();
         let r = self
             .req(reqwest::Method::POST, "/agent/poll", &n.token)
@@ -179,7 +198,7 @@ impl Env {
         resp
     }
 
-    async fn deploy(&self, token: &str, name: &str, domain: &str, query: &str) -> reqwest::Response {
+    pub(crate) async fn deploy(&self, token: &str, name: &str, domain: &str, query: &str) -> reqwest::Response {
         self.req(reqwest::Method::PUT, &format!("/apps/{name}?{query}"), token)
             .header("content-type", "application/zip")
             .body(bundle(domain))
@@ -188,7 +207,7 @@ impl Env {
             .unwrap()
     }
 
-    async fn apps(&self) -> Vec<AppSummary> {
+    pub(crate) async fn apps(&self) -> Vec<AppSummary> {
         self.req(reqwest::Method::GET, "/apps", &self.admin)
             .send()
             .await
@@ -198,7 +217,7 @@ impl Env {
             .unwrap()
     }
 
-    async fn status(&self, name: &str, generation: u64) -> ChangeStatus {
+    pub(crate) async fn status(&self, name: &str, generation: u64) -> ChangeStatus {
         let r = self
             .req(
                 reqwest::Method::GET,
@@ -221,18 +240,20 @@ impl Env {
     }
 }
 
-struct FakeNode {
-    token: String,
+pub(crate) struct FakeNode {
+    pub(crate) token: String,
     ingress_token: String,
-    id: u64,
-    facts: NodeFacts,
+    /// What the join answered about the registry.
+    pub(crate) registry: Option<kn_proto::agent::RegistryLogin>,
+    pub(crate) id: u64,
+    pub(crate) facts: NodeFacts,
     since: u64,
-    report: Report,
+    pub(crate) report: Report,
 }
 
 impl FakeNode {
     /// Records that a change is done, and the app as the node has it.
-    fn applied(&mut self, name: &str, generation: u64, ok: bool, deleted: bool) {
+    pub(crate) fn applied(&mut self, name: &str, generation: u64, ok: bool, deleted: bool) {
         self.report.applied.apps.insert(
             name.into(),
             Outcome {
@@ -257,6 +278,7 @@ impl FakeNode {
                 port: 30000,
                 bundle_digest: String::new(),
                 containers: "running(1)".into(),
+                starting: false,
                 last_request_at: None,
                 open_requests: 0,
                 space: Default::default(),
@@ -265,7 +287,7 @@ impl FakeNode {
     }
 }
 
-fn facts(memory: u64) -> NodeFacts {
+pub(crate) fn facts(memory: u64) -> NodeFacts {
     NodeFacts {
         arch: "amd64".into(),
         memory_bytes: memory,
@@ -284,19 +306,24 @@ fn bundle(domain: &str) -> Vec<u8> {
 
 /// A bundle ZIP with one service at `domain`, and more of `x-kiwi-nest`.
 fn bundle_with(domain: &str, extra: &str) -> Vec<u8> {
+    bundle_image(domain, extra, "x")
+}
+
+/// A bundle ZIP with one service at `domain` running `image`, and more of `x-kiwi-nest`.
+pub(crate) fn bundle_image(domain: &str, extra: &str, image: &str) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("compose.yaml"),
         format!(
             "x-kiwi-nest: {{ domain: {domain}, service: web, port: 80{extra} }}\n\
-             services:\n  web:\n    image: x\n    mem_limit: 128m\n"
+             services:\n  web:\n    image: {image}\n    mem_limit: 128m\n"
         ),
     )
     .unwrap();
     kn_bundle::dir::pack(dir.path(), &kn_bundle::Limits::default()).unwrap()
 }
 
-async fn error(r: reqwest::Response) -> (StatusCode, String) {
+pub(crate) async fn error(r: reqwest::Response) -> (StatusCode, String) {
     let status = r.status();
     let body: ErrorBody = r.json().await.unwrap();
     (status, body.error)
@@ -726,6 +753,7 @@ async fn a_restart_loses_nothing() {
     let mut again = FakeNode {
         token: a.token.clone(),
         ingress_token: a.ingress_token.clone(),
+        registry: None,
         id: a.id,
         facts: a.facts.clone(),
         since: 0,

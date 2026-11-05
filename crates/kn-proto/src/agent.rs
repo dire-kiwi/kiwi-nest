@@ -9,6 +9,7 @@
 //! | --- | --- | --- |
 //! | `POST /agent/join` | [`JoinRequest`] | [`JoinResponse`] |
 //! | `GET /agent/ingress-token` | | [`IngressToken`], for a node that joined before ingress tokens |
+//! | `POST /agent/registry` | | [`RegistryCredential`]: a new credential for the registry, replacing the last |
 //! | `POST /agent/poll` | [`PollRequest`] | [`PollResponse`], once something changed or the wait is over |
 //! | `POST /agent/report` | [`Report`] | `204 No Content`, at once |
 //! | `GET /agent/bundles/{digest}` | | the bundle's ZIP |
@@ -44,12 +45,18 @@ use crate::backup::{Kind, Restore};
 use crate::state::AppStatus;
 
 /// The version of the agent link that this build speaks. Version 2 added backups: [`Action::Backup`], restores in
-/// [`AppWant::Deploy`] and [`VolumeWant::Present`], `GET /agent/backup-targets`, and [`NodeFacts::protocol`].
-pub const PROTOCOL: u32 = 2;
+/// [`AppWant::Deploy`] and [`VolumeWant::Present`], `GET /agent/backup-targets`, and [`NodeFacts::protocol`]. Version 3
+/// added the image registry: [`JoinResponse::registry`], `POST /agent/registry`, [`AppReport::starting`] and
+/// [`Action::PruneImages`].
+pub const PROTOCOL: u32 = 3;
 
 /// The first version with backups: a server sends a node older than this no backup command and no restore (an
 /// older node would ignore the restore, and deploy the app empty).
 pub const BACKUPS_PROTOCOL: u32 = 2;
+
+/// The first version with the image registry: a server sends a node older than this no [`Action::PruneImages`]
+/// (it couldn't read it). Such a node has no registry credential, and doesn't say when an app is starting.
+pub const REGISTRY_PROTOCOL: u32 = 3;
 
 /// The oldest version a server built from this code still serves.
 pub const OLDEST_PROTOCOL: u32 = 1;
@@ -75,6 +82,27 @@ pub struct JoinResponse {
     /// The token the ingress adds to every request it sends to the node's gateway ([`INGRESS_HEADER`]).
     #[serde(default)]
     pub ingress_token: String,
+    /// The node's read-only credential for the cluster's registry, if it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryLogin>,
+}
+
+/// A login for the cluster's image registry, which the node writes into its Docker configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryLogin {
+    /// The host that image references name, such as `registry.example.com`.
+    pub host: String,
+    pub username: String,
+    /// A `knr_…` credential, which may only pull.
+    pub password: String,
+}
+
+/// `POST /agent/registry`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RegistryCredential {
+    /// `None` if the cluster has no registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryLogin>,
 }
 
 /// `GET /agent/ingress-token`.
@@ -212,6 +240,9 @@ pub struct AppReport {
     pub bundle_digest: String,
     /// What Docker reports for its containers, such as `running(2)`; `unknown` if Docker couldn't be asked.
     pub containers: String,
+    /// It's being started, or deployed, or looked at after the node agent started, so it may be pulling images.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub starting: bool,
     /// When a request through the gateway last began or ended (Unix seconds), if one has since the node started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_request_at: Option<u64>,
@@ -352,6 +383,12 @@ pub enum Action {
     VolumeInfo { name: String },
     /// Answers with `null`.
     DeleteSnapshot { name: String, app: String },
+    /// Removes the images of the node's past apps that nothing uses, and that weren't released within the grace
+    /// period (the node's own, unless given). Answers with a [`crate::api::PruneReport`].
+    PruneImages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grace_secs: Option<u64>,
+    },
     /// Backs up an app or a shared volume to the targets named (every target, if none is); answers with a
     /// [`crate::backup::BackupResult`].
     Backup {
@@ -372,6 +409,7 @@ impl Action {
                 app
             }
             Action::VolumeInfo { name } | Action::DeleteSnapshot { name, .. } | Action::Backup { name, .. } => name,
+            Action::PruneImages { .. } => "",
         }
     }
 }

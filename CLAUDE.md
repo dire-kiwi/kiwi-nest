@@ -20,8 +20,9 @@ kiwi-nest is written from scratch; don't copy from or refer to other deployment 
   `KIWI_NEST_TEST_BTRFS_DIR` names a directory on btrfs, and are skipped otherwise. `make test-btrfs`
   (`scripts/test-btrfs.sh`, needs sudo) loop-mounts one at `/mnt/kiwi-nest-test`, as CI does; any directory on a
   btrfs filesystem you own works too. Without root, tests destroy subvolumes by emptying them and using `rmdir`.
-- The ingress's end-to-end test (`crates/kiwi-nest/tests/ingress.rs`) also needs Caddy: `KIWI_NEST_TEST_CADDY` naming
-  the binary, or `caddy` on the PATH. It's skipped otherwise. CI downloads a pinned Caddy release for it.
+- The ingress's and the registry's end-to-end tests (`crates/kiwi-nest/tests/ingress.rs`, `registry.rs`) also need
+  Caddy: `KIWI_NEST_TEST_CADDY` naming the binary, or `caddy` on the PATH. They're skipped otherwise. CI downloads
+  a pinned Caddy release for them. The registry's runs `registry:3` in a container of its own, removed at the end.
 - `btrfs send` needs root, so the tests of the `send` format (in `kn-btrfs`, `kn-backup`, `kn-node` and
   `kiwi-nest/tests/backup.rs`) skip themselves otherwise. `make test-root` builds them as you and runs them as root
   through `sudo` (Cargo's runner), as CI's `root` job does; they clean up their read-only snapshots with
@@ -54,7 +55,8 @@ gateway port, loop-mounted btrfs file and project prefix; `KIWI_NEST_DEV_BTRFS=D
 btrfs filesystem instead of loop mounts and sudo), and writes a CLI configuration with the cluster added. With
 `caddy` on the PATH (or `KIWI_NEST_DEV_CADDY`), it also runs the ingress: Caddy with its internal CA, HTTPS on
 :7443, the server's API at `https://kn.localhost:7443` (which the nodes and the CLI then use) and the nodes' gateways
-listening for it on :7491 and :7492. Switching between the two needs `clean`, since nodes keep the server's URL.
+listening for it on :7491 and :7492, and the image registry (a `registry:3` container, `kn-dev-registry`) at
+`localhost:7443`. Switching between the two needs `clean`, since nodes keep the server's URL.
 
 ```sh
 scripts/dev-cluster.sh up
@@ -64,6 +66,7 @@ cargo run -q -- deploy blog ./path/to/bundle      # waits for the node; --node a
 curl -H 'Host: blog.example.com' http://127.0.0.1:7481/
 curl --cacert .dev-cluster/server/ingress-ca.crt https://blog.localhost:7443/   # through the ingress, with Caddy
 cargo run -q -- nest list
+cargo run -q -- push my-image:dev app:1             # with Caddy: prints localhost:7443/app:1, for a bundle's image
 cargo run -q -- user add ivan                     # then log in to the web UI at http://127.0.0.1:7400/
 scripts/dev-cluster.sh stop a                     # then `node forget a`; `start a` or `rejoin a` brings it back
 scripts/dev-cluster.sh down                       # or `clean`, which also removes the cluster's state
@@ -92,18 +95,23 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
   `apps/backup.rs` backs up snapshot sets and restores into first deploys and new volumes; `apps/usage.rs` measures
   the volumes' space now and then, grouped by what can share data;
   `gateway` (the proxy, each app's `gate` of phases and leases, the starting page, the ingress listener's token
-  check), `agent` (the link to the server: joining, the poll loop, the per-app applier and commands; `agent/link.rs`
-  is its HTTP client; `agent/forgotten.rs` takes a forgotten node's apps down and sets its data aside), `api`
-  (standalone API). `testing` is a fake runtime for unit tests.
+  check), `agent` (the link to the server: joining, the poll loop, the per-app applier and commands, the registry
+  credential in the node's own Docker configuration; `agent/link.rs` is its HTTP client; `agent/forgotten.rs` takes
+  a forgotten node's apps down and sets its data aside), `api` (standalone API). Apps record their images, and
+  `Apps::prune_images` removes the ones they stopped using. `testing` is a fake runtime for unit tests.
 - `crates/kn-server`: `store` (SQLite on its own thread, numbered migrations; `tokens`, `nodes` (cordons, labels,
   forgetting and tombstones), `apps` for apps, volumes, their nests, desired state and change status, `nests`,
-  `commands` (also each app's history), `users` (the web UI's users and sessions)), `bundles` (the store by digest, checking uploads), `backups` (the targets, the schedule, the
-  server's own backups and `server restore`), `auth`, `scheduler` (placing new nests: a pure
-  filter and score, with table tests), `hub` (in memory: online nodes, waking polls, callers waiting on commands),
-  `api` (for the CLI), `agent` (for nodes), `ingress` (Caddy's generated configuration, kept loaded through its
-  admin API) and `ui` (the embedded web UI, logins, and the same-origin and JSON checks on requests with its session
-  cookie).
-- `crates/kn-cli`: the CLI commands, and `config` (clusters in `~/.config/kiwi-nest/clusters.json`).
+  `commands` (also each app's history), `registry` for images in use, pushes and releases, `users` (the web UI's
+  users and sessions)), `bundles` (the store by digest, checking uploads),
+  `backups` (the targets, the schedule, the server's own backups and `server restore`), `auth`, `scheduler`
+  (placing new nests: a pure filter and score, with table tests), `hub` (in memory: online nodes, waking polls,
+  callers waiting on commands), `api` (for the CLI), `agent` (for nodes), `ingress` (Caddy's generated
+  configuration, kept loaded through its admin API), `ui` (the embedded web UI, logins, and the same-origin and JSON
+  checks on requests with its session cookie) and `registry` (the `registry:3` container, the credential check
+  Caddy asks for every request, garbage collection in `gc.rs` with table tests, image references in `refs.rs`; its
+  `tests.rs` uses a fake registry).
+- `crates/kn-cli`: the CLI commands (`push` runs `docker login`, `tag` and `push`), and `config` (clusters in
+  `~/.config/kiwi-nest/clusters.json`).
 - `web/`: the web UI (React, TypeScript, Vite; no other dependencies). `src/api.ts` mirrors `kn-proto`'s types;
   `src/views/` has a file per view. It talks only to the CLI's API, sending JSON on every change.
 
@@ -117,5 +125,6 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
   process, and each node on a tokio runtime of its own, so dropping the runtime kills the node mid-operation.
 - The server's tests play the nodes themselves over HTTP (`crates/kn-server/src/tests.rs`).
 - Tests never read the user's CLI configuration: the end-to-end harness sets `KIWI_NEST_CONFIG_DIR` to an empty
-  directory.
+  directory. Nor the user's Docker configuration: a joined node has its own (`STATE/docker`), and the registry's
+  test gives the CLI an empty `DOCKER_CONFIG`.
 - Every rule the bundle checker enforces has a unit test.

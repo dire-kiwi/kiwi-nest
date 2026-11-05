@@ -16,12 +16,14 @@
 //! - [`apps`]: apps and shared volumes, the desired state of each node, and whether a change is done.
 //! - [`nests`]: which nest each app and shared volume is in, and the node each nest is pinned to.
 //! - [`commands`]: one-off commands for nodes, kept as each app's history.
+//! - [`registry`]: what the image registry's garbage collection needs: the images apps use, pushes and releases.
 //! - [`users`]: the web UI's users and their sessions.
 
 pub mod apps;
 pub mod commands;
 pub mod nests;
 pub mod nodes;
+pub mod registry;
 pub mod tokens;
 pub mod users;
 
@@ -63,10 +65,16 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: MIGRATION_4,
         then: None,
     },
-    // 5: the web UI: its users and their sessions; commands record what they act on and who asked, for each app's
-    // history.
+    // 5: the image registry: each app's images, when images were released and tags pushed, and each node's
+    // registry credential.
     Migration {
         sql: MIGRATION_5,
+        then: None,
+    },
+    // 6: the web UI: its users and their sessions; commands record what they act on and who asked, for each app's
+    // history.
+    Migration {
+        sql: MIGRATION_6,
         then: Some(commands::backfill),
     },
 ];
@@ -200,8 +208,39 @@ const MIGRATION_4: &str = r#"
     ALTER TABLE volumes ADD COLUMN restore TEXT;
     "#;
 
-// 5: the web UI's users and sessions, and each command's target and caller.
+// 5: what the registry's garbage collection needs.
 const MIGRATION_5: &str = r#"
+    -- The image references of the app's bundle, as JSON. NULL for an app deployed before this migration until the
+    -- server has read them from its bundle; garbage collection deletes nothing while any app's images aren't known.
+    ALTER TABLE apps ADD COLUMN images TEXT;
+    -- When an app stopped using an image (redeployed with others, deleted, or its node forgotten).
+    CREATE TABLE image_releases (
+        reference TEXT PRIMARY KEY,
+        released_at INTEGER NOT NULL
+    );
+    -- The registry's tags: when each was last pushed through the ingress, and the digest garbage collection last saw
+    -- it at, with when it first saw it there.
+    CREATE TABLE registry_tags (
+        repository TEXT NOT NULL,
+        tag TEXT NOT NULL,
+        pushed_at INTEGER,
+        digest TEXT,
+        seen_at INTEGER,
+        PRIMARY KEY (repository, tag)
+    );
+    CREATE TABLE registry_gc (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        -- Manifests were deleted or untagged since the registry's own garbage collection last ran.
+        collect_pending INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER
+    );
+    -- SHA-256 of the node's read-only registry credential (`knr_…`).
+    ALTER TABLE nodes ADD COLUMN registry_hash TEXT;
+    CREATE INDEX nodes_by_registry_hash ON nodes (registry_hash);
+    "#;
+
+// 6: the web UI's users and sessions, and each command's target and caller.
+const MIGRATION_6: &str = r#"
     CREATE TABLE users (
         id INTEGER PRIMARY KEY,
         name TEXT NOT NULL UNIQUE,
