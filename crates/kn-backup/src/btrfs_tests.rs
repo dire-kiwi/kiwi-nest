@@ -36,7 +36,12 @@ pub(crate) fn describe(root: &Path) -> Vec<String> {
             let rel = p.strip_prefix(root).unwrap().display().to_string();
             let extra = if m.is_file() {
                 let data = std::fs::read(&p).unwrap();
-                format!("{} {:x}", data.len(), data.iter().fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(*b))))
+                format!(
+                    "{} {:x}",
+                    data.len(),
+                    data.iter()
+                        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(*b)))
+                )
             } else if m.file_type().is_symlink() {
                 std::fs::read_link(&p).unwrap().display().to_string()
             } else {
@@ -81,7 +86,10 @@ pub(crate) fn fill(v: &Path) {
         let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
         let n = std::ffi::CString::new(name).unwrap();
         // SAFETY: valid C strings and buffer.
-        assert_eq!(unsafe { libc::lsetxattr(c.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0) }, 0);
+        assert_eq!(
+            unsafe { libc::lsetxattr(c.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0) },
+            0
+        );
     };
     set(&v.join("tool"), "user.kind", b"script");
     set(&v.join("db"), "trusted.kn", b"\x00\x01");
@@ -89,7 +97,10 @@ pub(crate) fn fill(v: &Path) {
     // SAFETY: valid C strings.
     unsafe {
         assert_eq!(libc::mkfifo(c(&v.join("fifo")).as_ptr(), 0o640), 0);
-        assert_eq!(libc::mknod(c(&v.join("null")).as_ptr(), libc::S_IFCHR | 0o666, libc::makedev(1, 3)), 0);
+        assert_eq!(
+            libc::mknod(c(&v.join("null")).as_ptr(), libc::S_IFCHR | 0o666, libc::makedev(1, 3)),
+            0
+        );
     }
     let f = std::fs::File::create(v.join("sparse")).unwrap();
     f.set_len(10 << 20).unwrap();
@@ -105,7 +116,10 @@ fn reflink(from: &Path, to: &Path) {
     const FICLONE: u64 = (1 << 30) | (4 << 16) | (0x94 << 8) | 9;
     use std::os::fd::AsRawFd;
     // SAFETY: valid descriptors.
-    assert_eq!(unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE as _, src.as_raw_fd()) }, 0);
+    assert_eq!(
+        unsafe { libc::ioctl(dst.as_raw_fd(), FICLONE as _, src.as_raw_fd()) },
+        0
+    );
 }
 
 /// Changes a volume: new, changed, renamed and removed files, and a clone.
@@ -239,7 +253,9 @@ async fn backups_of_a_set_restore_through_a_target() {
     let t = target(&store, Format::Send);
     let k1 = Key::new(Kind::App, "blog", Stamp(1_800_000_000), None, Format::Send);
     let k2 = Key::new(Kind::App, "blog", Stamp(1_800_000_100), Some(k1.stamp), Format::Send);
-    t.upload(&k1, crate::send_producer(s1.clone(), names.clone(), None)).await.unwrap();
+    t.upload(&k1, crate::send_producer(s1.clone(), names.clone(), None))
+        .await
+        .unwrap();
     t.upload(&k2, crate::send_producer(s2.clone(), names.clone(), Some(s1.clone())))
         .await
         .unwrap();
@@ -253,7 +269,9 @@ async fn backups_of_a_set_restore_through_a_target() {
     let tt = target(&base.join("store-tar"), Format::Tar);
     let kt = Key::new(Kind::App, "blog", Stamp(1_800_000_100), None, Format::Tar);
     let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
-    tt.upload(&kt, crate::tar_producer(s2.clone(), names.clone(), notes)).await.unwrap();
+    tt.upload(&kt, crate::tar_producer(s2.clone(), names.clone(), notes))
+        .await
+        .unwrap();
     let dest = base.join("restore-tar");
     std::fs::create_dir(&dest).unwrap();
     let got = crate::restore(&tt, &kt, dest, restore_to()).await.unwrap();

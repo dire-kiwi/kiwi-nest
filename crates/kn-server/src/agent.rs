@@ -28,6 +28,7 @@ pub fn router() -> Router<Server> {
         .route(&format!("{p}/agent/poll"), post(poll))
         .route(&format!("{p}/agent/report"), post(report))
         .route(&format!("{p}/agent/bundles/{{digest}}"), get(bundle))
+        .route(&format!("{p}/agent/backup-targets"), get(backup_targets))
         .route(&format!("{p}/agent/commands/{{id}}/result"), post(command_result))
         .route(&format!("{p}/agent/commands/{{id}}/output"), post(command_output))
 }
@@ -158,6 +159,11 @@ async fn report(
 }
 
 /// A bundle, for a node that has an app or volume using it.
+/// The backup targets, credentials included: nodes back up and restore with them.
+async fn backup_targets(State(s): State<Server>, _node: NodeCaller) -> axum::Json<Vec<kn_proto::backup::TargetConfig>> {
+    axum::Json(s.backups.configs.clone())
+}
+
 async fn bundle(State(s): State<Server>, node: NodeCaller, Path(digest): Path<String>) -> Result<Response> {
     let path = s
         .bundles

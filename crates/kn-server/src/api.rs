@@ -19,6 +19,7 @@ use kn_proto::api::{
     LabelRequest, LogsQuery, NestInfo, NodeInfo, TokenInfo, TokenKind, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery,
     WhoAmI,
 };
+use kn_proto::backup::{BackupInfo, BackupQuery, BackupResult, Kind as BackupKind, ListQuery, Restore};
 use kn_proto::state::AppStatus;
 use serde::de::DeserializeOwned;
 
@@ -61,6 +62,10 @@ pub fn router() -> Router<Server> {
             &format!("{p}/volumes/{{name}}/snapshots/{{app}}"),
             delete_route(volume_delete_snapshot),
         )
+        .route(&format!("{p}/backups"), get(backup_list))
+        .route(&format!("{p}/backups/apps/{{name}}"), post(backup_app))
+        .route(&format!("{p}/backups/volumes/{{name}}"), post(backup_volume))
+        .route(&format!("{p}/backups/server"), post(backup_server))
         .route(&format!("{p}/nests"), get(nest_list))
         .route(&format!("{p}/nodes"), get(node_list))
         .route(&format!("{p}/nodes/{{name}}/labels"), post(node_label))
@@ -225,6 +230,7 @@ impl View {
             volumes: Vec::new(),
             shared: Vec::new(),
             from: self.app.from_app.clone(),
+            restored_from: self.app.restore.as_ref().map(|r| format!("{}:{}", r.target, r.key)),
             notes: Vec::new(),
             created_at: rfc3339(self.app.created_at),
             updated_at: rfc3339(self.app.updated_at),
@@ -264,7 +270,7 @@ async fn view(s: &Server, name: &str) -> Result<View> {
 }
 
 /// A command's JSON result.
-fn result<T: DeserializeOwned>(o: Outcome) -> Result<T> {
+pub(crate) fn result<T: DeserializeOwned>(o: Outcome) -> Result<T> {
     match o {
         Outcome::Result(CommandResult::Ok { value }) => Ok(serde_json::from_value(value)?),
         Outcome::Result(CommandResult::Err { status, error }) => Err(Error::Node(
@@ -344,6 +350,15 @@ async fn deploy(
         check_app_name(from)?;
         caller.may_use_from(from)?;
     }
+    if q.from.is_some() && q.restore.is_some() {
+        return Err(Error::BadRequest(
+            "an app's volumes start either `--from` another app or `--restore`d from a backup, not both".into(),
+        ));
+    }
+    let restore = match &q.restore {
+        Some(key) => Some(resolve_restore(&s, &caller, BackupKind::App, &name, key, q.target.as_deref()).await?),
+        None => None,
+    };
     check_zip(&headers)?;
     let limits = s.cfg.limits.clone();
     let upload = s.bundles.temp_file()?;
@@ -371,6 +386,7 @@ async fn deploy(
         from: q.from,
         node: q.node,
         queue: q.queue,
+        restore,
     };
     let saved = s
         .store
@@ -579,6 +595,10 @@ async fn volume_create(
 ) -> Result<Response> {
     caller.admin()?;
     check_volume_name(&name)?;
+    let restore = match &q.restore {
+        Some(key) => Some(resolve_restore(&s, &caller, BackupKind::Volume, &name, key, q.target.as_deref()).await?),
+        None => None,
+    };
     let (online, settings) = (s.online(), s.cfg.scheduler);
     let saved = s
         .store
@@ -591,6 +611,7 @@ async fn volume_create(
                 q.node.as_deref(),
                 q.nest.as_deref(),
                 q.queue,
+                restore.as_ref(),
                 store::now(),
             )
         })
@@ -880,4 +901,142 @@ async fn token_revoke(State(s): State<Server>, caller: Caller, Path(id): Path<u6
     s.store.call(move |c| tokens::revoke(c, id, store::now())).await?;
     tracing::info!(id, by = caller.id, "revoked a token");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Checks a `--restore` key, and finds the target that has it. A deploy token may restore another app's backup only
+/// if it may use that app as `--from`.
+async fn resolve_restore(
+    s: &Server,
+    caller: &Caller,
+    kind: BackupKind,
+    name: &str,
+    key: &str,
+    target: Option<&str>,
+) -> Result<Restore> {
+    let k = kn_backup::parse_restore_key(key, kind).map_err(|e| Error::BadRequest(format!("{e:#}")))?;
+    if kind == BackupKind::App && k.name != name {
+        caller.may_use_from(&k.name)?;
+    }
+    if s.backups.targets.is_empty() {
+        return Err(Error::BadRequest(
+            "the server has no backup targets to restore from: give it --backup-targets".into(),
+        ));
+    }
+    let t = kn_backup::find(&s.backups.targets, target, &k)
+        .await
+        .map_err(|e| Error::NotFound(format!("{e:#}")))?;
+    // The whole chain must be there before anything is saved.
+    kn_backup::chain_for(t, &k)
+        .await
+        .map_err(|e| Error::NotFound(format!("{e:#}")))?;
+    Ok(Restore {
+        target: t.name().into(),
+        key: k.to_string(),
+    })
+}
+
+async fn backup_list(
+    State(s): State<Server>,
+    caller: Caller,
+    Query(q): Query<ListQuery>,
+) -> Result<axum::Json<Vec<BackupInfo>>> {
+    if s.backups.targets.is_empty() {
+        return Err(Error::BadRequest(
+            "the server has no backup targets: give it --backup-targets".into(),
+        ));
+    }
+    let mut all = list_targets(&s, &q).await?;
+    if !caller.is_admin() {
+        all.retain(|b| b.kind == BackupKind::App && caller.may_manage(&b.name));
+    }
+    Ok(axum::Json(all))
+}
+
+/// Lists the targets' backups, as the node does.
+async fn list_targets(s: &Server, q: &ListQuery) -> Result<Vec<BackupInfo>> {
+    let chosen = s.backups.chosen(&q.target.iter().cloned().collect::<Vec<_>>())?;
+    let mut out = Vec::new();
+    for t in chosen {
+        let scope = match (q.kind, &q.name) {
+            (Some(BackupKind::Server), _) => Some((BackupKind::Server, "")),
+            (Some(k), Some(n)) => Some((k, n.as_str())),
+            _ => None,
+        };
+        let infos = t.infos(scope).await.map_err(|e| Error::Offline(format!("{e:#}")))?;
+        out.extend(
+            infos
+                .into_iter()
+                .filter(|i| q.kind.is_none_or(|k| k == i.kind))
+                .filter(|i| q.name.as_ref().is_none_or(|n| *n == i.name)),
+        );
+    }
+    Ok(out)
+}
+
+async fn backup_app(
+    State(s): State<Server>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Query(q): Query<BackupQuery>,
+) -> Result<axum::Json<BackupResult>> {
+    check_app_name(&name)?;
+    caller.manage(&name)?;
+    let targets: Vec<String> = q.target.into_iter().collect();
+    s.backups.chosen(&targets)?;
+    let v = view(&s, &name).await?;
+    let node = v
+        .node
+        .as_ref()
+        .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
+    let action = Action::Backup {
+        what: BackupKind::App,
+        name,
+        targets,
+        full: q.full,
+    };
+    let o = s
+        .command_with(node.id, &node.name, action, s.cfg.backup_timeout)
+        .await?;
+    Ok(axum::Json(result(o)?))
+}
+
+async fn backup_volume(
+    State(s): State<Server>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Query(q): Query<BackupQuery>,
+) -> Result<axum::Json<BackupResult>> {
+    caller.admin()?;
+    check_volume_name(&name)?;
+    let targets: Vec<String> = q.target.into_iter().collect();
+    s.backups.chosen(&targets)?;
+    let n = name.clone();
+    let node = s
+        .store
+        .call(move |c| {
+            let v = apps::live_volume(c, &n)?;
+            v.node_id.map(|id| nodes::get(c, id)).transpose()
+        })
+        .await?
+        .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
+    let action = Action::Backup {
+        what: BackupKind::Volume,
+        name,
+        targets,
+        full: q.full,
+    };
+    let o = s
+        .command_with(node.id, &node.name, action, s.cfg.backup_timeout)
+        .await?;
+    Ok(axum::Json(result(o)?))
+}
+
+async fn backup_server(
+    State(s): State<Server>,
+    caller: Caller,
+    Query(q): Query<BackupQuery>,
+) -> Result<axum::Json<BackupResult>> {
+    caller.admin()?;
+    let targets: Vec<String> = q.target.into_iter().collect();
+    Ok(axum::Json(s.backup_self(&targets).await?))
 }

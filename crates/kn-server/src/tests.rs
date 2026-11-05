@@ -595,6 +595,7 @@ async fn commands_are_delivered_once_and_lost_ones_fail() {
         volumes: vec![],
         shared: vec![],
         from: None,
+        restored_from: None,
         notes: vec![],
         created_at: String::new(),
         updated_at: String::new(),

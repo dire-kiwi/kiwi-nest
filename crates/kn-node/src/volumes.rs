@@ -4,6 +4,8 @@
 //! VOLUMES/apps/APP/VOL/            subvolume: APP's named volume VOL
 //! VOLUMES/shared/NAME/data/        subvolume: shared volume NAME
 //! VOLUMES/shared/NAME/snaps/APP/   subvolume: APP's writable snapshot of NAME
+//! VOLUMES/backups/apps/APP/STAMP/  read-only snapshots of APP's volumes, the parents of incremental backups
+//! VOLUMES/backups/volumes/NAME/STAMP/data   the same for shared volume NAME
 //! ```
 //!
 //! This module is the layout and the disk operations; [`crate::apps`] decides when to use them and records what they
@@ -29,6 +31,9 @@ pub const STAGING_PREFIX: &str = ".new-";
 /// Where `volume load` builds the new contents of a shared volume, beside `data`.
 pub const LOAD_NAME: &str = ".load";
 
+/// The prefix of a deleted app's backup snapshots, set aside in `VOLUMES/backups` to be destroyed later.
+pub const GONE_PREFIX: &str = ".gone-";
+
 /// The subvolume operations, on paths that must be absolute and are opened without following symlinks.
 pub trait Backend: Send + Sync + 'static {
     /// Checks the volumes directory when the node starts, and returns its filesystem.
@@ -37,6 +42,8 @@ pub trait Backend: Send + Sync + 'static {
     fn create(&self, path: &Path) -> Result<(), BtrfsError>;
     /// Snapshots the subvolume `source` as a writable `dest`, whose parent exists.
     fn snapshot(&self, source: &Path, dest: &Path) -> Result<(), BtrfsError>;
+    /// Snapshots the subvolume `source` as a read-only `dest`, for a backup.
+    fn snapshot_read_only(&self, source: &Path, dest: &Path) -> Result<(), BtrfsError>;
     /// Destroys the subvolume at `path`.
     fn destroy(&self, path: &Path) -> Result<(), BtrfsError>;
     /// Checks `path` is a subvolume, reached without symlinks, and says which one.
@@ -57,6 +64,10 @@ impl Backend for Btrfs {
 
     fn snapshot(&self, source: &Path, dest: &Path) -> Result<(), BtrfsError> {
         kn_btrfs::snapshot(source, dest, false)
+    }
+
+    fn snapshot_read_only(&self, source: &Path, dest: &Path) -> Result<(), BtrfsError> {
+        kn_btrfs::snapshot(source, dest, true)
     }
 
     fn destroy(&self, path: &Path) -> Result<(), BtrfsError> {
@@ -137,7 +148,7 @@ impl Volumes {
             ),
             e => anyhow::anyhow!("the volumes directory: {e}"),
         })?;
-        for d in ["apps", "shared"] {
+        for d in ["apps", "shared", "backups", "backups/apps", "backups/volumes"] {
             let d = root.join(d);
             std::fs::create_dir_all(&d).map_err(|e| anyhow::anyhow!("creating {}: {e}", d.display()))?;
             kn_btrfs::open_dir(&d).map_err(|e| anyhow::anyhow!("the volumes directory: {e}"))?;
@@ -181,6 +192,16 @@ impl Volumes {
     /// `VOLUMES/shared/NAME/snaps/APP`.
     pub fn snapshot_path(&self, name: &str, app: &str) -> PathBuf {
         self.snapshots_dir(name).join(app)
+    }
+
+    /// `VOLUMES/backups/apps/APP` or `VOLUMES/backups/volumes/NAME`: a plain directory of snapshot sets, one per
+    /// backup kept as a parent, each named by its stamp.
+    pub fn backups_dir(&self, kind: kn_proto::backup::Kind, name: &str) -> PathBuf {
+        let k = match kind {
+            kn_proto::backup::Kind::Volume => "volumes",
+            _ => "apps",
+        };
+        self.root.join("backups").join(k).join(name)
     }
 
     /// The staging name beside `path`.
@@ -307,6 +328,19 @@ impl Volumes {
         made
     }
 
+    /// Snapshots `source` (already checked) as a read-only `dest`, and returns its ID.
+    pub fn snapshot_read_only(&self, source: &Path, dest: &Path) -> Result<u64> {
+        let what = || format!("snapshotting {} as {}", source.display(), dest.display());
+        self.backend.snapshot_read_only(source, dest).map_err(ctx(what()))?;
+        let sub = self.backend.inspect(dest).map_err(ctx(what()))?;
+        Ok(sub.id)
+    }
+
+    /// The backend, for restores.
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        self.backend.clone()
+    }
+
     /// Swaps two paths atomically.
     pub fn exchange(&self, a: &Path, b: &Path) -> Result<()> {
         kn_btrfs::exchange(a, b).map_err(ctx(format!("swapping {} and {}", a.display(), b.display())))
@@ -338,6 +372,23 @@ impl Volumes {
         for app in Self::names(&self.root.join("apps"))? {
             dirs.push(self.app_dir(&app));
         }
+        // Snapshot sets being made for a backup, and deleted apps' backup snapshots.
+        let mut gone = Vec::new();
+        for kind in ["apps", "volumes"] {
+            let d = self.root.join("backups").join(kind);
+            dirs.push(d.clone());
+            for name in Self::names(&d)? {
+                dirs.push(d.join(name));
+            }
+            if let Ok(entries) = std::fs::read_dir(&d) {
+                gone.extend(
+                    entries
+                        .flatten()
+                        .filter(|e| e.file_name().to_string_lossy().starts_with(GONE_PREFIX))
+                        .map(|e| e.path()),
+                );
+            }
+        }
         let mut loads = Vec::new();
         for name in Self::names(&self.root.join("shared"))? {
             dirs.push(self.snapshots_dir(&name));
@@ -359,6 +410,13 @@ impl Volumes {
                 removed.push(load);
             }
         }
+        for g in gone {
+            // A send of one may still be running (it holds it open); the next sweep tries again.
+            match self.remove(&g) {
+                Ok(()) => removed.push(g),
+                Err(e) => tracing::warn!(path = %g.display(), error = %e, "couldn't remove old backup snapshots yet"),
+            }
+        }
         Ok(removed)
     }
 }
@@ -376,7 +434,8 @@ pub mod fake {
 
     #[derive(Default)]
     pub struct Fake {
-        subvolumes: Mutex<HashMap<(u64, u64), u64>>,
+        /// Each subvolume's ID, and whether it's read-only.
+        subvolumes: Mutex<HashMap<(u64, u64), (u64, bool)>>,
         next: Mutex<u64>,
         /// Snapshots whose destination has one of these names fail.
         pub fail_snapshots: Mutex<HashSet<String>>,
@@ -424,28 +483,15 @@ pub mod fake {
     }
 
     impl Fake {
-        fn register(&self, path: &Path) -> Result<(), BtrfsError> {
+        fn register(&self, path: &Path, read_only: bool) -> Result<(), BtrfsError> {
             let k = key(path)?;
             let mut next = self.next.lock().unwrap();
             *next += 1;
-            self.subvolumes.lock().unwrap().insert(k, 256 + *next);
+            self.subvolumes.lock().unwrap().insert(k, (256 + *next, read_only));
             Ok(())
         }
-    }
 
-    impl Backend for Fake {
-        fn filesystem(&self, root: &Path) -> Result<FsId, BtrfsError> {
-            kn_btrfs::open_dir(root)?;
-            Ok(FsId([7; 16]))
-        }
-
-        fn create(&self, path: &Path) -> Result<(), BtrfsError> {
-            kn_btrfs::open_dir(path.parent().unwrap())?;
-            std::fs::create_dir(path).map_err(io("creating", path))?;
-            self.register(path)
-        }
-
-        fn snapshot(&self, source: &Path, dest: &Path) -> Result<(), BtrfsError> {
+        fn copy(&self, source: &Path, dest: &Path, read_only: bool) -> Result<(), BtrfsError> {
             self.inspect(source)?;
             let name = dest.file_name().unwrap().to_string_lossy().into_owned();
             if self.fail_snapshots.lock().unwrap().contains(&name) {
@@ -459,7 +505,28 @@ pub mod fake {
             std::fs::create_dir(dest).map_err(io("snapshotting into", dest))?;
             copy_tree(source, dest).map_err(io("snapshotting into", dest))?;
             self.snapshots.lock().unwrap().push((source.into(), dest.into()));
-            self.register(dest)
+            self.register(dest, read_only)
+        }
+    }
+
+    impl Backend for Fake {
+        fn filesystem(&self, root: &Path) -> Result<FsId, BtrfsError> {
+            kn_btrfs::open_dir(root)?;
+            Ok(FsId([7; 16]))
+        }
+
+        fn create(&self, path: &Path) -> Result<(), BtrfsError> {
+            kn_btrfs::open_dir(path.parent().unwrap())?;
+            std::fs::create_dir(path).map_err(io("creating", path))?;
+            self.register(path, false)
+        }
+
+        fn snapshot(&self, source: &Path, dest: &Path) -> Result<(), BtrfsError> {
+            self.copy(source, dest, false)
+        }
+
+        fn snapshot_read_only(&self, source: &Path, dest: &Path) -> Result<(), BtrfsError> {
+            self.copy(source, dest, true)
         }
 
         fn destroy(&self, path: &Path) -> Result<(), BtrfsError> {
@@ -473,10 +540,10 @@ pub mod fake {
         fn inspect(&self, path: &Path) -> Result<Subvolume, BtrfsError> {
             let k = key(path)?;
             match self.subvolumes.lock().unwrap().get(&k) {
-                Some(id) => Ok(Subvolume {
+                Some((id, read_only)) => Ok(Subvolume {
                     id: *id,
                     fs: FsId([7; 16]),
-                    read_only: false,
+                    read_only: *read_only,
                 }),
                 None => Err(BtrfsError::NotSubvolume(path.into())),
             }

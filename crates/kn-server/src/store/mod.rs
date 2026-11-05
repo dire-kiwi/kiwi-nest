@@ -51,6 +51,11 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: MIGRATION_2,
         then: Some(nests::backfill),
     },
+    // 3: backups: whether scheduled backups include an app, and the backup an app or volume was restored from.
+    Migration {
+        sql: MIGRATION_3,
+        then: None,
+    },
 ];
 
 const MIGRATION_1: &str = r#"
@@ -161,6 +166,13 @@ const MIGRATION_2: &str = r#"
     ALTER TABLE volumes ADD COLUMN nest TEXT;
     CREATE INDEX apps_by_nest ON apps (nest);
     CREATE INDEX volumes_by_nest ON volumes (nest);
+    "#;
+
+const MIGRATION_3: &str = r#"
+    ALTER TABLE apps ADD COLUMN backups INTEGER NOT NULL DEFAULT 1;
+    -- `{"target": …, "key": …}`, given with `--restore`; the node only uses it on the app's first deploy.
+    ALTER TABLE apps ADD COLUMN restore TEXT;
+    ALTER TABLE volumes ADD COLUMN restore TEXT;
     "#;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;

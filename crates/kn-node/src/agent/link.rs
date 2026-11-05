@@ -160,6 +160,18 @@ impl Link {
         Ok(())
     }
 
+    /// The server's backup targets, with their credentials.
+    pub async fn backup_targets(&self) -> Result<Vec<kn_proto::backup::TargetConfig>, LinkError> {
+        let resp = self
+            .http
+            .get(format!("{}/agent/backup-targets", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await?;
+        Ok(check(resp).await?.json().await?)
+    }
+
     pub async fn result(&self, id: u64, result: &CommandResult) -> Result<(), LinkError> {
         let resp = self
             .http

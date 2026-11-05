@@ -16,7 +16,9 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use kn_proto::api::{
     AppInfo, AppSummary, DeleteQuery, DeployDirectory, DeployQuery, ErrorBody, LogsQuery, VersionInfo, VolumeInfo,
+    VolumeQuery,
 };
+use kn_proto::backup::{BackupInfo, BackupQuery, BackupResult, Kind, ListQuery};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdout};
 use tokio_util::io::ReaderStream;
@@ -109,6 +111,9 @@ pub fn router(apps: Apps) -> Router {
             get(volume_inspect).put(volume_create).delete(volume_delete),
         )
         .route(&format!("{p}/volumes/{{name}}/data"), put(volume_load))
+        .route(&format!("{p}/backups"), get(backup_list))
+        .route(&format!("{p}/backups/apps/{{name}}"), post(backup_app))
+        .route(&format!("{p}/backups/volumes/{{name}}"), post(backup_volume))
         .route(
             &format!("{p}/volumes/{{name}}/snapshots/{{app}}"),
             delete_route(volume_delete_snapshot),
@@ -274,8 +279,43 @@ async fn volume_inspect(State(apps): State<Apps>, Path(name): Path<String>) -> A
     Ok(axum::Json(apps.volume_info(&name).await?))
 }
 
-async fn volume_create(State(apps): State<Apps>, Path(name): Path<String>) -> ApiResult<Response> {
-    Ok((StatusCode::CREATED, axum::Json(apps.volume_create(&name).await?)).into_response())
+async fn volume_create(
+    State(apps): State<Apps>,
+    Path(name): Path<String>,
+    Query(q): Query<VolumeQuery>,
+) -> ApiResult<Response> {
+    let restore = match &q.restore {
+        Some(key) => Some(apps.resolve_restore(Kind::Volume, key, q.target.as_deref()).await?),
+        None => None,
+    };
+    let info = apps.volume_create_from(&name, restore.as_ref()).await?;
+    Ok((StatusCode::CREATED, axum::Json(info)).into_response())
+}
+
+async fn backup_list(State(apps): State<Apps>, Query(q): Query<ListQuery>) -> ApiResult<axum::Json<Vec<BackupInfo>>> {
+    Ok(axum::Json(apps.backup_list(&q).await?))
+}
+
+async fn backup_app(
+    State(apps): State<Apps>,
+    Path(name): Path<String>,
+    Query(q): Query<BackupQuery>,
+) -> ApiResult<axum::Json<BackupResult>> {
+    Ok(axum::Json(
+        apps.backup(Kind::App, &name, &q.target.into_iter().collect::<Vec<_>>(), q.full)
+            .await?,
+    ))
+}
+
+async fn backup_volume(
+    State(apps): State<Apps>,
+    Path(name): Path<String>,
+    Query(q): Query<BackupQuery>,
+) -> ApiResult<axum::Json<BackupResult>> {
+    Ok(axum::Json(
+        apps.backup(Kind::Volume, &name, &q.target.into_iter().collect::<Vec<_>>(), q.full)
+            .await?,
+    ))
 }
 
 async fn volume_load(
@@ -330,9 +370,14 @@ async fn deploy(
         }
         Received::Dir(dir) => apps.stage_dir(dir).await?,
     };
+    let restore = match &q.restore {
+        Some(key) => Some(apps.resolve_restore(Kind::App, key, q.target.as_deref()).await?),
+        None => None,
+    };
     let opts = DeployOptions {
         create_only: q.create_only,
         from: q.from,
+        restore,
         generation: None,
     };
     Ok(axum::Json(apps.deploy(&name, staged, opts).await?))

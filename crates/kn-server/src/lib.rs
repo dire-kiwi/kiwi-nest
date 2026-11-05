@@ -7,17 +7,20 @@
 //! - [`scheduler`] places new nests on nodes.
 //! - [`hub`] is what's only in memory: which nodes are online, waking polls, and callers waiting for results.
 //! - [`api`] is the API for the CLI, and [`agent`] the link for nodes.
+//! - [`backups`] is the backup targets, the schedule, and backups (and restores) of the server's own state.
 //!
 //! On disk:
 //!
 //! ```text
 //! STATE/server.sqlite   the database (WAL mode)
 //! STATE/bundles/        bundles by digest; see [`bundles`]
+//! STATE/bundles/tmp/    uploads being checked, and the server's state being copied for a backup
 //! ```
 
 pub mod agent;
 pub mod api;
 pub mod auth;
+pub mod backups;
 pub mod bundles;
 pub mod error;
 pub mod hub;
@@ -62,6 +65,12 @@ pub struct ServerConfig {
     pub load_limits: Limits,
     /// How placement counts memory.
     pub scheduler: scheduler::Settings,
+    /// Where backups go: handed to nodes, and used for the server's own.
+    pub backup_targets: Vec<kn_proto::backup::TargetConfig>,
+    /// How often the schedule looks for backups that are due.
+    pub backup_check_interval: Duration,
+    /// How long a backup on a node may take before its caller gives up (the node carries on).
+    pub backup_timeout: Duration,
 }
 
 impl ServerConfig {
@@ -74,6 +83,9 @@ impl ServerConfig {
             limits: Limits::default(),
             load_limits: Limits::for_volumes(),
             scheduler: scheduler::Settings::default(),
+            backup_targets: Vec::new(),
+            backup_check_interval: Duration::from_secs(60),
+            backup_timeout: Duration::from_secs(6 * 3600),
         }
     }
 }
@@ -87,6 +99,7 @@ pub struct Inner {
     pub store: Store,
     pub bundles: Arc<Bundles>,
     pub hub: Arc<Hub>,
+    pub backups: Arc<backups::Backups>,
     /// Cancelled when the server shuts down, so open polls answer at once.
     pub stop: CancellationToken,
 }
@@ -104,7 +117,8 @@ impl Server {
     /// token and returns it: the only time it's shown.
     pub async fn open(cfg: ServerConfig) -> anyhow::Result<(Server, Option<String>)> {
         std::fs::create_dir_all(&cfg.state_dir).with_context(|| format!("creating {}", cfg.state_dir.display()))?;
-        let store = Store::open(&cfg.state_dir.join("server.sqlite"))?;
+        let backups = Arc::new(backups::Backups::new(cfg.backup_targets.clone()).context("the backup targets")?);
+        let store = Store::open(&cfg.state_dir.join(backups::DATABASE))?;
         let bundles = Arc::new(Bundles::open(cfg.state_dir.join("bundles"))?);
         let hub = Arc::new(Hub::new(cfg.offline_after));
         let b = bundles.clone();
@@ -130,6 +144,7 @@ impl Server {
             store,
             bundles,
             hub,
+            backups,
             stop: CancellationToken::new(),
         }));
         Ok((server, first))
@@ -152,6 +167,11 @@ impl Server {
 
     /// Runs a command on a node and waits for its outcome. Refused at once if the node is offline.
     pub async fn command(&self, node_id: u64, node: &str, action: Action) -> Result<Outcome> {
+        self.command_with(node_id, node, action, self.cfg.command_timeout).await
+    }
+
+    /// [`Server::command`], waiting up to `timeout`.
+    pub async fn command_with(&self, node_id: u64, node: &str, action: Action, timeout: Duration) -> Result<Outcome> {
         if !self.hub.is_online(node_id) {
             return Err(Error::Offline(format!("node `{node}` is offline")));
         }
@@ -179,7 +199,7 @@ impl Server {
             }
         };
         let outcome = tokio::select! {
-            r = tokio::time::timeout(self.cfg.command_timeout, rx) => r,
+            r = tokio::time::timeout(timeout, rx) => r,
             _ = offline => {
                 return Err(Error::Offline(format!("node `{node}` went offline before answering")));
             }
@@ -229,6 +249,7 @@ pub async fn serve(
             stop.cancel();
         }
     });
+    tokio::spawn(backups::schedule(server.clone(), stop.clone()));
     let router = server.router();
     let graceful = axum::serve(listener, router).with_graceful_shutdown(stop.clone().cancelled_owned());
     tokio::select! {

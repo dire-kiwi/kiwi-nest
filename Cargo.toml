@@ -32,7 +32,7 @@ getrandom = "0.3"
 # TLS through rustls with ring (installed as the process's provider), so the static musl builds need no C toolchain
 # beyond what ring's own build uses.
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls-no-provider"] }
-rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
+rusqlite = { version = "0.40", features = ["backup", "bundled", "fallible_uint"] }
 rusty-s3 = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }

@@ -11,6 +11,7 @@
 //! | `POST /agent/poll` | [`PollRequest`] | [`PollResponse`], once something changed or the wait is over |
 //! | `POST /agent/report` | [`Report`] | `204 No Content`, at once |
 //! | `GET /agent/bundles/{digest}` | | the bundle's ZIP |
+//! | `GET /agent/backup-targets` | | `Vec<`[`crate::backup::TargetConfig`]`>`: the server's targets, secrets included |
 //! | `POST /agent/commands/{id}/result` | [`CommandResult`] | `204 No Content` |
 //! | `POST /agent/commands/{id}/output` | the command's output, streamed | `204 No Content` |
 //!
@@ -38,6 +39,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{ErrorBody, LogsQuery, VolumeInfo};
+use crate::backup::{Kind, Restore};
 use crate::state::AppStatus;
 
 /// The version of the agent link that this build speaks.
@@ -225,6 +227,9 @@ pub enum AppWant {
         /// The shared volumes it mounts, which must be in place first.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         shared: Vec<String>,
+        /// On the app's first deploy, restore its volumes from this backup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore: Option<Restore>,
     },
     /// Delete the app.
     Delete {
@@ -249,6 +254,9 @@ pub enum VolumeWant {
     Present {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data_digest: Option<String>,
+        /// When it's created: its data, restored from this backup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore: Option<Restore>,
     },
     Delete,
 }
@@ -275,6 +283,16 @@ pub enum Action {
     VolumeInfo { name: String },
     /// Answers with `null`.
     DeleteSnapshot { name: String, app: String },
+    /// Backs up an app or a shared volume to the targets named (every target, if none is); answers with a
+    /// [`crate::backup::BackupResult`].
+    Backup {
+        what: Kind,
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        targets: Vec<String>,
+        #[serde(default)]
+        full: bool,
+    },
 }
 
 impl Action {
@@ -284,7 +302,7 @@ impl Action {
             Action::Inspect { app } | Action::Logs { app, .. } | Action::Suspend { app } | Action::Resume { app } => {
                 app
             }
-            Action::VolumeInfo { name } | Action::DeleteSnapshot { name, .. } => name,
+            Action::VolumeInfo { name } | Action::DeleteSnapshot { name, .. } | Action::Backup { name, .. } => name,
         }
     }
 }
@@ -333,6 +351,7 @@ mod tests {
                 bundle_digest: "sha256:ab".into(),
                 from: None,
                 shared: vec![],
+                restore: None,
             },
         };
         let json = serde_json::to_value(&c).unwrap();

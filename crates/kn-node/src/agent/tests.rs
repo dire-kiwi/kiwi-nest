@@ -553,6 +553,7 @@ async fn a_change_replaced_by_a_later_one_wakes_whoever_waits_on_it() {
                 bundle_digest: format!("sha256:{}", "0".repeat(64)),
                 from: None,
                 shared: shared.iter().map(|s| s.to_string()).collect(),
+                restore: None,
             },
         })
     };
@@ -565,7 +566,10 @@ async fn a_change_replaced_by_a_later_one_wakes_whoever_waits_on_it() {
             name: "v".into(),
             generation: 1,
             seq: 5,
-            want: VolumeWant::Present { data_digest: None },
+            want: VolumeWant::Present {
+                data_digest: None,
+                restore: None,
+            },
         }),
     );
     tokio::time::sleep(Duration::from_millis(300)).await;
