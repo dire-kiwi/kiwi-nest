@@ -1,4 +1,4 @@
-//! Records the git commit the binary is built from, for `kiwi-nest version`.
+//! Records the git commit the binary is built from, for `kiwi-nest version`, and the target it's built for.
 //!
 //! `KIWI_NEST_COMMIT` overrides it, for builds outside a git checkout.
 
@@ -36,4 +36,7 @@ fn main() {
         }
     };
     println!("cargo:rustc-env=KN_GIT_COMMIT={commit}");
+    // The target this is built for, such as x86_64-unknown-linux-musl, which names release files.
+    let target = std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+    println!("cargo:rustc-env=KN_TARGET={target}");
 }

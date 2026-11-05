@@ -15,6 +15,7 @@ kn-node = { path = "crates/kn-node" }
 kn-btrfs = { path = "crates/kn-btrfs" }
 kn-backup = { path = "crates/kn-backup" }
 kn-cli = { path = "crates/kn-cli" }
+kn-install = { path = "crates/kn-install" }
 kn-server = { path = "crates/kn-server" }
 
 anyhow = "1"

@@ -4,6 +4,7 @@
 //! - [`agent`]: the link between nodes and the server: polls, reports, desired state and commands.
 //! - [`backup`]: backup targets' configuration, and the backup routes' requests and answers.
 //! - [`state`]: what a node has applied, as it reports it.
+//! - [`version`]: release versions, and comparing them.
 //!
 //! The API is versioned by its path prefix ([`API_PREFIX`]), so a newer side can keep serving an older one.
 
@@ -11,6 +12,7 @@ pub mod agent;
 pub mod api;
 pub mod backup;
 pub mod state;
+pub mod version;
 
 /// The path prefix of every API route in this version.
 pub const API_PREFIX: &str = "/v1";
@@ -23,3 +25,9 @@ pub const GIT_COMMIT: &str = env!("KN_GIT_COMMIT");
 
 /// `VERSION (commit COMMIT)`, as printed by `kiwi-nest version`.
 pub const LONG_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (commit ", env!("KN_GIT_COMMIT"), ")");
+
+/// The target this build is for, such as `x86_64-unknown-linux-musl`, as release files are named.
+pub const TARGET: &str = env!("KN_TARGET");
+
+/// The repository releases are published in, on GitHub.
+pub const REPOSITORY: &str = "dire-kiwi/kiwi-nest";

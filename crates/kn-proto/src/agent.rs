@@ -14,6 +14,7 @@
 //! | `POST /agent/report` | [`Report`] | `204 No Content`, at once |
 //! | `GET /agent/bundles/{digest}` | | the bundle's ZIP |
 //! | `GET /agent/backup-targets` | | `Vec<`[`crate::backup::TargetConfig`]`>`: the server's targets, secrets included |
+//! | `GET /agent/releases/{version}/{arch}` | | the server's release of kiwi-nest for an architecture, for [`Action::Upgrade`] |
 //! | `POST /agent/commands/{id}/result` | [`CommandResult`] | `204 No Content` |
 //! | `POST /agent/commands/{id}/output` | the command's output, streamed | `204 No Content` |
 //!
@@ -47,8 +48,9 @@ use crate::state::AppStatus;
 /// The version of the agent link that this build speaks. Version 2 added backups: [`Action::Backup`], restores in
 /// [`AppWant::Deploy`] and [`VolumeWant::Present`], `GET /agent/backup-targets`, and [`NodeFacts::protocol`]. Version 3
 /// added the image registry: [`JoinResponse::registry`], `POST /agent/registry`, [`AppReport::starting`] and
-/// [`Action::PruneImages`].
-pub const PROTOCOL: u32 = 3;
+/// [`Action::PruneImages`]. Version 4 added upgrades: [`Action::Upgrade`], `GET /agent/releases/…` and
+/// [`NodeFacts::self_upgrade`].
+pub const PROTOCOL: u32 = 4;
 
 /// The first version with backups: a server sends a node older than this no backup command and no restore (an
 /// older node would ignore the restore, and deploy the app empty).
@@ -57,6 +59,10 @@ pub const BACKUPS_PROTOCOL: u32 = 2;
 /// The first version with the image registry: a server sends a node older than this no [`Action::PruneImages`]
 /// (it couldn't read it). Such a node has no registry credential, and doesn't say when an app is starting.
 pub const REGISTRY_PROTOCOL: u32 = 3;
+
+/// The first version with upgrades: a server offers its release to a node older than this never (it couldn't read
+/// [`Action::Upgrade`]); such a node is upgraded by hand, with `kiwi-nest upgrade` on it.
+pub const UPGRADE_PROTOCOL: u32 = 4;
 
 /// The oldest version a server built from this code still serves.
 pub const OLDEST_PROTOCOL: u32 = 1;
@@ -147,6 +153,10 @@ pub struct NodeFacts {
     /// The version of the agent link it speaks ([`PROTOCOL`]); 0 from a node of version 1, which didn't say.
     #[serde(default)]
     pub protocol: u32,
+    /// It runs from an installed release (`kiwi-nest node join`), so it can take [`Action::Upgrade`]: download
+    /// a release, swap it in and restart.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub self_upgrade: bool,
 }
 
 /// A filesystem's size and free space.
@@ -346,6 +356,11 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grace_secs: Option<u64>,
     },
+    /// Upgrades the node to the server's release: it downloads it (`GET /agent/releases/{version}/{arch}`), checks
+    /// its size and SHA-256 and that it runs, installs it beside the releases it has, and answers with an
+    /// [`UpgradeAnswer`]; then it waits for the changes it's applying, swaps the release in and restarts into it.
+    /// Its apps keep running meanwhile.
+    Upgrade { version: String, sha256: String, size: u64 },
     /// Backs up an app or a shared volume to the targets named (every target, if none is); answers with a
     /// [`crate::backup::BackupResult`].
     Backup {
@@ -366,9 +381,18 @@ impl Action {
                 app
             }
             Action::VolumeInfo { name } | Action::DeleteSnapshot { name, .. } | Action::Backup { name, .. } => name,
-            Action::PruneImages { .. } => "",
+            Action::PruneImages { .. } | Action::Upgrade { .. } => "",
         }
     }
+}
+
+/// What a node answers [`Action::Upgrade`] with, before it restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradeAnswer {
+    /// The version it's restarting into.
+    pub version: String,
+    /// Whether it's restarting (it isn't if it already runs that version).
+    pub restarting: bool,
 }
 
 /// `POST /agent/commands/{id}/result`.
