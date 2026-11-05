@@ -673,6 +673,9 @@ async fn the_ingress_listener_takes_only_requests_with_the_token() {
                     ("x-forwarded-for", "203.0.113.7"),
                     ("x-forwarded-proto", "https"),
                     ("x-forwarded-host", "blog.test"),
+                    ("x-real-ip", "10.0.0.1"),
+                    ("forwarded", "for=10.0.0.1"),
+                    ("x-forwarded-port", "1"),
                 ],
             ),
         )
@@ -682,6 +685,12 @@ async fn the_ingress_listener_takes_only_requests_with_the_token() {
     assert!(!r.body.contains(INGRESS_TOKEN), "{}", r.body);
     assert!(r.body.contains("x-forwarded-for: 203.0.113.7\n"), "{}", r.body);
     assert!(r.body.contains("x-forwarded-proto: https\n"), "{}", r.body);
+    // Those the ingress doesn't set came from the client, so they're removed.
+    assert!(
+        !r.body.contains("x-real-ip") && !r.body.contains("forwarded:") && !r.body.contains("x-forwarded-port"),
+        "{}",
+        r.body
+    );
     assert_eq!(env.starts("blog"), 1);
     // An unknown host still gets 404.
     let r = env.send_to(env.ingress, headers_request("other.test", &[token])).await;
@@ -748,4 +757,18 @@ async fn a_websocket_through_the_ingress_listener_needs_the_token_and_works_with
     }
     assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 101"));
     echo(&mut s, b"through the ingress").await;
+}
+
+#[test]
+fn an_empty_ingress_token_admits_nobody() {
+    let access = super::Access::Ingress("".into());
+    let mut req = Request::get("/").header("kiwi-nest-ingress", "").body(()).unwrap();
+    assert_eq!(super::admit(&access, &mut req), super::Admitted::Refused);
+    let access = super::Access::Ingress(INGRESS_TOKEN.into());
+    let mut req = Request::get("/")
+        .header("kiwi-nest-ingress", INGRESS_TOKEN)
+        .body(())
+        .unwrap();
+    assert_eq!(super::admit(&access, &mut req), super::Admitted::FromIngress);
+    assert!(!req.headers().contains_key("kiwi-nest-ingress"));
 }

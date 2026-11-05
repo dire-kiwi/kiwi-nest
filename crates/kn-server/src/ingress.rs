@@ -38,6 +38,14 @@ use crate::error::Result;
 /// old configuration's handler closes it. Every change in the cluster reloads Caddy, so this is long.
 pub const STREAM_CLOSE_DELAY: &str = "24h";
 
+/// How long Caddy keeps an idle connection to a gateway: less than the gateway's 30 seconds for a request's headers,
+/// so Caddy never sends a request on a connection the gateway is closing.
+pub const UPSTREAM_IDLE_TIMEOUT: &str = "20s";
+
+/// Forwarding headers Caddy passes on as the client sent them (it sets only `X-Forwarded-For`, `-Proto` and
+/// `-Host`): removed, so an app can't be fooled by them.
+const UNTRUSTED_FORWARDING: [&str; 3] = ["Forwarded", "X-Forwarded-Port", "X-Real-IP"];
+
 /// The name of the HTTP server in Caddy's configuration.
 const SERVER_NAME: &str = "kiwi-nest";
 
@@ -244,8 +252,30 @@ pub fn routes(c: &Connection) -> Result<(Vec<Route>, Vec<String>)> {
     Ok((routes, warnings))
 }
 
+/// Why the ingress mustn't proxy to `upstream`, if it mustn't: it's Caddy's own admin API or the server's API, which
+/// a node could otherwise point an app's domain at by reporting that address.
+pub fn forbidden_upstream(upstream: SocketAddr, admin_listen: &str, api: SocketAddr) -> Option<&'static str> {
+    let admin = admin_listen.rsplit_once(':').and_then(|(host, port)| {
+        let port: u16 = port.parse().ok()?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        Some((host.parse::<IpAddr>().ok(), host == "localhost", port))
+    });
+    let is_admin = admin.is_some_and(|(ip, localhost, port)| {
+        upstream.port() == port && (ip == Some(upstream.ip()) || (localhost && upstream.ip().is_loopback()))
+    });
+    if is_admin {
+        Some("Caddy's admin API")
+    } else if upstream == api
+        || (upstream.port() == api.port() && upstream.ip().is_loopback() && api.ip().is_loopback())
+    {
+        Some("the server's API")
+    } else {
+        None
+    }
+}
+
 /// Caddy's whole configuration: the admin API at `admin_listen`, the server's API at `api` (if it has a domain),
-/// and `routes`.
+/// and `routes` (bar any whose upstream is [`forbidden_upstream`]).
 pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, routes: &[Route]) -> Value {
     let mut handlers = Vec::new();
     if let Some(domain) = &cfg.api_domain {
@@ -262,7 +292,9 @@ pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, ro
         }));
     }
     for r in routes {
-        if cfg.api_domain.as_deref() == Some(r.domain.as_str()) {
+        if cfg.api_domain.as_deref() == Some(r.domain.as_str())
+            || forbidden_upstream(r.upstream, admin_listen, api).is_some()
+        {
             continue;
         }
         let mut handle = Vec::new();
@@ -287,7 +319,11 @@ pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, ro
         handle.push(json!({
             "handler": "reverse_proxy",
             "upstreams": [{ "dial": r.upstream.to_string() }],
-            "headers": { "request": { "set": { INGRESS_HEADER: [r.token] } } },
+            "headers": { "request": {
+                "set": { INGRESS_HEADER: [r.token] },
+                "delete": UNTRUSTED_FORWARDING,
+            } },
+            "transport": { "protocol": "http", "keep_alive": { "idle_timeout": UPSTREAM_IDLE_TIMEOUT } },
             "flush_interval": -1,
             "stream_close_delay": STREAM_CLOSE_DELAY,
         }));
@@ -495,7 +531,15 @@ impl Ingress {
         let mut last_routes = None;
         loop {
             match server.store.call(|c| routes(c)).await {
-                Ok((routes, warnings)) => {
+                Ok((routes, mut warnings)) => {
+                    for r in &routes {
+                        if let Some(what) = forbidden_upstream(r.upstream, &self.admin_listen, api) {
+                            warnings.push(format!(
+                                "`{}` isn't routed: its node reported {what}'s address as its ingress address",
+                                r.domain
+                            ));
+                        }
+                    }
                     for w in warnings.iter().filter(|w| !warned.contains(w)) {
                         tracing::warn!("{w}");
                     }

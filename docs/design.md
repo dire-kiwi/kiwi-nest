@@ -345,9 +345,11 @@ VOLUMES/                         one btrfs filesystem per node
 - **Routing.** The Host is compared case-insensitively, without its port or a trailing dot. The method, path, query,
   headers (bar hop-by-hop ones) and body are passed on unchanged, Host included; HTTP/1.1 upgrades such as WebSockets
   become a byte stream between the client and the app. Unknown hosts get 404.
-- **Forwarding headers** (`X-Forwarded-For`, `-Proto`, `-Host`, `-Port`, `Forwarded`, `X-Real-IP`) are passed on
-  only from requests that carried the ingress token, since the ingress sets them. On any other request they're
-  replaced with what the gateway saw: the peer's address, `http`, and the Host.
+- **Forwarding headers.** `X-Forwarded-For`, `-Proto` and `-Host` are passed on only from requests that carried the
+  ingress token, since the ingress sets them (Caddy replaces a client's unless it comes from a `--trusted-proxy`).
+  On any other request they're replaced with what the gateway saw: the peer's address, `http`, and the Host.
+  `Forwarded`, `X-Forwarded-Port` and `X-Real-IP`, which Caddy would pass on as the client sent them, are removed
+  by both the ingress and the gateway.
 - **A request to a stopped app starts it.** Concurrent requests share one start, which checks the app's mounts (as
   before every start), runs `docker compose start` (or `up`, if some containers are missing) and waits for healthchecks and a TCP connection. A browser page load
   that isn't ready after about a second gets a small "starting" page, which reloads itself when the app is up or
@@ -403,7 +405,10 @@ VOLUMES/                         one btrfs filesystem per node
   ingress token set in `Kiwi-Nest-Ingress` (replacing any a client sent). Moving an app changes one upstream; DNS
   doesn't change. Responses are flushed as they come (streams, server-sent events), and WebSockets pass through.
   Every change in the cluster reloads Caddy, and a reload closes the old configuration's upgraded connections, so
-  they're given a long `stream_close_delay` (24 hours). An app is routed while it's active; its route goes when its
+  they're given a long `stream_close_delay` (24 hours). So a WebSocket opened before a redeploy that removes a
+  basic-auth user can stay open for up to a day; a delete still cuts it off at the gateway. Caddy lets go of idle
+  connections to a gateway after 20 seconds, before the gateway's 30-second limit for a request's headers closes
+  them. An app is routed while it's active; its route goes when its
   delete is saved. One whose node hasn't reported an ingress address, or whose basic-auth users aren't known (see
   below), isn't routed, and the server logs why. Unknown hosts get 404 from Caddy itself (over HTTPS, a host with
   no certificate fails the handshake instead).
@@ -691,5 +696,9 @@ flowchart LR
 - **Caddy's admin API.** It listens on loopback without authentication, as Caddy's does, so anything running on the
   server's host can read the configuration (the nodes' ingress tokens, the bcrypt hashes) and change it. The
   server's host is expected to run nothing else untrusted. Caddy keeps the configuration only in memory.
+- **Nodes choose their ingress address.** The ingress dials whatever address a node reports, so a compromised node
+  could point its apps' domains at another service the server's host or the private network can reach. Routes to
+  Caddy's admin API and the server's own API are refused (and logged); anything else is trusted, as nodes are (see
+  the non-goals).
 - **Crash-consistent snapshots.** `--from` and backups capture data like a power cut. That's fine for SQLite and
   PostgreSQL; an app that can't recover from a crash would need a dump hook (Later).

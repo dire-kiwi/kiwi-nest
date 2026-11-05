@@ -92,6 +92,13 @@ fn routes_go_to_each_node_with_its_token_and_unknown_hosts_get_404() {
     );
     assert_eq!(h[0]["flush_interval"], -1);
     assert_eq!(h[0]["stream_close_delay"], STREAM_CLOSE_DELAY);
+    // Forwarding headers Caddy doesn't set itself would come from the client: they're removed.
+    assert_eq!(
+        h[0]["headers"]["request"]["delete"],
+        json!(["Forwarded", "X-Forwarded-Port", "X-Real-IP"])
+    );
+    // Idle connections are let go before the gateway would close them.
+    assert_eq!(h[0]["transport"]["keep_alive"]["idle_timeout"], UPSTREAM_IDLE_TIMEOUT);
 
     // An app with auth: Caddy checks it first, with bcrypt and its cache.
     let h = handlers(&config, "blog-pr1.example.com");
@@ -520,4 +527,27 @@ async fn a_changed_certificates_folder_forces_a_reload() {
     );
     assert_eq!(loads[0].0, loads[1].0);
     stop.cancel();
+}
+
+#[test]
+fn a_node_cant_point_an_app_at_caddys_admin_api_or_the_servers_api() {
+    let c = cfg(Tls::Internal);
+    let config = generate(
+        &c,
+        &[
+            route("admin.test", "127.0.0.1:2019", false),
+            route("api.test", "127.0.0.1:7400", false),
+            route("ok.test", "127.0.0.1:7382", false),
+        ],
+    );
+    let text = config.to_string();
+    assert!(!text.contains("admin.test") && !text.contains("api.test"), "{text}");
+    assert!(text.contains("ok.test"));
+    let api = api();
+    let up = |s: &str| s.parse::<SocketAddr>().unwrap();
+    assert!(forbidden_upstream(up("127.0.0.1:2019"), "127.0.0.1:2019", api).is_some());
+    assert!(forbidden_upstream(up("[::1]:2019"), "localhost:2019", api).is_some());
+    assert!(forbidden_upstream(up("127.0.0.2:7400"), "127.0.0.1:2019", api).is_some());
+    assert!(forbidden_upstream(up("10.0.0.5:2019"), "127.0.0.1:2019", api).is_none());
+    assert!(forbidden_upstream(up("10.0.0.5:7400"), "127.0.0.1:2019", api).is_none());
 }

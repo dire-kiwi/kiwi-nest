@@ -18,8 +18,9 @@
 //!   on the node's private address for the ingress ([`Access`]). There every request must carry the node's ingress
 //!   token in [`INGRESS_HEADER`], or it's refused with `403` before anything else, so a machine on the private
 //!   network can't skip the ingress's basic auth or wake an app. The token is removed before the request goes on.
-//!   Forwarding headers (`X-Forwarded-For` and the like) are passed on only from requests that carried the token,
-//!   since the ingress sets them; on any other request they're replaced with what the gateway saw.
+//!   `X-Forwarded-For`, `-Proto` and `-Host` are passed on only from requests that carried the token, since the
+//!   ingress sets them; on any other request they're replaced with what the gateway saw. `Forwarded`,
+//!   `X-Forwarded-Port` and `X-Real-IP`, which the ingress doesn't set, are always removed.
 
 pub mod gate;
 pub mod pages;
@@ -75,6 +76,14 @@ const FORWARDING: [HeaderName; 6] = [
     HeaderName::from_static("x-real-ip"),
 ];
 
+/// Forwarding headers the ingress doesn't set, so a client's would get through it: removed even from the ingress's
+/// requests.
+const NOT_SET_BY_INGRESS: [HeaderName; 3] = [
+    HeaderName::from_static("forwarded"),
+    HeaderName::from_static("x-forwarded-port"),
+    HeaderName::from_static("x-real-ip"),
+];
+
 /// Who may use a listener of the gateway.
 #[derive(Clone)]
 pub enum Access {
@@ -107,7 +116,7 @@ fn admit<B>(access: &Access, req: &mut Request<B>) -> Admitted {
     };
     match access {
         Access::Ingress(token) => match given.as_slice() {
-            [one] if same(one.as_bytes(), token.as_bytes()) => Admitted::FromIngress,
+            [one] if !token.is_empty() && same(one.as_bytes(), token.as_bytes()) => Admitted::FromIngress,
             _ => Admitted::Refused,
         },
         Access::Local => Admitted::Local,
@@ -164,7 +173,11 @@ pub async fn serve(
                 let (apps, access) = (apps.clone(), access.clone());
                 async move {
                     match admit(&access, &mut req) {
-                        Admitted::FromIngress => {}
+                        Admitted::FromIngress => {
+                            for name in &NOT_SET_BY_INGRESS {
+                                req.headers_mut().remove(name);
+                            }
+                        }
                         Admitted::Local => own_forwarding(&mut req, peer),
                         Admitted::Refused => {
                             return Ok::<_, Infallible>(text(

@@ -274,6 +274,9 @@ impl Agent {
                 .ingress_token()
                 .await
                 .with_context(|| format!("getting this node's ingress token from {}", cfg.server))?;
+            if t.is_empty() {
+                anyhow::bail!("the server gave this node an empty ingress token");
+            }
             file.ingress_token = Some(t);
             let bytes = serde_json::to_vec_pretty(&file)?;
             let p = path.clone();
