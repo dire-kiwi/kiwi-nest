@@ -31,10 +31,16 @@
 //! | `GET /whoami` | | [`WhoAmI`] |
 //! | `GET /apps/{name}/changes/{generation}?` [`WaitQuery`] | | [`ChangeStatus`] |
 //! | `GET /volumes/{name}/changes/{generation}?` [`WaitQuery`] | | [`ChangeStatus`] |
+//! | `GET /nests` | | `Vec<`[`NestInfo`]`>` |
 //! | `GET /nodes` | | `Vec<`[`NodeInfo`]`>` |
+//! | `POST /nodes/{name}/labels` | [`LabelRequest`] | [`NodeInfo`] |
+//! | `POST /nodes/{name}/cordon`, `/uncordon` | | [`NodeInfo`] |
+//! | `POST /nodes/{name}/forget?` [`ForgetQuery`] | | [`Forgot`] |
 //! | `GET /tokens` | | `Vec<`[`TokenInfo`]`>` |
 //! | `POST /tokens` | [`CreateToken`] | [`CreatedToken`] |
 //! | `DELETE /tokens/{id}` | | `204 No Content` |
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -86,9 +92,12 @@ pub struct DeleteQuery {
 /// The query of the server's `PUT /volumes/{name}`, `PUT /volumes/{name}/data` and `DELETE /volumes/{name}`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct VolumeQuery {
-    /// The node for a new volume. By default the server picks one.
+    /// The node for a new volume's new nest. By default the server picks one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// The nest of a new volume; by default, a nest named after the volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nest: Option<String>,
     /// Save the change even if the volume's node is offline.
     #[serde(default)]
     pub queue: bool,
@@ -102,6 +111,12 @@ pub struct Accepted {
     pub generation: u64,
     /// Whether the node is online; if it isn't, the change waits for it (`--queue`).
     pub node_online: bool,
+    /// The app's or volume's nest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nest: Option<String>,
+    /// Saved anyway, but worth knowing, such as that the nest's node is out of memory headroom.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// The query of `GET …/changes/{generation}`.
@@ -168,6 +183,9 @@ pub struct AppSummary {
     /// Server only: the node it's on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// Server only: its nest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nest: Option<String>,
     /// Server only: a generation saved on the server that the node hasn't applied yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<u64>,
@@ -215,6 +233,13 @@ pub struct AppInfo {
     /// Server only: the node it's on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// Server only: its nest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nest: Option<String>,
+    /// Server only: how it came to be in its nest, and why the nest's node was chosen, such as `through --from
+    /// blog; nest blog went to node a when blog was deployed: the most memory headroom …`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
     /// Server only: a generation saved on the server that the node hasn't applied yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<u64>,
@@ -265,6 +290,9 @@ pub struct VolumeInfo {
     /// Server only: the node it's on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// Server only: its nest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nest: Option<String>,
     /// Server only: a generation saved on the server that the node hasn't applied yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<u64>,
@@ -289,10 +317,72 @@ pub struct NodeInfo {
     /// What it last reported about itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub facts: Option<NodeFacts>,
+    /// Cordoned: it gets no new nests (the nests on it still take new members).
+    #[serde(default)]
+    pub cordoned: bool,
+    /// Its labels for placement: those it reports (`--label`), and those set with `node label`, which win.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// The nests placed on it.
+    #[serde(default)]
+    pub nests: Vec<String>,
     /// The apps placed on it.
     pub apps: u64,
     /// The memory its apps may use: each service's `mem_limit`, or 256 MiB without one.
     pub app_memory_bytes: u64,
+    /// Its memory headroom, as placement counts it: its memory, less the reserve, the `mem_limit`s of its
+    /// always-on apps, and a share of those of its apps that idle out. Negative when it's overcommitted.
+    #[serde(default)]
+    pub headroom_bytes: i64,
+}
+
+/// A nest, in `GET /nests`: apps and shared volumes that live together on one node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NestInfo {
+    pub name: String,
+    pub node: String,
+    pub node_online: bool,
+    pub apps: Vec<String>,
+    pub volumes: Vec<String>,
+    /// What its apps may use: each service's `mem_limit`, or 256 MiB without one.
+    pub memory_bytes: u64,
+    /// Why its node was chosen when it was placed.
+    pub placement: String,
+    pub created_at: String,
+}
+
+/// `POST /nodes/{name}/labels`: labels to set and to remove (only those set with `node label`; a node's own
+/// `--label`s stay).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LabelRequest {
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// The query of `POST /nodes/{name}/forget`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForgetQuery {
+    /// Forget the node even though it's online.
+    #[serde(default)]
+    pub force: bool,
+    /// Only say what forgetting it would release, and whether it would be refused.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// What `node forget` released (or, as a dry run, would release): the names and domains of these apps, and these
+/// shared volumes and nests, all free to be used again elsewhere.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Forgot {
+    pub node: String,
+    pub online: bool,
+    pub apps: Vec<String>,
+    pub volumes: Vec<String>,
+    pub nests: Vec<String>,
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// The kinds of token.

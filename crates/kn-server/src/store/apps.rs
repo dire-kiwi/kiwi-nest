@@ -1,10 +1,16 @@
 //! Apps and shared volumes: placing them, the desired state of each node, and whether a change is done.
 //!
 //! Each change (deploy, delete, `volume create|load|delete`) is one transaction, which checks everything first and
-//! saves nothing if it refuses: the name's permission was checked by the caller; here, the node (and that it's
-//! online, unless the change is queued), the domain, `--from` and the shared volumes. A saved change bumps the node's
-//! sequence number, and the app or volume records it with its new generation. Generations of a name only ever grow,
-//! even across a delete, so a node never mistakes a new app for one it has already applied.
+//! saves nothing if it refuses: the name's permission was checked by the caller; here, the nest and its node (and
+//! that the node is online, unless the change is queued), the domain, `--from` and the shared volumes. A saved
+//! change bumps the node's sequence number, and the app or volume records it with its new generation. Generations
+//! of a name only ever grow, even across a delete, so a node never mistakes a new app for one it has already applied.
+//!
+//! **Nests.** An app's nest comes from what it's deployed with: the nest it's already in (a redeploy), its `--from`
+//! app's, each shared volume's, and `x-kiwi-nest.nest`. They must all agree, or the deploy is refused; with none of
+//! them, it's the nest named after the app. A shared volume's is `--nest`, or the one named after it. A nest that
+//! exists stays on its node, whatever that node's memory (the deploy warns when it's full); a new one is placed by
+//! the [`scheduler`], or on `--node`.
 //!
 //! A deleted app or volume stays `deleting` (keeping its name and domain) until its node reports the delete done.
 
@@ -14,10 +20,11 @@ use kn_proto::agent::{AppChange, AppWant, Outcome, Report, VolumeChange, VolumeW
 use kn_proto::api::{Accepted, ChangeStatus};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use super::nests;
 use super::nodes::{self, Node};
 use crate::bundles::{Bundles, CheckedApp};
 use crate::error::{Error, Result};
-use crate::scheduler;
+use crate::scheduler::{self, Candidate, Needs, Settings};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -52,6 +59,10 @@ pub struct AppRow {
     pub keep_data: bool,
     pub created_at: u64,
     pub updated_at: u64,
+    pub nest: Option<String>,
+    /// How it came to be in its nest, such as `through --from blog`.
+    pub nest_via: String,
+    pub idle_timeout_secs: u64,
 }
 
 /// A shared volume as the server records it.
@@ -65,10 +76,11 @@ pub struct VolumeRow {
     pub data_digest: Option<String>,
     pub created_at: u64,
     pub updated_at: u64,
+    pub nest: Option<String>,
 }
 
 const APP_COLUMNS: &str = "name, state, node_id, domain, generation, seq, bundle_digest, from_app, shared, \
-                           memory_bytes, keep_data, created_at, updated_at";
+                           memory_bytes, keep_data, created_at, updated_at, nest, nest_via, idle_timeout_secs";
 
 fn app_row(r: &rusqlite::Row) -> rusqlite::Result<AppRow> {
     let shared: String = r.get(8)?;
@@ -86,10 +98,13 @@ fn app_row(r: &rusqlite::Row) -> rusqlite::Result<AppRow> {
         keep_data: r.get(10)?,
         created_at: r.get(11)?,
         updated_at: r.get(12)?,
+        nest: r.get(13)?,
+        nest_via: r.get(14)?,
+        idle_timeout_secs: r.get(15)?,
     })
 }
 
-const VOLUME_COLUMNS: &str = "name, state, node_id, generation, seq, data_digest, created_at, updated_at";
+const VOLUME_COLUMNS: &str = "name, state, node_id, generation, seq, data_digest, created_at, updated_at, nest";
 
 fn volume_row(r: &rusqlite::Row) -> rusqlite::Result<VolumeRow> {
     Ok(VolumeRow {
@@ -101,6 +116,7 @@ fn volume_row(r: &rusqlite::Row) -> rusqlite::Result<VolumeRow> {
         data_digest: r.get(5)?,
         created_at: r.get(6)?,
         updated_at: r.get(7)?,
+        nest: r.get(8)?,
     })
 }
 
@@ -180,28 +196,141 @@ fn check_online(node: &Node, online: &dyn Fn(u64) -> bool, queue: bool, what: &s
     Ok(up)
 }
 
-/// One reason an app must go to a node.
-struct Pin {
-    node: u64,
+/// One thing that names an app's nest.
+struct Source {
+    nest: String,
+    /// How the app comes to be in it, such as `through --from blog`.
+    via: String,
+    /// Why it names that nest, for a refusal.
     why: String,
 }
 
-/// The one node that every pin names, if any.
-fn agree(pins: &[Pin]) -> Result<Option<u64>> {
-    let Some(first) = pins.first() else { return Ok(None) };
-    for p in &pins[1..] {
-        if p.node != first.node {
-            return Err(Error::Conflict(format!(
-                "{}, but {}; an app has to be on the same node as its `--from` app and its shared volumes",
-                first.why, p.why
-            )));
-        }
+/// The one nest every source names, if any; refused if they disagree.
+fn agree(sources: &[Source]) -> Result<Option<(String, String)>> {
+    let Some(first) = sources.first() else { return Ok(None) };
+    if let Some(other) = sources.iter().find(|s| s.nest != first.nest) {
+        return Err(Error::Conflict(format!(
+            "{}, but {}; an app's `--from` app, its shared volumes and `x-kiwi-nest.nest` must all be in one nest",
+            first.why, other.why
+        )));
     }
-    Ok(Some(first.node))
+    Ok(Some((first.nest.clone(), first.via.clone())))
 }
 
-fn node_name(tx: &Transaction, id: u64) -> Result<String> {
-    Ok(nodes::get(tx, id)?.name)
+/// The node a nest goes on, and why, if the nest is new.
+struct Placed {
+    node_id: u64,
+    /// Why that node was chosen, for a new nest.
+    new: Option<String>,
+}
+
+/// Finds the node for a nest: the one it's pinned to if it exists (`--node` may only name that one), or, for a new
+/// nest, `--node` (if it passes the filter) or the scheduler's choice.
+fn place_nest(
+    tx: &Transaction,
+    online: &dyn Fn(u64) -> bool,
+    settings: &Settings,
+    nest: &str,
+    node: Option<&str>,
+    needs: &Needs,
+    except: Option<&str>,
+) -> Result<Placed> {
+    let cands = scheduler::candidates(tx, online, except)?;
+    if let Some(existing) = nests::live(tx, nest)? {
+        let on = nodes::get(tx, existing.node_id)?;
+        if let Some(want) = node
+            && want != on.name
+        {
+            nodes::by_name(tx, want)?;
+            return Err(Error::Conflict(format!(
+                "nest `{nest}` is on node `{}`, so --node `{want}` can't apply: a nest never splits",
+                on.name
+            )));
+        }
+        // It goes there whatever, as long as it can run there: a cordon only keeps new nests away.
+        if let Some(c) = cands.iter().find(|c| c.id == on.id) {
+            let c = Candidate {
+                cordoned: false,
+                ..c.clone()
+            };
+            if let Some(why) = scheduler::unfit(&c, needs, false) {
+                return Err(Error::Conflict(format!(
+                    "nest `{nest}` is on node `{}`, which can't take this: {why}",
+                    on.name
+                )));
+            }
+        }
+        return Ok(Placed {
+            node_id: on.id,
+            new: None,
+        });
+    }
+    if let Some(want) = node {
+        let c = cands
+            .iter()
+            .find(|c| c.name == want)
+            .ok_or_else(|| Error::NotFound(format!("there's no node `{want}`")))?;
+        if let Some(why) = scheduler::unfit(c, needs, false) {
+            return Err(Error::Conflict(format!(
+                "node `{want}` can't take new nest `{nest}`: {why}"
+            )));
+        }
+        return Ok(Placed {
+            node_id: c.id,
+            new: Some(format!("--node {want}")),
+        });
+    }
+    match scheduler::place(&cands, needs, settings) {
+        Ok(choice) => Ok(Placed {
+            node_id: choice.id,
+            new: Some(choice.why),
+        }),
+        Err(e) if e.all_offline() => Err(Error::Offline(format!(
+            "no node is online to take new nest `{nest}`; pass --node and --queue to place it on an offline one"
+        ))),
+        Err(e) if e.unfit.is_empty() => Err(Error::Conflict(e.describe())),
+        Err(e) => Err(Error::Conflict(format!("{} (for nest `{nest}`)", e.describe()))),
+    }
+}
+
+/// A warning if the node has no memory headroom left once `memory` more is placed on it.
+fn memory_warning(
+    tx: &Transaction,
+    settings: &Settings,
+    node: &Node,
+    except: &str,
+    memory: u64,
+    idles: bool,
+    nest: &str,
+    new: bool,
+) -> Result<Option<String>> {
+    let load = scheduler::loads(tx, Some(except))?
+        .get(&node.id)
+        .copied()
+        .unwrap_or_default()
+        .with(memory, idles);
+    let total = nodes::facts_of(node).memory_bytes;
+    let room = scheduler::headroom(total, load, settings);
+    if room >= 0 {
+        return Ok(None);
+    }
+    let b = |x: u64| scheduler::bytes(x.into());
+    Ok(Some(format!(
+        "node `{}` is out of memory headroom with `{except}`: {} ({} of memory, less {} reserved, {} for always-on \
+         apps and {} of the {} for apps that idle out); {}",
+        node.name,
+        scheduler::bytes(room),
+        b(total),
+        b(settings.memory_reserve),
+        b(load.always_on),
+        settings.idle_factor,
+        b(load.idle),
+        if new {
+            "it was still the best node".to_string()
+        } else {
+            format!("it goes there anyway, as nest `{nest}` does")
+        }
+    )))
 }
 
 /// What a deploy asks for.
@@ -218,12 +347,13 @@ pub struct Deploy {
     pub queue: bool,
 }
 
-/// Saves a deploy: reserves the name and domain, picks the node, stores the bundle and bumps the node's desired
-/// state, all in one transaction.
+/// Saves a deploy: reserves the name and domain, works out the nest and its node, stores the bundle and bumps the
+/// node's desired state, all in one transaction.
 pub fn deploy(
     c: &mut Connection,
     bundles: &Bundles,
     online: &dyn Fn(u64) -> bool,
+    settings: &Settings,
     d: Deploy,
     now: u64,
 ) -> Result<Saved> {
@@ -242,14 +372,15 @@ pub fn deploy(
         }
     }
 
-    // Where it has to go.
-    let mut pins = Vec::new();
+    // The nest, from everything that names one.
+    let mut sources = Vec::new();
     if let Some(a) = live
-        && let Some(n) = a.node_id
+        && let Some(n) = &a.nest
     {
-        pins.push(Pin {
-            node: n,
-            why: format!("app `{}` is on node `{}`", d.name, node_name(&tx, n)?),
+        sources.push(Source {
+            nest: n.clone(),
+            via: a.nest_via.clone(),
+            why: format!("app `{}` is in nest `{n}`", d.name),
         });
     }
     if let Some(from) = &d.from {
@@ -259,10 +390,11 @@ pub fn deploy(
         let src = app(&tx, from)?
             .filter(|a| a.state == State::Active)
             .ok_or_else(|| Error::NotFound(format!("app `{from}` (given as --from) doesn't exist")))?;
-        if let Some(n) = src.node_id {
-            pins.push(Pin {
-                node: n,
-                why: format!("`--from` app `{from}` is on node `{}`", node_name(&tx, n)?),
+        if let Some(n) = &src.nest {
+            sources.push(Source {
+                nest: n.clone(),
+                via: format!("through --from {from}"),
+                why: format!("`--from` app `{from}` is in nest `{n}`"),
             });
         }
     }
@@ -272,54 +404,44 @@ pub fn deploy(
                 "the bundle mounts shared volume `{v}`, which doesn't exist; create it with `kiwi-nest volume create`"
             ))
         })?;
-        if let Some(n) = vol.node_id {
-            pins.push(Pin {
-                node: n,
-                why: format!("shared volume `{v}` is on node `{}`", node_name(&tx, n)?),
+        if let Some(n) = &vol.nest {
+            sources.push(Source {
+                nest: n.clone(),
+                via: format!("through shared volume `{v}`"),
+                why: format!("shared volume `{v}` is in nest `{n}`"),
             });
         }
     }
-    if let Some(name) = &d.node {
-        let n = nodes::by_name(&tx, name)?;
-        pins.push(Pin {
-            node: n.id,
-            why: format!("--node is `{name}`"),
+    if let Some(n) = &d.bundle.nest {
+        sources.push(Source {
+            nest: n.clone(),
+            via: "named by x-kiwi-nest.nest".into(),
+            why: format!("the bundle's `x-kiwi-nest.nest` is `{n}`"),
         });
     }
-    let node_id = match agree(&pins)? {
-        Some(n) => n,
-        None => scheduler::pick(&tx, online, d.bundle.arch.as_deref())?,
+    let (nest, via) = agree(&sources)?.unwrap_or_else(|| (d.name.clone(), "named after the app".into()));
+    let needs = Needs {
+        arch: d.bundle.arch.clone(),
+        labels: d.bundle.node_labels.clone(),
+        host_paths: d.bundle.host_paths.clone(),
     };
+    let placed = place_nest(&tx, online, settings, &nest, d.node.as_deref(), &needs, Some(&d.name))?;
+    let node_id = placed.node_id;
     let node = nodes::get(&tx, node_id)?;
     let up = check_online(&node, online, d.queue, "deploy")?;
-    let facts = nodes::facts_of(&node);
-    if let Some(arch) = &d.bundle.arch
-        && node.facts.is_some()
-        && &facts.arch != arch
-    {
-        return Err(Error::Conflict(format!(
-            "the bundle needs arch `{arch}`, and node `{}` is `{}`",
-            node.name, facts.arch
-        )));
-    }
-    let disallowed: Vec<String> = d
-        .bundle
-        .host_paths
-        .iter()
-        .filter(|p| !facts.allowed_host_paths.iter().any(|a| Path::new(p).starts_with(a)))
-        .map(|p| {
-            format!(
-                "host path `{p}` isn't allowed on node `{}` (see `--allow-host-path`)",
-                node.name
-            )
-        })
-        .collect();
-    if !disallowed.is_empty() {
-        return Err(Error::Refused {
-            message: "the bundle was refused".into(),
-            problems: disallowed,
-        });
-    }
+    let idles = d.bundle.idle_timeout_secs > 0;
+    let warnings: Vec<String> = memory_warning(
+        &tx,
+        settings,
+        &node,
+        &d.name,
+        d.bundle.memory_bytes,
+        idles,
+        &nest,
+        placed.new.is_some(),
+    )?
+    .into_iter()
+    .collect();
     let taken: Option<(String, Option<String>)> = tx
         .query_row(
             "SELECT a.name, n.name FROM apps a LEFT JOIN nodes n ON n.id = a.node_id
@@ -336,6 +458,15 @@ pub fn deploy(
         )));
     }
 
+    if let Some(why) = &placed.new {
+        nests::place(
+            &tx,
+            &nest,
+            node_id,
+            &format!("when `{}` was deployed: {why}", d.name),
+            now,
+        )?;
+    }
     let seq = bump(&tx, node_id)?;
     let generation = previous.as_ref().map_or(1, |a| a.generation + 1);
     tx.execute(
@@ -346,11 +477,11 @@ pub fn deploy(
     let created_at = live.map_or(now, |a| a.created_at);
     tx.execute(
         "INSERT INTO apps (name, state, node_id, domain, generation, seq, bundle_digest, from_app, shared,
-                           memory_bytes, keep_data, created_at, updated_at)
-         VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)
+                           memory_bytes, keep_data, created_at, updated_at, nest, nest_via, idle_timeout_secs)
+         VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT (name) DO UPDATE SET state = 'active', node_id = ?2, domain = ?3, generation = ?4, seq = ?5,
              bundle_digest = ?6, from_app = ?7, shared = ?8, memory_bytes = ?9, keep_data = 0, created_at = ?10,
-             updated_at = ?11",
+             updated_at = ?11, nest = ?12, nest_via = ?13, idle_timeout_secs = ?14",
         params![
             d.name,
             node_id,
@@ -362,7 +493,10 @@ pub fn deploy(
             serde_json::to_string(&d.bundle.shared)?,
             d.bundle.memory_bytes,
             created_at,
-            now
+            now,
+            nest,
+            via,
+            d.bundle.idle_timeout_secs,
         ],
     )?;
     tx.commit()?;
@@ -373,6 +507,8 @@ pub fn deploy(
             node: node.name,
             generation,
             node_online: up,
+            nest: Some(nest),
+            warnings,
         },
         node_id,
     })
@@ -400,6 +536,8 @@ pub fn delete(
                 node: node.name,
                 generation: a.generation,
                 node_online: online(node_id),
+                nest: a.nest.clone(),
+                warnings: Vec::new(),
             },
             node_id,
         });
@@ -419,17 +557,23 @@ pub fn delete(
             node: node.name,
             generation,
             node_online: up,
+            nest: a.nest,
+            warnings: Vec::new(),
         },
         node_id,
     })
 }
 
-/// Saves a new shared volume, on `node` or the node the scheduler picks.
+/// Saves a new shared volume, in nest `nest` (by default, the one named after it): on that nest's node if it exists,
+/// else on `node` or the node the scheduler picks.
+#[allow(clippy::too_many_arguments)]
 pub fn create_volume(
     c: &mut Connection,
     online: &dyn Fn(u64) -> bool,
+    settings: &Settings,
     name: &str,
     node: Option<&str>,
+    nest: Option<&str>,
     queue: bool,
     now: u64,
 ) -> Result<Saved> {
@@ -438,20 +582,40 @@ pub fn create_volume(
     if previous.as_ref().is_some_and(|v| v.state != State::Deleted) {
         return Err(Error::Conflict(format!("shared volume `{name}` already exists")));
     }
-    let node_id = match node {
-        Some(n) => nodes::by_name(&tx, n)?.id,
-        None => scheduler::pick(&tx, online, None)?,
+    let nest = match nest {
+        Some(n) if nests::valid_name(n) => n.to_string(),
+        Some(n) => {
+            return Err(Error::BadRequest(format!(
+                "`{n}` isn't a valid nest name: use lowercase letters, digits and `-`, at most 50 characters"
+            )));
+        }
+        None if nests::valid_name(name) => name.to_string(),
+        None => {
+            return Err(Error::BadRequest(format!(
+                "`{name}` can't name a nest (use lowercase letters, digits and `-`), so pass --nest for the volume's"
+            )));
+        }
     };
-    let n = nodes::get(&tx, node_id)?;
+    let placed = place_nest(&tx, online, settings, &nest, node, &Needs::default(), None)?;
+    let n = nodes::get(&tx, placed.node_id)?;
     let up = check_online(&n, online, queue, "volume")?;
-    let seq = bump(&tx, node_id)?;
+    if let Some(why) = &placed.new {
+        nests::place(
+            &tx,
+            &nest,
+            n.id,
+            &format!("when shared volume `{name}` was created: {why}"),
+            now,
+        )?;
+    }
+    let seq = bump(&tx, n.id)?;
     let generation = previous.as_ref().map_or(1, |v| v.generation + 1);
     tx.execute(
-        "INSERT INTO volumes (name, state, node_id, generation, seq, data_digest, created_at, updated_at)
-         VALUES (?1, 'active', ?2, ?3, ?4, NULL, ?5, ?5)
+        "INSERT INTO volumes (name, state, node_id, generation, seq, data_digest, created_at, updated_at, nest)
+         VALUES (?1, 'active', ?2, ?3, ?4, NULL, ?5, ?5, ?6)
          ON CONFLICT (name) DO UPDATE SET state = 'active', node_id = ?2, generation = ?3, seq = ?4,
-             data_digest = NULL, created_at = ?5, updated_at = ?5",
-        params![name, node_id, generation, seq, now],
+             data_digest = NULL, created_at = ?5, updated_at = ?5, nest = ?6",
+        params![name, n.id, generation, seq, now, nest],
     )?;
     tx.commit()?;
     Ok(Saved {
@@ -460,8 +624,10 @@ pub fn create_volume(
             node: n.name,
             generation,
             node_online: up,
+            nest: Some(nest),
+            warnings: Vec::new(),
         },
-        node_id,
+        node_id: placed.node_id,
     })
 }
 
@@ -507,6 +673,8 @@ pub fn load_volume(
             node: n.name,
             generation,
             node_online: up,
+            nest: v.nest,
+            warnings: Vec::new(),
         },
         node_id,
     })
@@ -533,6 +701,8 @@ pub fn delete_volume(
                 node: n.name,
                 generation: v.generation,
                 node_online: online(node_id),
+                nest: v.nest.clone(),
+                warnings: Vec::new(),
             },
             node_id,
         });
@@ -562,6 +732,8 @@ pub fn delete_volume(
             node: n.name,
             generation,
             node_online: up,
+            nest: v.nest,
+            warnings: Vec::new(),
         },
         node_id,
     })
@@ -770,6 +942,26 @@ pub fn change_status(c: &Connection, kind: Kind, name: &str, generation: u64) ->
     }
     let node_id = node_id.ok_or_else(|| Error::Internal(anyhow::anyhow!("`{name}` has no node")))?;
     let node = nodes::get(c, node_id)?;
+    if node.forgotten_at.is_some() {
+        return Ok((
+            ChangeStatus {
+                name: name.into(),
+                generation,
+                node: node.name.clone(),
+                node_online: false,
+                done: true,
+                ok: false,
+                error: Some(format!(
+                    "node `{}` was forgotten, and `{name}` with it; deploy it again elsewhere",
+                    node.name
+                )),
+                problems: Vec::new(),
+                notes: Vec::new(),
+                superseded_by: None,
+            },
+            node_id,
+        ));
+    }
     let applied = nodes::applied(&node);
     let outcome: Option<&Outcome> = match kind {
         Kind::App => applied.apps.get(name),
@@ -813,12 +1005,14 @@ pub fn change_status(c: &Connection, kind: Kind, name: &str, generation: u64) ->
     Ok((s, node_id))
 }
 
-/// The memory placed on each node, and how many apps: (node ID, bytes, apps).
-pub fn placed(c: &Connection) -> Result<Vec<(u64, u64, u64)>> {
+/// The memory placed on each node, and how many apps: (node ID, always-on apps' bytes, idling apps' bytes, apps),
+/// not counting the app `except`.
+pub fn placed(c: &Connection, except: Option<&str>) -> Result<Vec<(u64, u64, u64, u64)>> {
     let mut st = c.prepare(
-        "SELECT node_id, sum(memory_bytes), count(*) FROM apps
-         WHERE state != 'deleted' AND node_id IS NOT NULL GROUP BY node_id",
+        "SELECT node_id, sum(CASE WHEN idle_timeout_secs = 0 THEN memory_bytes ELSE 0 END),
+                sum(CASE WHEN idle_timeout_secs > 0 THEN memory_bytes ELSE 0 END), count(*)
+         FROM apps WHERE state != 'deleted' AND node_id IS NOT NULL AND name IS NOT ?1 GROUP BY node_id",
     )?;
-    let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let rows = st.query_map([except], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }

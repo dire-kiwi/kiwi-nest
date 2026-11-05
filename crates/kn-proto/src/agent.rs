@@ -304,9 +304,20 @@ pub enum CommandResult {
     },
 }
 
-/// The body a server answers a forgotten node's poll with (with `410 Gone`); see the design's "Failure and
-/// recovery". Nothing else means the node was forgotten.
+/// The error a server answers a forgotten node with, with `410 Gone`, in a [`ForgottenBody`]; see the design's
+/// "Failure and recovery". Nothing else means the node was forgotten: not a network error, not a 401.
 pub const FORGOTTEN: &str = "node forgotten";
+
+/// What a server answers a forgotten node's requests with (`410 Gone`). The node only takes it as being forgotten
+/// if `error` is [`FORGOTTEN`] and `node_id` is its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgottenBody {
+    pub error: String,
+    pub node_id: u64,
+    pub name: String,
+    /// Unix seconds.
+    pub forgotten_at: u64,
+}
 
 #[cfg(test)]
 mod tests {

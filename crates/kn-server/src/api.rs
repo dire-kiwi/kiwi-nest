@@ -15,8 +15,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete as delete_route, get, post, put};
 use kn_proto::agent::{Action, CommandResult};
 use kn_proto::api::{
-    AppInfo, AppSummary, ChangeStatus, CreateToken, CreatedToken, DeleteQuery, DeployQuery, LogsQuery, NodeInfo,
-    TokenInfo, TokenKind, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery, WhoAmI,
+    AppInfo, AppSummary, ChangeStatus, CreateToken, CreatedToken, DeleteQuery, DeployQuery, ForgetQuery, Forgot,
+    LabelRequest, LogsQuery, NestInfo, NodeInfo, TokenInfo, TokenKind, VersionInfo, VolumeInfo, VolumeQuery, WaitQuery,
+    WhoAmI,
 };
 use kn_proto::state::AppStatus;
 use serde::de::DeserializeOwned;
@@ -26,7 +27,9 @@ use crate::auth::{self, Caller};
 use crate::bundles;
 use crate::error::{Error, Result};
 use crate::hub::Outcome;
+use crate::scheduler;
 use crate::store::apps::{self, AppRow, Kind, VolumeRow};
+use crate::store::nests::{self, Nest};
 use crate::store::nodes::{self, Node};
 use crate::store::{self, rfc3339, tokens};
 
@@ -58,7 +61,12 @@ pub fn router() -> Router<Server> {
             &format!("{p}/volumes/{{name}}/snapshots/{{app}}"),
             delete_route(volume_delete_snapshot),
         )
+        .route(&format!("{p}/nests"), get(nest_list))
         .route(&format!("{p}/nodes"), get(node_list))
+        .route(&format!("{p}/nodes/{{name}}/labels"), post(node_label))
+        .route(&format!("{p}/nodes/{{name}}/cordon"), post(node_cordon))
+        .route(&format!("{p}/nodes/{{name}}/uncordon"), post(node_uncordon))
+        .route(&format!("{p}/nodes/{{name}}/forget"), post(node_forget))
         .route(&format!("{p}/tokens"), get(token_list).post(token_create))
         .route(&format!("{p}/tokens/{{id}}"), delete_route(token_revoke))
 }
@@ -121,6 +129,7 @@ struct View {
     app: AppRow,
     node: Option<Node>,
     online: bool,
+    nest: Option<Nest>,
 }
 
 impl View {
@@ -146,6 +155,29 @@ impl View {
         (self.app.generation > self.applied()).then_some(self.app.generation)
     }
 
+    /// How the app came to be in its nest, and why the nest's node was chosen.
+    fn placement(&self) -> Option<String> {
+        let nest = self.nest.as_ref()?;
+        let node = self.node.as_ref().map_or("?", |n| n.name.as_str());
+        let via = if self.app.nest_via.is_empty() {
+            String::new()
+        } else {
+            format!("{}; ", self.app.nest_via)
+        };
+        Some(format!(
+            "{via}nest {} went to node {node} {}",
+            nest.name, nest.placement
+        ))
+    }
+
+    /// Adds what only the server knows to what the node says.
+    fn annotate(&self, info: &mut AppInfo) {
+        info.node = self.node.as_ref().map(|n| n.name.clone());
+        info.pending = self.pending();
+        info.nest = self.app.nest.clone();
+        info.placement = self.placement();
+    }
+
     fn summary(&self) -> AppSummary {
         let r = self.report();
         let containers = match r {
@@ -167,6 +199,7 @@ impl View {
             containers,
             updated_at: rfc3339(self.app.updated_at),
             node: self.node.as_ref().map(|n| n.name.clone()),
+            nest: self.app.nest.clone(),
             pending: self.pending(),
         }
     }
@@ -198,6 +231,8 @@ impl View {
             containers: Vec::new(),
             open_requests: 0,
             node: self.node.as_ref().map(|n| n.name.clone()),
+            nest: self.app.nest.clone(),
+            placement: self.placement(),
             pending: self.pending(),
             stale: true,
         }
@@ -206,16 +241,26 @@ impl View {
 
 async fn view(s: &Server, name: &str) -> Result<View> {
     let n = name.to_string();
-    let (app, node) = s
+    let node = s
         .store
         .call(move |c| {
             let app = apps::live_app(c, &n)?;
             let node = app.node_id.map(|id| nodes::get(c, id)).transpose()?;
-            Ok((app, node))
+            let nest = match &app.nest {
+                Some(n) => nests::live(c, n)?,
+                None => None,
+            };
+            Ok((app, node, nest))
         })
         .await?;
+    let (app, node, nest) = node;
     let online = node.as_ref().is_some_and(|n| s.hub.is_online(n.id));
-    Ok(View { app, node, online })
+    Ok(View {
+        app,
+        node,
+        online,
+        nest,
+    })
 }
 
 /// A command's JSON result.
@@ -247,8 +292,7 @@ async fn inspect_on_node(s: &Server, v: &View) -> Result<AppInfo> {
         )
         .await?,
     )?;
-    info.node = Some(node.name.clone());
-    info.pending = v.pending();
+    v.annotate(&mut info);
     Ok(info)
 }
 
@@ -261,7 +305,13 @@ async fn list(State(s): State<Server>, caller: Caller) -> Result<axum::Json<Vec<
             .map(|app| {
                 let node = app.node_id.and_then(|id| nodes.get(&id).cloned());
                 let online = node.as_ref().is_some_and(|n| s.hub.is_online(n.id));
-                View { app, node, online }.summary()
+                View {
+                    app,
+                    node,
+                    online,
+                    nest: None,
+                }
+                .summary()
             })
             .collect(),
     ))
@@ -311,7 +361,7 @@ async fn deploy(
             checked.shared_rw.join(", ")
         )));
     }
-    let (b, online) = (s.bundles.clone(), s.online());
+    let (b, online, settings) = (s.bundles.clone(), s.online(), s.cfg.scheduler);
     let d = apps::Deploy {
         name: name.clone(),
         bundle: checked,
@@ -324,12 +374,13 @@ async fn deploy(
     };
     let saved = s
         .store
-        .call(move |c| apps::deploy(c, &b, &online, d, store::now()))
+        .call(move |c| apps::deploy(c, &b, &online, &settings, d, store::now()))
         .await?;
     drop(upload);
     tracing::info!(
         app = name,
         node = saved.accepted.node,
+        nest = saved.accepted.nest,
         generation = saved.accepted.generation,
         "deploy saved"
     );
@@ -430,8 +481,7 @@ async fn app_command(s: &Server, caller: &Caller, name: String, action: Action) 
         .as_ref()
         .ok_or_else(|| Error::Internal(anyhow::anyhow!("no node")))?;
     let mut info: AppInfo = result(s.command(node.id, &node.name, action).await?)?;
-    info.node = Some(node.name.clone());
-    info.pending = v.pending();
+    v.annotate(&mut info);
     Ok(axum::Json(info))
 }
 
@@ -464,12 +514,14 @@ fn volume_view(v: &VolumeRow, node: Option<&Node>) -> VolumeInfo {
         snapshots: Vec::new(),
         problem: None,
         node: None,
+        nest: None,
         pending: None,
     });
     if info.problem.is_none() {
         info.problem = failed;
     }
     info.node = node.map(|n| n.name.clone());
+    info.nest = v.nest.clone();
     info.pending = (v.generation > applied).then_some(v.generation);
     info
 }
@@ -508,6 +560,7 @@ async fn volume_inspect(
             Ok(o) => {
                 let mut live: VolumeInfo = result(o)?;
                 live.node = view.node.take();
+                live.nest = view.nest.take();
                 live.pending = view.pending;
                 return Ok(axum::Json(live));
             }
@@ -526,10 +579,21 @@ async fn volume_create(
 ) -> Result<Response> {
     caller.admin()?;
     check_volume_name(&name)?;
-    let online = s.online();
+    let (online, settings) = (s.online(), s.cfg.scheduler);
     let saved = s
         .store
-        .call(move |c| apps::create_volume(c, &online, &name, q.node.as_deref(), q.queue, store::now()))
+        .call(move |c| {
+            apps::create_volume(
+                c,
+                &online,
+                &settings,
+                &name,
+                q.node.as_deref(),
+                q.nest.as_deref(),
+                q.queue,
+                store::now(),
+            )
+        })
         .await?;
     s.hub.wake(saved.node_id);
     Ok((StatusCode::ACCEPTED, axum::Json(saved.accepted)).into_response())
@@ -616,25 +680,153 @@ async fn volume_delete_snapshot(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Every node that isn't forgotten, as `node list` shows it.
+async fn nodes_info(s: &Server) -> Result<Vec<NodeInfo>> {
+    let settings = s.cfg.scheduler;
+    let (nodes, loads, nests) = s
+        .store
+        .call(|c| Ok((nodes::list_facts(c)?, scheduler::loads(c, None)?, nests::list(c)?)))
+        .await?;
+    Ok(nodes
+        .into_iter()
+        .map(|n| {
+            let load = loads.get(&n.id).copied().unwrap_or_default();
+            let facts = nodes::facts_of(&n);
+            NodeInfo {
+                id: n.id,
+                online: s.hub.is_online(n.id),
+                joined_at: rfc3339(n.joined_at),
+                last_seen: n.last_seen.map(rfc3339),
+                cordoned: n.cordoned,
+                labels: nodes::labels_of(&n),
+                nests: nests
+                    .iter()
+                    .filter(|m| m.nest.node_id == n.id)
+                    .map(|m| m.nest.name.clone())
+                    .collect(),
+                apps: load.apps,
+                app_memory_bytes: load.always_on + load.idle,
+                headroom_bytes: scheduler::headroom(facts.memory_bytes, load, &settings)
+                    .clamp(i64::MIN.into(), i64::MAX.into()) as i64,
+                facts: n.facts,
+                name: n.name,
+            }
+        })
+        .collect())
+}
+
+async fn node_info(s: &Server, name: &str) -> Result<axum::Json<NodeInfo>> {
+    nodes_info(s)
+        .await?
+        .into_iter()
+        .find(|n| n.name == name)
+        .map(axum::Json)
+        .ok_or_else(|| Error::NotFound(format!("there's no node `{name}`")))
+}
+
 async fn node_list(State(s): State<Server>, caller: Caller) -> Result<axum::Json<Vec<NodeInfo>>> {
     caller.admin()?;
-    let (nodes, placed) = s.store.call(|c| Ok((nodes::list_facts(c)?, apps::placed(c)?))).await?;
-    let placed: HashMap<u64, (u64, u64)> = placed.into_iter().map(|(n, m, c)| (n, (m, c))).collect();
+    Ok(axum::Json(nodes_info(&s).await?))
+}
+
+/// Whether a label's key or value is acceptable: printable, without `=` or spaces, and not too long.
+fn valid_label(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 63
+        && s.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.' | b'/'))
+}
+
+async fn node_label(
+    State(s): State<Server>,
+    caller: Caller,
+    Path(name): Path<String>,
+    axum::Json(req): axum::Json<LabelRequest>,
+) -> Result<axum::Json<NodeInfo>> {
+    caller.admin()?;
+    if let Some(bad) = req
+        .set
+        .iter()
+        .flat_map(|(k, v)| [k, v])
+        .chain(&req.remove)
+        .find(|x| !valid_label(x))
+    {
+        return Err(Error::BadRequest(format!(
+            "`{bad}` isn't a valid label key or value: use letters, digits, `-`, `_`, `.` and `/`, at most 63"
+        )));
+    }
+    let n = name.clone();
+    s.store
+        .call(move |c| nodes::set_labels(c, &n, &req.set, &req.remove))
+        .await?;
+    node_info(&s, &name).await
+}
+
+async fn cordon(s: &Server, caller: &Caller, name: String, cordoned: bool) -> Result<axum::Json<NodeInfo>> {
+    caller.admin()?;
+    let n = name.clone();
+    s.store.call(move |c| nodes::set_cordoned(c, &n, cordoned)).await?;
+    tracing::info!(node = name, cordoned, "cordon changed");
+    node_info(s, &name).await
+}
+
+async fn node_cordon(
+    State(s): State<Server>,
+    caller: Caller,
+    Path(name): Path<String>,
+) -> Result<axum::Json<NodeInfo>> {
+    cordon(&s, &caller, name, true).await
+}
+
+async fn node_uncordon(
+    State(s): State<Server>,
+    caller: Caller,
+    Path(name): Path<String>,
+) -> Result<axum::Json<NodeInfo>> {
+    cordon(&s, &caller, name, false).await
+}
+
+async fn node_forget(
+    State(s): State<Server>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Query(q): Query<ForgetQuery>,
+) -> Result<axum::Json<Forgot>> {
+    caller.admin()?;
+    let online = s.online();
+    let f = s
+        .store
+        .call(move |c| nodes::forget(c, &name, &online, q.force, q.dry_run, store::now()))
+        .await?;
+    if !q.dry_run {
+        for id in &f.lost_commands {
+            s.hub.settle(*id, Outcome::Lost);
+        }
+        let (b, gone) = (s.bundles.clone(), f.forgot.apps.len() + f.forgot.volumes.len());
+        s.store.call(move |c| apps::gc(c, &b)).await?;
+        // An open poll (with --force) is answered at once, and says the node was forgotten.
+        s.hub.wake(f.node_id);
+        s.hub.reported(f.node_id);
+        tracing::warn!(node = f.forgot.node, released = gone, by = caller.id, "forgot a node");
+    }
+    Ok(axum::Json(f.forgot))
+}
+
+async fn nest_list(State(s): State<Server>, caller: Caller) -> Result<axum::Json<Vec<NestInfo>>> {
+    caller.admin()?;
+    let (list, all) = s.store.call(|c| Ok((nests::list(c)?, nodes::list_facts(c)?))).await?;
+    let names: HashMap<u64, String> = all.into_iter().map(|n| (n.id, n.name)).collect();
     Ok(axum::Json(
-        nodes
-            .into_iter()
-            .map(|n| {
-                let (mem, count) = placed.get(&n.id).copied().unwrap_or_default();
-                NodeInfo {
-                    id: n.id,
-                    online: s.hub.is_online(n.id),
-                    name: n.name,
-                    joined_at: rfc3339(n.joined_at),
-                    last_seen: n.last_seen.map(rfc3339),
-                    facts: n.facts,
-                    apps: count,
-                    app_memory_bytes: mem,
-                }
+        list.into_iter()
+            .map(|m| NestInfo {
+                node: names.get(&m.nest.node_id).cloned().unwrap_or_default(),
+                node_online: s.hub.is_online(m.nest.node_id),
+                memory_bytes: m.apps.iter().map(|(_, b)| b).sum(),
+                apps: m.apps.into_iter().map(|(n, _)| n).collect(),
+                volumes: m.volumes,
+                placement: m.nest.placement,
+                created_at: rfc3339(m.nest.created_at),
+                name: m.nest.name,
             })
             .collect(),
     ))

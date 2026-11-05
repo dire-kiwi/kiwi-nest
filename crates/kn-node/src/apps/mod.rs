@@ -667,6 +667,7 @@ impl Apps {
                 port: r.port,
                 updated_at: rfc3339(r.updated_at),
                 node: None,
+                nest: None,
                 pending: None,
             })
             .collect())
@@ -1638,6 +1639,8 @@ impl App<'_> {
             containers,
             open_requests,
             node: None,
+            nest: None,
+            placement: None,
             pending: None,
             stale: false,
         })

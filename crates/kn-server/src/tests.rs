@@ -594,6 +594,8 @@ async fn commands_are_delivered_once_and_lost_ones_fail() {
         containers: vec![],
         open_requests: 0,
         node: None,
+        nest: None,
+        placement: None,
         pending: None,
         stale: false,
     })

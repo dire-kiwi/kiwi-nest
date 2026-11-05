@@ -4,7 +4,7 @@
 //!   state of each node, and commands.
 //! - [`bundles`] keeps bundles as files named by digest, and checks uploads.
 //! - [`auth`] makes and checks tokens.
-//! - [`scheduler`] picks a node for a new app or volume.
+//! - [`scheduler`] places new nests on nodes.
 //! - [`hub`] is what's only in memory: which nodes are online, waking polls, and callers waiting for results.
 //! - [`api`] is the API for the CLI, and [`agent`] the link for nodes.
 //!
@@ -60,6 +60,8 @@ pub struct ServerConfig {
     pub limits: Limits,
     /// The limits on what `volume load` uploads.
     pub load_limits: Limits,
+    /// How placement counts memory.
+    pub scheduler: scheduler::Settings,
 }
 
 impl ServerConfig {
@@ -71,6 +73,7 @@ impl ServerConfig {
             command_timeout: Duration::from_secs(600),
             limits: Limits::default(),
             load_limits: Limits::for_volumes(),
+            scheduler: scheduler::Settings::default(),
         }
     }
 }
