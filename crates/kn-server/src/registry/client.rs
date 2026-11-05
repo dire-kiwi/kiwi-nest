@@ -53,6 +53,8 @@ impl Client {
     }
 
     pub fn with_base(base: String) -> anyhow::Result<Client> {
+        // The registry is plain HTTP on loopback, but reqwest needs a TLS provider all the same.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder()
             .user_agent(format!("kiwi-nest-server/{}", kn_proto::VERSION))
             .no_proxy()

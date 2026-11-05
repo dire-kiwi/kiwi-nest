@@ -370,6 +370,11 @@ async fn deploy(
             checked.shared_rw.join(", ")
         )));
     }
+    // Garbage collection doesn't decide what to delete, nor stop the registry, while a deploy is checked and saved.
+    let hold = match &s.registry {
+        Some(r) => Some(r.hold().await),
+        None => None,
+    };
     // The platforms of the images the registry holds, so the app only goes to a node that can run them.
     let platforms = match &s.registry {
         Some(r) => r.platforms(&checked.images).await,
@@ -386,11 +391,6 @@ async fn deploy(
         node: q.node,
         queue: q.queue,
         platforms,
-    };
-    // Garbage collection doesn't decide what to delete, nor stop the registry, while a deploy is saved.
-    let hold = match &s.registry {
-        Some(r) => Some(r.hold().await),
-        None => None,
     };
     let saved = s
         .store

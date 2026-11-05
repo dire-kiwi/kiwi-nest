@@ -286,7 +286,8 @@ VOLUMES/                         one btrfs filesystem per node
   token. Nodes need no inbound port except the gateway, and they work behind NAT.
 - **Joining.** `kiwi-nest node --server URL --join-token TOKEN` swaps a one-time join token for the node's own token
   and its ingress token (see the gateway) on its first start, and keeps them with the server's URL in
-  `STATE/agent.json` (mode 0600), so later starts need neither. A node that joined but never polled (it didn't get
+  `STATE/agent.json` (mode 0600), so later starts need neither. It also gets its registry credential (see
+  [Images](#images)), and a new one every time it starts. A node that joined but never polled (it didn't get
   the answer) may join again under its name with a new join token, and gets a new ingress token too. A node that
   joined before the server gave out ingress tokens asks for its own (`GET /agent/ingress-token`) when it starts
   with `--ingress-listen`. The server's URL is normally its API domain through the ingress, over HTTPS;
@@ -341,7 +342,8 @@ VOLUMES/                         one btrfs filesystem per node
   change them, and may mount shared volumes `ro` or `snapshot` but not `rw`; node tokens, which `node forget`
   revokes; one-time join tokens. The first start of a server prints its first admin token, once. The last admin
   token can't be revoked. Each node's ingress token (`kni_…`) is the exception: the server keeps it as it is, since
-  the ingress's configuration needs it.
+  the ingress's configuration needs it. Each node's registry credential (`knr_…`) is kept as a hash, and only
+  pulls.
 - **A forgotten node is kept as a tombstone**: its row, marked forgotten, and its token's hash, revoked but not
   deleted. Without them the server couldn't tell a forgotten node coming back from a request with a wrong or unknown
   token, and so couldn't give it the explicit "forgotten" answer that makes it take its apps down. A tombstone is
@@ -460,15 +462,82 @@ VOLUMES/                         one btrfs filesystem per node
 
 ## Images
 
-- **The server runs `registry:3`**, served by the ingress at a cluster hostname such as `registry.example.com`, with
-  token auth. People and CI `docker login` with a deploy token and push there. Nodes log in with their own read-only
-  credential, written when they join.
-- **Bundles reference images by that hostname**, so a bundle works on any node.
-- **Garbage collection** runs on the server, which knows every app's image references on every node. It keeps tags
-  pushed or released within a grace period, so a delete followed by a deploy doesn't re-pull.
-- **Nodes prune their own unused images**, keeping those of stopped (idle) apps.
-- **Mixed architectures:** push multi-arch images, or set `arch` on the bundle. Deploy checks the image's platforms
-  against the node when the registry holds the image.
+- **The server runs the registry** (`kn-server`'s `registry`, with `--registry-domain`): a `registry:3` container
+  (`--registry-image`) named `--registry-container`, published only on loopback (`--registry-listen`,
+  `127.0.0.1:5000`), and served by the ingress at the registry's domain, such as `registry.example.com`. It runs as
+  the server's own user, with its storage in the server's state directory:
+
+  ```text
+  STATE/registry/config.yml   its configuration, written by the server: deletes allowed, relative URLs
+  STATE/registry/secret       the secret it signs upload state with, made once
+  STATE/registry/data/        its storage
+  ```
+
+  The server keeps it running as configured, checking every 30 seconds, and replaces the container when its image,
+  address or configuration changes (a label on the container holds a hash of them).
+- **Credentials are checked by the server, in the ingress** (D8). Caddy sends each request for the registry's domain
+  to the server first (`GET /registry/auth`, without the body, with the request's `Authorization` and its method and
+  path in `X-Forwarded-Method` and `-Uri`), and passes it on to the registry only if the server answers 2xx; a 401
+  (with a Basic login challenge, so `docker login` works) or a 403 goes back to the client as it is. The registry
+  checks nothing itself, and Caddy removes `Authorization` before passing a request on.
+  - **People and CI** log in with an admin or deploy token as the password (any user name):
+    `kiwi-nest registry login`, or `docker login registry.example.com`. Either may pull and push any repository;
+    only an admin token may delete. A deploy token's name patterns are for apps, not images, since images are
+    shared: `blog-deps` serves `blog` and its previews.
+  - **Each node has its own credential** (`knr_…`, kept as a hash), which may only pull: given when it joins, and
+    replaced every time the node starts, which makes the old one stop working. `node forget` makes it worthless. A
+    node runs Docker with a configuration directory of its own, `STATE/docker`, and writes the credential there
+    (mode 0600). Logins for other registries can be added to it (`DOCKER_CONFIG=STATE/docker docker login …`) and
+    are kept; Compose plugins in the usual directory's `cli-plugins` are still found (`cliPluginsExtraDirs`).
+  - The server records every manifest pushed by tag (a `PUT` to `/v2/NAME/manifests/TAG`) for garbage
+    collection's grace period, and when the registry was last used, so it doesn't stop it under a pull.
+  - A route to the registry's address isn't made for an app's domain, whatever address a node reports, since it
+    would skip the check.
+- **Docker trusts the ingress's certificate** as it trusts any registry's: with `--ingress acme` or `certs` that's
+  usually so; with `--ingress internal`, put the ingress's CA (`STATE/ingress-ca.crt`) at
+  `/etc/docker/certs.d/HOST/ca.crt` on every node and every machine that pushes. Docker reaches a registry on
+  loopback (`localhost:PORT`, as in the dev cluster and the tests) without checking its certificate, or over plain
+  HTTP.
+- **`kiwi-nest push LOCAL NAME:TAG`** logs Docker in with the CLI's token, tags LOCAL as `HOST/NAME:TAG`, runs
+  `docker push` and prints `HOST/NAME:TAG`, the reference to put in bundles. The host is the registry's domain, with
+  the ingress's port if it isn't the default one (`kiwi-nest registry host`).
+- **Bundles reference images by that host**, so a bundle works on any node. The server records each app's image
+  references when it's deployed.
+- **Garbage collection** runs on the server every `--registry-gc-interval` (6 hours) and on `kiwi-nest registry gc`
+  (admin; `--dry-run`, `--grace`), since the server knows every app's images on every node.
+  1. It lists the registry's tags and their manifests' digests, on loopback.
+  2. Tags are grouped by manifest, in each repository, since deleting a manifest deletes every tag that names it. A
+     group is kept if any of its tags is used by an app deployed on any node, or being deleted from one, either by
+     tag or by the group's digest; or if one was pushed, released (an app using it was redeployed with other images,
+     deleted, or its node forgotten) or first seen at that digest within the grace period (`--registry-grace`, 24
+     hours). So a tag that shares a manifest with one that's kept is kept too, and a tag pushed some way the server
+     didn't see is kept for a grace period after it's first seen. Every other group's manifest is deleted. Nothing
+     is deleted while some app's images aren't known (deployed before the server recorded them, with a bundle it
+     can't read).
+  3. Then, if it deleted anything, or a tag moved to another manifest (leaving the old one untagged), the
+     registry's own offline garbage collection frees the layers: the server stops the registry, runs `registry
+     garbage-collect --delete-untagged` on its storage in a one-off container, and starts the registry again,
+     whatever happened. `--delete-untagged` is left out while an app uses, by digest, a manifest no tag names.
+  4. It never stops the registry while something may be pulling: while an online node reports an app deploying or
+     starting (or being looked at after its agent restarted), while a deploy is on its way to an online node, or
+     within 10 seconds of a request to the registry. It waits for that up to 10 minutes, then leaves freeing the
+     layers to its next run. Deploys wait to be saved while it decides what to delete and while the registry is
+     stopped (seconds), so no deploy names a tag being deleted, and none reaches a node while the registry is down.
+
+  The gap left: a start that has to pull (an app whose containers were removed) and begins in the moment between
+  the check and the stop fails, and the next request tries again after the start cooldown.
+- **Nodes prune their own images.** Each node records its apps' images, and when an app stops using one
+  (redeployed with others, or deleted) it's released. Every `--prune-interval` (an hour), and on `kiwi-nest node
+  prune NODE`, the node removes each released image that none of its apps uses and that was released longer ago
+  than `--image-grace` (24 hours). It uses `docker image rm`, which Docker refuses while any container uses the
+  image, so a stopped (idle) app's images stay, as do those of anything else on the engine; images its apps never
+  used aren't touched. So a delete followed by a deploy within the grace period finds the image on the node (and in
+  the registry), and pulls nothing.
+- **Mixed architectures:** push multi-arch images, or set `arch` on the bundle. Deploy checks each image the registry
+  holds against the node: an index's Linux platforms (attestations aside), or a single image's config. A node of
+  another architecture is filtered out like one of the wrong `arch`, so a new nest goes where its images run, and an
+  existing nest's node refuses the deploy (`image registry.example.com/app:1 is only built for amd64`). Images
+  elsewhere, and any the registry doesn't hold (yet), aren't checked.
 
 ## Backups
 
@@ -580,7 +649,7 @@ for macOS.
 | D5 | Nodes long-poll the server: desired state with generations for what's deployed, commands for one-off actions. | Stays correct across disconnects without storing, re-sending and de-duplicating every command. Pushing over SSH needs keys on every node and breaks behind NAT. |
 | D6 | One ingress Caddy per cluster, proxying to node gateways over the private network. | Wildcard DNS and certificates just work, and moving an app needs no DNS change. A Caddy per node would need DNS-provider code, certificates on every node and a DNS change on every move. Cost: a private network, and the ingress is a single point of failure (accepted, since there's no HA). |
 | D7 | Server storage is SQLite through `rusqlite` (bundled), on a dedicated blocking thread, with numbered migrations. | Transactions for reserving names, domains and nests. JSON files would need a global lock; `sqlx` adds build-time database setup for little gain. |
-| D8 | One registry per cluster, behind the ingress with token auth. | A registry per node would mean knowing the node before pushing, and pushing again on every move. |
+| D8 | One registry per cluster, behind the ingress, which has the server check every request's credentials first (Caddy's forward auth); nodes get pull-only credentials of their own. | A registry per node would mean knowing the node before pushing, and pushing again on every move. The registry's own token auth was the alternative: it needs a token service and a signing key, and a revoked token keeps working until the tokens issued for it expire. Checking in the ingress uses the tokens the server already has, takes effect at once, and lets the server see every push, which garbage collection's grace period needs. Cost: a round trip to the server on loopback for every request, and a registry that checks nothing itself, so it's published only on loopback. |
 | D9 | The node agent runs as root under systemd; the server runs as its own unprivileged user. | Controlling Docker is already root-equivalent, and root keeps btrfs and file ownership simple. |
 | D10 | No failover; recover by restoring from backup with `--node`. | Without replicated data, automatic rescheduling would bring an app back empty, which is worse than down. |
 | D11 | Each backup target chooses `send` (default) or `tar`; the server's own state always uses tar. | Only `send` couldn't be read without btrfs; only tar is slower, larger and loses sharing. Incremental tar isn't worth its complexity for occasional off-site copies. |
@@ -692,7 +761,15 @@ flowchart LR
    written on join; `kiwi-nest push` (tags and runs `docker push`); garbage collection with a grace period across
    the whole inventory; pruning on each node; the platform check.
    *Verify:* push once and deploy the image on both nodes; garbage collection keeps a tag used only on node B; a
-   delete followed by a deploy doesn't re-pull within the grace period; a node's credential can't push.
+   delete followed by a deploy doesn't re-pull within the grace period; a node's credential can't push; an
+   amd64-only image is refused for an arm64 node.
+   *Done:* credentials checked by the server through Caddy's forward auth (D8); `crates/kn-server/src/registry/`
+   (the container, the registry's API, the checks, garbage collection; `gc.rs`'s rules in table tests, and
+   `tests.rs` through the server against a fake registry: platforms, credentials, what's kept, not stopping the
+   registry under a pull), the nodes' credentials and pruning (`crates/kn-node/src/agent/tests.rs`,
+   `apps/tests.rs`), and `crates/kiwi-nest/tests/registry.rs` (real Caddy, `registry:3`, Docker and two nodes: push,
+   pull on both nodes, a node's credential refused a push, garbage collection, pruning, a redeploy with the registry
+   stopped). `scripts/dev-cluster.sh` runs the registry with the ingress, at `localhost:7443`.
 
 ### Phase 3: running it
 
@@ -745,6 +822,11 @@ flowchart LR
 - **Caddy's admin API.** It listens on loopback without authentication, as Caddy's does, so anything running on the
   server's host can read the configuration (the nodes' ingress tokens, the bcrypt hashes) and change it. The
   server's host is expected to run nothing else untrusted. Caddy keeps the configuration only in memory.
+- **The registry on loopback.** It checks no credentials itself, so anything on the server's host can push to it or
+  delete from it directly. The same expectation applies.
+- **Images are shared.** Any deploy token may push any repository, so a preview's CI could overwrite production's
+  tag. Whoever can deploy is trusted (see the non-goals); production can name images by digest, or by tags that
+  only its own pipeline pushes.
 - **Nodes choose their ingress address.** The ingress dials whatever address a node reports, so a compromised node
   could point its apps' domains at another service the server's host or the private network can reach. Routes to
   Caddy's admin API and the server's own API are refused (and logged); anything else is trusted, as nodes are (see
