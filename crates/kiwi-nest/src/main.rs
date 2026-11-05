@@ -30,9 +30,23 @@ enum Cmd {
     Client(kn_cli::Command),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum IngressMode {
+    /// The server doesn't configure an ingress.
+    None,
+    /// HTTPS, with certificates from an ACME CA (Let's Encrypt and ZeroSSL by default).
+    Acme,
+    /// HTTPS, with certificates from Caddy's internal CA, for clusters reached only over a VPN.
+    Internal,
+    /// HTTPS, with the certificates in --certs-dir, obtained elsewhere (such as a DNS-01 wildcard).
+    Certs,
+    /// Plain HTTP, behind another proxy or a tunnel that handles TLS.
+    Http,
+}
+
 #[derive(clap::Args)]
 struct ServerArgs {
-    /// The address to listen on, for the CLI and the nodes.
+    /// The address to listen on, for the CLI and the nodes (directly, or through the ingress at --api-domain).
     #[arg(long, default_value = "127.0.0.1:7400")]
     listen: SocketAddr,
     /// Where the server keeps its database and bundles.
@@ -54,6 +68,36 @@ struct ServerArgs {
     /// A node that hasn't polled for this long is offline.
     #[arg(long, default_value = "15s")]
     offline_after: String,
+    /// The cluster's ingress: the Caddy the server configures, and how it gets certificates.
+    #[arg(long, value_enum, default_value = "none")]
+    ingress: IngressMode,
+    /// Caddy's admin API, on loopback.
+    #[arg(long, default_value = "http://127.0.0.1:2019", value_name = "URL")]
+    caddy_admin: String,
+    /// The domain the ingress publishes the server's API at, such as kn.example.com, for nodes and the CLI.
+    #[arg(long, value_name = "DOMAIN")]
+    api_domain: Option<String>,
+    /// The ingress's port for HTTP (in the HTTPS modes, it redirects to HTTPS).
+    #[arg(long, default_value_t = 80)]
+    http_port: u16,
+    /// The ingress's port for HTTPS.
+    #[arg(long, default_value_t = 443)]
+    https_port: u16,
+    /// With --ingress acme: the email address for the ACME account.
+    #[arg(long, value_name = "EMAIL")]
+    acme_email: Option<String>,
+    /// With --ingress acme: the ACME CA's directory URL [default: Let's Encrypt, then ZeroSSL].
+    #[arg(long, value_name = "URL")]
+    acme_ca: Option<String>,
+    /// With --ingress certs: the folder of certificates, as .pem files each holding a certificate chain and its key.
+    #[arg(long, value_name = "DIR")]
+    certs_dir: Option<PathBuf>,
+    /// A proxy in front of the ingress whose X-Forwarded-For is believed, as an address or CIDR range (repeatable).
+    #[arg(long = "trusted-proxy", value_name = "CIDR")]
+    trusted_proxies: Vec<String>,
+    /// How often the ingress's configuration is checked, so a restarted Caddy gets it back.
+    #[arg(long, default_value = "10s")]
+    ingress_sync: String,
 }
 
 #[derive(clap::Args)]
@@ -76,9 +120,13 @@ struct NodeArgs {
     /// The address of the standalone API; it must be loopback.
     #[arg(long, default_value = "127.0.0.1:7380")]
     listen: SocketAddr,
-    /// The address of the gateway, which proxies requests to apps by Host; it must be loopback for now.
+    /// The address of the gateway, which proxies requests to apps by Host, on loopback.
     #[arg(long, default_value = "127.0.0.1:7381")]
     gateway_listen: SocketAddr,
+    /// Where the gateway listens for the cluster's ingress: the node's address on the private network, such as
+    /// 10.0.0.5:7382. Requests there need the node's ingress token, which the ingress adds.
+    #[arg(long, value_name = "ADDR")]
+    ingress_listen: Option<SocketAddr>,
     /// Where the node keeps its state, bundles and generated files.
     #[arg(long, env = "KIWI_NEST_STATE_DIR", default_value = "/var/lib/kiwi-nest")]
     state_dir: PathBuf,
@@ -162,6 +210,39 @@ async fn server(args: ServerArgs) -> anyhow::Result<()> {
             kn_proto::agent::MAX_POLL_SECS
         );
     }
+    let tls = match args.ingress {
+        IngressMode::None => None,
+        IngressMode::Acme => Some(kn_server::ingress::Tls::Acme {
+            email: args.acme_email.clone(),
+            ca: args.acme_ca.clone(),
+        }),
+        IngressMode::Internal => Some(kn_server::ingress::Tls::Internal),
+        IngressMode::Certs => Some(kn_server::ingress::Tls::Folder(absolute(
+            args.certs_dir.clone().context("--ingress certs needs --certs-dir")?,
+        )?)),
+        IngressMode::Http => Some(kn_server::ingress::Tls::Http),
+    };
+    if args.ingress != IngressMode::Acme && (args.acme_email.is_some() || args.acme_ca.is_some()) {
+        bail!("--acme-email and --acme-ca go with --ingress acme");
+    }
+    if args.ingress != IngressMode::Certs && args.certs_dir.is_some() {
+        bail!("--certs-dir goes with --ingress certs");
+    }
+    if let Some(tls) = tls {
+        let mut i = kn_server::ingress::IngressConfig::new(args.caddy_admin, tls);
+        i.api_domain = args.api_domain;
+        i.http_port = args.http_port;
+        i.https_port = args.https_port;
+        i.trusted_proxies = args.trusted_proxies;
+        i.sync_interval = duration("--ingress-sync", &args.ingress_sync)?;
+        if i.sync_interval.is_zero() {
+            bail!("--ingress-sync must be at least 1s");
+        }
+        i.validate()?;
+        cfg.ingress = Some(i);
+    } else if args.api_domain.is_some() {
+        bail!("--api-domain needs an --ingress");
+    }
     kn_server::run(cfg, args.listen).await
 }
 
@@ -194,17 +275,21 @@ async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result<()>
     cfg.start_timeout = duration("--start-timeout", &args.start_timeout)?;
     cfg.start_cooldown = duration("--start-cooldown", &args.start_cooldown)?;
     let Some(server) = server else {
+        if args.ingress_listen.is_some() {
+            bail!("a standalone node has no ingress, so no --ingress-listen");
+        }
         return kn_node::run_standalone(cfg, args.listen, args.gateway_listen).await;
     };
     let mut agent = kn_node::agent::AgentConfig::new(server, args.name.unwrap_or_else(host_name));
     agent.join_token = args.join_token;
+    agent.ca_certs = global.read_ca_cert()?;
     for l in &args.labels {
         let (k, v) = l
             .split_once('=')
             .with_context(|| format!("a label is KEY=VALUE, not {l}"))?;
         agent.labels.insert(k.trim().to_string(), v.trim().to_string());
     }
-    kn_node::run_agent(cfg, agent, args.gateway_listen).await
+    kn_node::run_agent(cfg, agent, args.gateway_listen, args.ingress_listen).await
 }
 
 fn main() -> std::process::ExitCode {

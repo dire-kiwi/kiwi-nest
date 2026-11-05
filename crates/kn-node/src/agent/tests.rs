@@ -72,6 +72,7 @@ impl Cluster {
             ports,
             fake: Fake::new(),
             volumes: Arc::new(crate::volumes::fake::Fake::default()),
+            ingress: String::new(),
             rt: None,
             exited: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -184,6 +185,8 @@ struct Node {
     ports: std::ops::RangeInclusive<u16>,
     fake: Arc<Fake>,
     volumes: Arc<crate::volumes::fake::Fake>,
+    /// The ingress address it reports.
+    ingress: String,
     rt: Option<tokio::runtime::Runtime>,
     /// Why the agent stopped, once it has (it was forgotten).
     exited: Arc<std::sync::Mutex<Option<String>>>,
@@ -221,6 +224,7 @@ impl Node {
         let (cfg, fake, volumes) = (self.config(), self.fake.clone(), self.volumes.clone());
         let mut acfg = AgentConfig::new(self.server.clone(), self.name.clone());
         acfg.join_token = join_token;
+        acfg.ingress = self.ingress.clone();
         acfg.poll_wait = Duration::from_secs(1);
         acfg.max_backoff = Duration::from_millis(200);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -328,8 +332,9 @@ async fn two_nodes_join_report_and_run_apps_through_the_server() {
     assert_eq!(f.version, kn_proto::VERSION);
     assert_eq!(f.project_prefix, "kn-a-");
     assert!(f.state.total_bytes > 0);
-    // The node's token is kept, and only there.
+    // The node's token is kept, and only there, with its ingress token.
     assert_eq!(a.agent_file().name, "a");
+    assert!(a.agent_file().ingress_token.unwrap().starts_with("kni_"));
 
     let acc = c.deployed("blog", &yaml("blog.test", &["data"]), "node=a").await;
     assert_eq!((acc.node.as_str(), acc.generation), ("a", 1));
@@ -538,6 +543,7 @@ async fn a_change_replaced_by_a_later_one_wakes_whoever_waits_on_it() {
         node_id: 1,
         name: "a".into(),
         token: "knn_test".into(),
+        ingress_token: None,
         applied: Applied::default(),
         forgotten: None,
     };
@@ -580,6 +586,33 @@ async fn a_change_replaced_by_a_later_one_wakes_whoever_waits_on_it() {
     }
     assert!(inner.applied().volumes["v"].ok);
     assert!(inner.applied().apps.is_empty(), "x is still retrying its download");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_that_joined_before_ingress_tokens_asks_for_its_own() {
+    let c = Cluster::start().await;
+    let mut a = c.node("a", 31000..=31099);
+    a.start(Some(c.join_token().await)).await;
+    let token = a.agent_file().ingress_token.expect("given when it joins");
+    a.kill();
+    // As if it joined before the server gave out ingress tokens.
+    let path = a.dir.join("state/agent.json");
+    let mut f = a.agent_file();
+    f.ingress_token = None;
+    std::fs::write(&path, serde_json::to_vec(&f).unwrap()).unwrap();
+    // Without an ingress address it doesn't need one.
+    a.start(None).await;
+    assert_eq!(a.agent_file().ingress_token, None);
+    a.kill();
+    a.ingress = "127.0.0.1:7382".into();
+    a.start(None).await;
+    assert_eq!(a.agent_file().ingress_token, Some(token));
+    // And it reports where the ingress reaches it.
+    c.until_nodes("a's ingress address", |ns| {
+        ns.iter()
+            .any(|n| n.facts.as_ref().is_some_and(|f| f.ingress == "127.0.0.1:7382"))
+    })
+    .await;
 }
 
 /// The directories under `VOLUMES/forgotten/` on a node.

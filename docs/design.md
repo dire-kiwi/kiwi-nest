@@ -174,8 +174,8 @@ volumes:
   loopback only and has no tokens. It answers only requests whose `Host` is `localhost`, `127.x.x.x` or `[::1]` and
   that carry no `Origin`, so a web page can't reach it by rebinding its DNS name to 127.0.0.1. Besides deploy, list,
   inspect, logs and delete, it has `suspend` and `resume` (step 3). A node's gateway (`--gateway-listen`,
-  `127.0.0.1:7381` by default), standalone or joined to a server, is on loopback too, until step 6 moves it to the
-  private address.
+  `127.0.0.1:7381` by default), standalone or joined to a server, is on loopback too; a node joined to a server
+  also listens for the ingress on its private address (`--ingress-listen`, see the gateway).
 - **An app's status** is kiwi-nest's view of it: `deploying`, `running`, `idle` (stopped for being idle, or its last
   start failed; a request starts it), `suspended` (stopped on purpose; only `resume` starts it) or `failed` (its last
   deploy failed). `inspect` also shows the app's open requests through the gateway.
@@ -284,10 +284,13 @@ VOLUMES/                         one btrfs filesystem per node
 
 - **Nodes connect out.** Each node long-polls the server's API over HTTPS (normally through the ingress) with its own
   token. Nodes need no inbound port except the gateway, and they work behind NAT.
-- **Joining.** `kiwi-nest node --server URL --join-token TOKEN` swaps a one-time join token for the node's own token on
-  its first start, and keeps it with the server's URL in `STATE/agent.json` (mode 0600), so later starts need
-  neither. A node that joined but never polled (it didn't get the answer) may join again under its name with a new
-  join token.
+- **Joining.** `kiwi-nest node --server URL --join-token TOKEN` swaps a one-time join token for the node's own token
+  and its ingress token (see the gateway) on its first start, and keeps them with the server's URL in
+  `STATE/agent.json` (mode 0600), so later starts need neither. A node that joined but never polled (it didn't get
+  the answer) may join again under its name with a new join token, and gets a new ingress token too. A node that
+  joined before the server gave out ingress tokens asks for its own (`GET /agent/ingress-token`) when it starts
+  with `--ingress-listen`. The server's URL is normally its API domain through the ingress, over HTTPS;
+  `--ca-cert FILE` adds a root to trust, such as the ingress's internal CA.
 - **Desired state for what's deployed.** For each node, the server keeps the list of apps and shared volumes it
   should have, each with a bundle digest and a generation number. Every change to a node's desired state bumps the
   node's sequence number, and the entry records the number it changed at. A poll carries the number of the last
@@ -333,30 +336,41 @@ VOLUMES/                         one btrfs filesystem per node
   digest; each app's current bundle is kept until the app is deleted. An upload is checked by the node's rules before
   anything is saved, and only moved into the store by the transaction that saves the change, so a refused deploy
   leaves nothing. Each node keeps a small state file of what it has applied.
-- **Tokens**, all stored only as hashes: admin tokens; deploy tokens limited to name patterns (for example `blog-pr*`
+- **Tokens**, stored only as hashes: admin tokens; deploy tokens limited to name patterns (for example `blog-pr*`
   for a repository's previews), which may also name apps they may use as `--from` (`blog`) without being able to
   change them, and may mount shared volumes `ro` or `snapshot` but not `rw`; node tokens, which `node forget`
   revokes; one-time join tokens. The first start of a server prints its first admin token, once. The last admin
-  token can't be revoked.
+  token can't be revoked. Each node's ingress token (`kni_…`) is the exception: the server keeps it as it is, since
+  the ingress's configuration needs it.
 - **A forgotten node is kept as a tombstone**: its row, marked forgotten, and its token's hash, revoked but not
   deleted. Without them the server couldn't tell a forgotten node coming back from a request with a wrong or unknown
   token, and so couldn't give it the explicit "forgotten" answer that makes it take its apps down. A tombstone is
   never attached to anything again, and its name is free: node names are unique only among nodes that aren't
   forgotten.
-- **The CLI's clusters** are in `~/.config/kiwi-nest/clusters.json` (mode 0600): each a server URL and a token, and
-  which is current. CI can pass `--server` and `--token` (or `KIWI_NEST_SERVER` and `KIWI_NEST_TOKEN`) instead.
+- **The CLI's clusters** are in `~/.config/kiwi-nest/clusters.json` (mode 0600): each a server URL, a token and
+  optionally a CA certificate to trust (`cluster add NAME URL --ca-cert FILE`), and which is current. CI can pass
+  `--server` and `--token` (or `KIWI_NEST_SERVER` and `KIWI_NEST_TOKEN`) instead.
   `--node-api` still talks to a standalone node.
 
 ## Gateway: wake on request, stop when idle
 
 - **Each node runs a gateway**, a reverse proxy built on `hyper`, keyed by Host, whose upstreams are the apps'
   loopback ports.
-- **It listens on the node's private address for the ingress**, and only accepts requests that carry the node's
-  ingress token, so a machine on the private network can't skip basic auth.
+- **It listens on the node's private address for the ingress** (`--ingress-listen ADDR`, such as `10.0.0.5:7382`;
+  a specific address, since the node reports it and the ingress dials it), and only accepts requests that carry
+  the node's ingress token in a `Kiwi-Nest-Ingress` header, so a machine on the private network can't skip basic
+  auth or wake an app. Anything else there (no token, a wrong one, or two) gets 403 before the request is looked
+  at, whatever its host. The token is compared in constant time and removed before the request goes on, so an app
+  never sees it. The loopback listener (`--gateway-listen`) needs no token: whatever runs on the node can reach the
+  apps' loopback ports anyway.
 - **Routing.** The Host is compared case-insensitively, without its port or a trailing dot. The method, path, query,
   headers (bar hop-by-hop ones) and body are passed on unchanged, Host included; HTTP/1.1 upgrades such as WebSockets
-  become a byte stream between the client and the app. Unknown hosts get 404. Forwarding headers
-  (`X-Forwarded-For` and so on) are left to the ingress, in step 6.
+  become a byte stream between the client and the app. Unknown hosts get 404.
+- **Forwarding headers.** `X-Forwarded-For`, `-Proto` and `-Host` are passed on only from requests that carried the
+  ingress token, since the ingress sets them (Caddy replaces a client's unless it comes from a `--trusted-proxy`).
+  On any other request they're replaced with what the gateway saw: the peer's address, `http`, and the Host.
+  `Forwarded`, `X-Forwarded-Port` and `X-Real-IP`, which Caddy would pass on as the client sent them, are removed
+  by both the ingress and the gateway.
 - **A request to a stopped app starts it.** Concurrent requests share one start, which checks the app's mounts (as
   before every start), runs `docker compose start` (or `up`, if some containers are missing) and waits for healthchecks and a TCP connection. A browser page load
   that isn't ready after about a second gets a small "starting" page, which reloads itself when the app is up or
@@ -400,15 +414,49 @@ VOLUMES/                         one btrfs filesystem per node
 
 ## Ingress
 
-- **One Caddy per cluster**, on the server's host by default. The server writes Caddy's whole JSON configuration
-  through its admin API: at startup, after each change, and periodically.
-- **Routing.** Each domain goes to its node's gateway on the private network, with the node's ingress token added.
-  Moving an app changes one upstream; DNS doesn't change.
-- **Basic auth is checked by Caddy** (bcrypt, with a cache of verified credentials), so an unauthenticated request
-  never reaches a node or wakes an app.
-- **TLS modes**, per cluster: automatic ACME; Caddy's internal CA, for VPN-only clusters; a folder of certificates
-  obtained elsewhere, such as a DNS-01 wildcard; plain HTTP behind another proxy or a Cloudflare tunnel you run. A
-  wildcard DNS record and certificate per cluster is the expected setup.
+- **One Caddy per cluster**, on the server's host by default, started by its own service with nothing but its admin
+  API on loopback (`--caddy-admin`, `http://127.0.0.1:2019` by default). The server (`kn-server`'s `ingress`)
+  generates Caddy's whole JSON configuration from its store and loads it through the admin API: at startup, after
+  each change (a deploy or delete saved, a node joining, a report), and every `--ingress-sync` (10 seconds). Each
+  time it first reads Caddy's configuration back (`GET /config/`) and loads its own (`POST /load`) only if they
+  differ, so a restarted Caddy gets its routes back within one interval and an unchanged one is never reloaded.
+  Caddy is told not to save the configuration (`persist: false`), since it holds the nodes' ingress tokens; the
+  server always has it. Without `--ingress` (the default, `none`), the server configures no ingress.
+- **Routing.** Each domain goes to its node's gateway at the ingress address the node reported, with the node's
+  ingress token set in `Kiwi-Nest-Ingress` (replacing any a client sent). Moving an app changes one upstream; DNS
+  doesn't change. Responses are flushed as they come (streams, server-sent events), and WebSockets pass through.
+  Every change in the cluster reloads Caddy, and a reload closes the old configuration's upgraded connections, so
+  they're given a long `stream_close_delay` (24 hours). So a WebSocket opened before a redeploy that removes a
+  basic-auth user can stay open for up to a day; a delete still cuts it off at the gateway. Caddy lets go of idle
+  connections to a gateway after 20 seconds, before the gateway's 30-second limit for a request's headers closes
+  them. An app is routed while it's active; its route goes when its
+  delete is saved. One whose node hasn't reported an ingress address, or whose basic-auth users aren't known (see
+  below), isn't routed, and the server logs why. Unknown hosts get 404 from Caddy itself (over HTTPS, a host with
+  no certificate fails the handshake instead).
+- **Basic auth is checked by Caddy** (bcrypt, with Caddy's cache of verified credentials), so an unauthenticated
+  request never reaches a node or wakes an app. `x-kiwi-nest.auth` takes bcrypt hashes only (`$2a$`, `$2b$` or
+  `$2y$`, a cost from 04 to 31, and 53 characters of bcrypt's base64), user names without `:`, spaces, control
+  characters, `{` or `}` (which Caddy would read as placeholders), and no user twice: the checker refuses anything
+  Caddy would refuse, since one bad entry would make Caddy refuse the whole cluster's configuration. The server
+  keeps each app's users and hashes for the ingress, and the API never returns them. An app deployed before the
+  server kept them gets them from its stored bundle when the server starts; one whose bundle can't be read isn't
+  routed until it's deployed again, rather than routed without its auth. The `Authorization` header is passed on to
+  the app.
+- **The server's own API** is published at `--api-domain` (such as `kn.example.com`), proxied to the server's
+  listener (`--listen`, loopback by default), so nodes and the CLI reach it over HTTPS. No app may use that domain.
+- **TLS modes**, per cluster (`--ingress MODE`), all with HTTP on `--http-port` (80) and HTTPS on `--https-port`
+  (443):
+  - `acme`: Caddy gets each domain's certificate from Let's Encrypt or ZeroSSL, or from `--acme-ca` with
+    `--acme-email`, and redirects HTTP to HTTPS.
+  - `internal`: Caddy's own CA issues them, for VPN-only clusters. The server writes the CA's root to
+    `STATE/ingress-ca.crt`, for nodes and the CLI to trust with `--ca-cert`.
+  - `certs`: certificates obtained elsewhere, such as a DNS-01 wildcard, from `--certs-dir`: `.pem` files each
+    holding a certificate chain and its key, readable by Caddy. Caddy never asks a CA. The server reloads Caddy
+    when a file in the folder changes, so a renewed certificate is picked up within one interval.
+  - `http`: plain HTTP behind another proxy or a Cloudflare tunnel you run. `--trusted-proxy CIDR` (in any mode)
+    names the proxies whose `X-Forwarded-For` Caddy believes.
+
+  A wildcard DNS record and certificate per cluster is the expected setup.
 
 ## Images
 
@@ -545,6 +593,8 @@ for macOS.
 | D18 | A change is saved and answered at once; the CLI follows it on a route of its own until the node reports it. | Holding the deploy's request open would tie the result to one connection: a server restart or a proxy timeout would lose it, though the change is saved. Following it can resume. |
 | D19 | Nests are known by name and exist while they have members; an app with nothing else naming its nest is in the one named after it. | Named nests let an app join another's (`nest: shop`) without inventing IDs, and a nest that dissolves when emptied can be placed afresh rather than pinning a name to a node for ever. An explicit nest object, made and deleted by hand, would be one more thing to manage for every app. |
 | D20 | `node forget` keeps the node and its token as a tombstone, and a forgotten node acts only on an exact `410 node forgotten` for its own ID. | Deleting them would make a returning node indistinguishable from a wrong token, so it couldn't be told to stand down. Acting on anything looser (a `401`, a network error, a proxy's `410`) would let an outage or a misconfiguration take a working node's apps down. |
+| D21 | Each node has its own ingress token, which the ingress adds as a header and the gateway's ingress listener requires (403 otherwise) and removes; forwarding headers are believed only alongside it. | The gateway can't tell the ingress from another machine on the private network by address alone, and basic auth is checked only at the ingress. A token per node limits what one leaked token opens. TLS client certificates between Caddy and the gateways would also work, but need a CA and rotation for little more on a firewalled LAN. |
+| D22 | The server owns Caddy's whole configuration, keeps it only in Caddy's memory, and on every change and every interval reads it back and loads its own only if it differs. | Caddy restarting with nothing is then the same as any other drift, fixed within one interval, and an unchanged configuration never reloads Caddy (which would close WebSockets). Patching parts of Caddy's configuration would need the server to track what Caddy has; letting Caddy persist it would write the ingress tokens to disk. |
 
 ## Build plan
 
@@ -633,6 +683,11 @@ flowchart LR
    *Verify with real Caddy:* a request through the ingress wakes an app on node B; a request without credentials
    never reaches the node; a direct request to a gateway without the token gets 403; a WebSocket through the ingress
    keeps its app awake; a restarted Caddy gets its configuration back.
+   *Done:* `crates/kn-server/src/ingress/tests.rs` (the configuration in each TLS mode, the routes from the store,
+   syncing with a fake admin API), the gateway's tests of its ingress listener, and
+   `crates/kiwi-nest/tests/ingress.rs` (real Caddy with its internal CA, the server and two nodes, the CLI and nodes
+   through the ingress; it needs `KIWI_NEST_TEST_CADDY` or `caddy` on the PATH). `scripts/dev-cluster.sh` starts
+   Caddy too when it's on the PATH.
 7. **Registry.** The server runs `registry:3`, served behind the ingress with token auth, with node credentials
    written on join; `kiwi-nest push` (tags and runs `docker push`); garbage collection with a grace period across
    the whole inventory; pruning on each node; the platform check.
@@ -684,7 +739,15 @@ flowchart LR
   apps keep running. Accepted, since this isn't HA. The server's state is backed up (step 8).
 - **The private network, and plain traffic on the LAN.** Traffic between the ingress and the gateways crosses the LAN
   unencrypted, ingress token included. That's acceptable on a home LAN: gateways are firewalled to the server VM, and
-  nodes reach the server's API over HTTPS, so node tokens never cross the LAN in the clear. WireGuard between the VMs
-  can be added later without changing kiwi-nest.
+  nodes reach the server's API over HTTPS, so node tokens never cross the LAN in the clear. Someone who can sniff
+  the LAN can read an ingress token, and with it skip the ingress's basic auth for that node's apps; the firewall
+  still keeps them off the gateway. WireGuard between the VMs can be added later without changing kiwi-nest.
+- **Caddy's admin API.** It listens on loopback without authentication, as Caddy's does, so anything running on the
+  server's host can read the configuration (the nodes' ingress tokens, the bcrypt hashes) and change it. The
+  server's host is expected to run nothing else untrusted. Caddy keeps the configuration only in memory.
+- **Nodes choose their ingress address.** The ingress dials whatever address a node reports, so a compromised node
+  could point its apps' domains at another service the server's host or the private network can reach. Routes to
+  Caddy's admin API and the server's own API are refused (and logged); anything else is trusted, as nodes are (see
+  the non-goals).
 - **Crash-consistent snapshots.** `--from` and backups capture data like a power cut. That's fine for SQLite and
   PostgreSQL; an app that can't recover from a crash would need a dump hook (Later).

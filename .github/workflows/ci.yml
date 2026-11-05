@@ -27,6 +27,19 @@ jobs:
         run: rustup toolchain install || rustup show
       - uses: Swatinem/rust-cache@v2
       - run: docker version && docker compose version
+      - name: Install Caddy for the ingress tests
+        env:
+          CADDY_VERSION: 2.11.9
+        run: |
+          base=https://github.com/caddyserver/caddy/releases/download/v$CADDY_VERSION
+          tarball=caddy_${CADDY_VERSION}_linux_amd64.tar.gz
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "$base/$tarball"
+          curl -fsSLO "$base/caddy_${CADDY_VERSION}_checksums.txt"
+          grep " $tarball\$" "caddy_${CADDY_VERSION}_checksums.txt" | sha512sum -c -
+          mkdir -p caddy && tar -xzf "$tarball" -C caddy caddy
+          caddy/caddy version
+          echo "KIWI_NEST_TEST_CADDY=$RUNNER_TEMP/caddy/caddy" >> "$GITHUB_ENV"
       - name: Mount a btrfs filesystem for the tests
         run: |
           command -v mkfs.btrfs || { sudo apt-get update -qq && sudo apt-get install -y -qq btrfs-progs; }

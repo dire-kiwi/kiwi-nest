@@ -7,12 +7,14 @@
 //! - [`scheduler`] places new nests on nodes.
 //! - [`hub`] is what's only in memory: which nodes are online, waking polls, and callers waiting for results.
 //! - [`api`] is the API for the CLI, and [`agent`] the link for nodes.
+//! - [`ingress`] configures the cluster's Caddy.
 //!
 //! On disk:
 //!
 //! ```text
-//! STATE/server.sqlite   the database (WAL mode)
-//! STATE/bundles/        bundles by digest; see [`bundles`]
+//! STATE/server.sqlite     the database (WAL mode)
+//! STATE/bundles/          bundles by digest; see [`bundles`]
+//! STATE/ingress-ca.crt    the ingress's internal CA's root certificate, with `--ingress internal`
 //! ```
 
 pub mod agent;
@@ -21,6 +23,7 @@ pub mod auth;
 pub mod bundles;
 pub mod error;
 pub mod hub;
+pub mod ingress;
 pub mod scheduler;
 pub mod store;
 
@@ -60,6 +63,8 @@ pub struct ServerConfig {
     pub limits: Limits,
     /// The limits on what `volume load` uploads.
     pub load_limits: Limits,
+    /// The ingress Caddy to configure, if any.
+    pub ingress: Option<ingress::IngressConfig>,
     /// How placement counts memory.
     pub scheduler: scheduler::Settings,
 }
@@ -73,6 +78,7 @@ impl ServerConfig {
             command_timeout: Duration::from_secs(600),
             limits: Limits::default(),
             load_limits: Limits::for_volumes(),
+            ingress: None,
             scheduler: scheduler::Settings::default(),
         }
     }
@@ -89,6 +95,7 @@ pub struct Inner {
     pub hub: Arc<Hub>,
     /// Cancelled when the server shuts down, so open polls answer at once.
     pub stop: CancellationToken,
+    pub ingress: Option<Arc<ingress::Ingress>>,
 }
 
 impl Deref for Server {
@@ -104,10 +111,15 @@ impl Server {
     /// token and returns it: the only time it's shown.
     pub async fn open(cfg: ServerConfig) -> anyhow::Result<(Server, Option<String>)> {
         std::fs::create_dir_all(&cfg.state_dir).with_context(|| format!("creating {}", cfg.state_dir.display()))?;
+        let ingress = cfg
+            .ingress
+            .clone()
+            .map(|i| ingress::Ingress::new(i, &cfg.state_dir).map(Arc::new))
+            .transpose()?;
         let store = Store::open(&cfg.state_dir.join("server.sqlite"))?;
         let bundles = Arc::new(Bundles::open(cfg.state_dir.join("bundles"))?);
         let hub = Arc::new(Hub::new(cfg.offline_after));
-        let b = bundles.clone();
+        let (b, limits) = (bundles.clone(), cfg.limits.clone());
         let first = store
             .call(move |c| {
                 let now = store::now();
@@ -116,6 +128,7 @@ impl Server {
                     tracing::info!(lost, "commands open when the server stopped won't be answered");
                 }
                 store::apps::sweep(c, &b)?;
+                store::apps::backfill_auth(c, &b, &limits)?;
                 if store::tokens::admin_count(c)? > 0 {
                     return Ok(None);
                 }
@@ -131,6 +144,7 @@ impl Server {
             bundles,
             hub,
             stop: CancellationToken::new(),
+            ingress,
         }));
         Ok((server, first))
     }
@@ -142,6 +156,19 @@ impl Server {
             // JSON bodies (reports, tokens, joins) are small; uploads are streamed under their own limits.
             .layer(axum::extract::DefaultBodyLimit::max(MAX_JSON))
             .with_state(self.clone())
+    }
+
+    /// Has the ingress's configuration checked, after something it's made from may have changed.
+    pub fn ingress_changed(&self) {
+        if let Some(i) = &self.ingress {
+            i.changed();
+        }
+    }
+
+    /// What a domain is kept for, if apps can't use it: the server's own API.
+    pub fn reserved_domain(&self, domain: &str) -> Option<&'static str> {
+        let i = self.ingress.as_ref()?;
+        (i.config().api_domain.as_deref() == Some(domain)).then_some("the server's API domain")
     }
 
     /// Whether a node is online, for the store's transactions.
@@ -229,6 +256,11 @@ pub async fn serve(
             stop.cancel();
         }
     });
+    if let Some(ingress) = server.ingress.clone() {
+        let api = ingress::reachable(listener.local_addr()?);
+        let (server, stop) = (server.clone(), stop.clone());
+        tokio::spawn(async move { ingress.run(server, api, stop).await });
+    }
     let router = server.router();
     let graceful = axum::serve(listener, router).with_graceful_shutdown(stop.clone().cancelled_owned());
     tokio::select! {

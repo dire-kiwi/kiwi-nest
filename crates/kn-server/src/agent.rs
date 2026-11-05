@@ -10,7 +10,9 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_util::StreamExt;
-use kn_proto::agent::{CommandResult, JoinRequest, JoinResponse, OLDEST_PROTOCOL, PROTOCOL, PollRequest, PollResponse};
+use kn_proto::agent::{
+    CommandResult, IngressToken, JoinRequest, JoinResponse, OLDEST_PROTOCOL, PROTOCOL, PollRequest, PollResponse,
+};
 use kn_proto::api::TokenKind;
 use tokio::sync::mpsc;
 use tokio_util::io::ReaderStream;
@@ -25,6 +27,7 @@ pub fn router() -> Router<Server> {
     let p = kn_proto::API_PREFIX;
     Router::new()
         .route(&format!("{p}/agent/join"), post(join))
+        .route(&format!("{p}/agent/ingress-token"), get(ingress_token))
         .route(&format!("{p}/agent/poll"), post(poll))
         .route(&format!("{p}/agent/report"), post(report))
         .route(&format!("{p}/agent/bundles/{{digest}}"), get(bundle))
@@ -40,14 +43,28 @@ async fn join(State(s): State<Server>, axum::Json(req): axum::Json<JoinRequest>)
         )));
     }
     let token = auth::generate(TokenKind::Node);
+    let ingress_token = auth::generate_ingress();
     let (join_hash, node_hash, name, facts) = (auth::hash(&req.token), auth::hash(&token), req.name, req.facts);
-    let n = name.clone();
+    let (n, i) = (name.clone(), ingress_token.clone());
     let node_id = s
         .store
-        .call(move |c| nodes::join(c, &join_hash, &n, &facts, &node_hash, store::now()))
+        .call(move |c| nodes::join(c, &join_hash, &n, &facts, &node_hash, &i, store::now()))
         .await?;
     tracing::info!(node = name, node_id, "a node joined");
-    Ok(axum::Json(JoinResponse { node_id, name, token }))
+    s.ingress_changed();
+    Ok(axum::Json(JoinResponse {
+        node_id,
+        name,
+        token,
+        ingress_token,
+    }))
+}
+
+/// The node's ingress token, for a node that joined before the server gave them out.
+async fn ingress_token(State(s): State<Server>, node: NodeCaller) -> Result<axum::Json<IngressToken>> {
+    let id = node.node_id;
+    let ingress_token = s.store.call(move |c| nodes::ingress_token(c, id)).await?;
+    Ok(axum::Json(IngressToken { ingress_token }))
 }
 
 /// A long poll: records the report, then answers with what changed after `since` and any commands, as soon as
@@ -71,6 +88,8 @@ async fn poll(
         .call(move |c| apps::record_report(c, &b, id, &report, store::now()))
         .await?;
     s.hub.reported(id);
+    // The node's ingress address may have changed, or a delete finished.
+    s.ingress_changed();
 
     let wait = Duration::from_secs(req.wait_secs.unwrap_or(u64::MAX)).min(s.cfg.poll_timeout);
     let deadline = tokio::time::Instant::now() + wait;
@@ -154,6 +173,7 @@ async fn report(
         .call(move |c| apps::record_report(c, &b, id, &report, store::now()))
         .await?;
     s.hub.reported(id);
+    s.ingress_changed();
     Ok(StatusCode::NO_CONTENT)
 }
 

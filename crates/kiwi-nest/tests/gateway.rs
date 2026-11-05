@@ -120,71 +120,6 @@ fn wait_for(what: &str, timeout: Duration, mut f: impl FnMut() -> bool) {
     }
 }
 
-/// A Python web app that takes two seconds to start listening, answers `/` with `hello`, and echoes bytes on a
-/// WebSocket at `/ws`.
-fn write_python_bundle(dir: &Path, idle_timeout: &str) {
-    std::fs::create_dir_all(dir.join("app")).unwrap();
-    std::fs::write(
-        dir.join("app/server.py"),
-        r#"import base64, hashlib, http.server, time
-
-time.sleep(2)
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, *args):
-        pass
-
-    def do_GET(self):
-        if self.path == "/ws":
-            key = self.headers["Sec-WebSocket-Key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-            self.send_response(101)
-            self.send_header("Upgrade", "websocket")
-            self.send_header("Connection", "Upgrade")
-            self.send_header("Sec-WebSocket-Accept", base64.b64encode(hashlib.sha1(key.encode()).digest()).decode())
-            self.end_headers()
-            self.wfile.flush()
-            self.close_connection = True
-            while True:
-                data = self.connection.recv(4096)
-                if not data:
-                    return
-                self.connection.sendall(data)
-        body = b"hello"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-http.server.ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
-"#,
-    )
-    .unwrap();
-    std::fs::write(
-        dir.join("compose.yaml"),
-        format!(
-            r#"x-kiwi-nest: {{ domain: wake.localhost, service: web, port: 8080, idle_timeout: {idle_timeout} }}
-services:
-  web:
-    image: python:3.13-alpine
-    command: ["python", "-u", "/app/server.py"]
-    user: "{}"
-    init: true
-    volumes: ["./app:/app"]
-    restart: always
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/')"]
-      interval: 1s
-      retries: 60
-"#,
-            uid_gid()
-        ),
-    )
-    .unwrap();
-}
-
 #[test]
 fn waking_idling_websockets_and_the_starting_page() {
     if !docker_and_btrfs() {
@@ -193,7 +128,7 @@ fn waking_idling_websockets_and_the_starting_page() {
     let prefix = random_prefix();
     let node = Node::start(&prefix);
     let bundle = tempfile::tempdir().unwrap();
-    write_python_bundle(bundle.path(), "4s");
+    write_python_bundle(bundle.path(), "wake.localhost", "4s", "");
     node.ok(&["deploy", "wake", bundle.path().to_str().unwrap()]);
     let project = format!("{prefix}wake");
     let gw = node.gateway;
