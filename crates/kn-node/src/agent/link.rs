@@ -104,6 +104,20 @@ impl Link {
         Ok(check(resp).await?.json().await?)
     }
 
+    /// Sends a report on its own, beside the open poll.
+    pub async fn report(&self, report: &kn_proto::agent::Report) -> Result<(), LinkError> {
+        let resp = self
+            .http
+            .post(format!("{}/agent/report", self.base))
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(30))
+            .json(report)
+            .send()
+            .await?;
+        check(resp).await?;
+        Ok(())
+    }
+
     /// Downloads a bundle into `dest`, refusing more than `limit` bytes.
     pub async fn bundle(&self, digest: &str, dest: &Path, limit: u64) -> Result<(), LinkError> {
         let resp = self

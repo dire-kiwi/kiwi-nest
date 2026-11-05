@@ -4,8 +4,10 @@
 //!   0600) with the server's URL, so later starts need neither.
 //! - **Polling.** One loop long-polls the server with a report of the node (its facts, its apps and volumes, the
 //!   changes it has finished, the commands it's running), and hands what comes back to the applier and to command
-//!   tasks. It never waits for either, so it never stalls. When a change finishes, it re-polls at once, so the
-//!   report reaches the server (and the CLI waiting on it) without waiting for the poll to time out.
+//!   tasks. It never waits for either, so it never stalls. When a change finishes, a reporter sends a report at
+//!   once on a route of its own, beside the open poll (never cancelling it, so a command on its way can't be
+//!   lost), so it reaches the server (and the CLI waiting on it) without waiting for the poll to time out. Reports
+//!   carry a serial, so one that arrives late never replaces a newer one.
 //! - **Applying.** Each app and each shared volume has a worker that applies its changes one at a time, always the
 //!   latest one it has been given. A deploy downloads its bundle by digest, checks the digest, and deploys it with
 //!   the server's generation. Every finished change, done or failed, is recorded in `agent.json` with its
@@ -162,6 +164,9 @@ struct Inner {
     work: Mutex<HashMap<Key, watch::Sender<Option<Want>>>>,
     /// Bumped whenever a change finishes, for workers waiting on others.
     progress: watch::Sender<u64>,
+    /// The serial of the next report: milliseconds since the epoch when the agent started, so it keeps growing
+    /// across restarts too.
+    serial: std::sync::atomic::AtomicU64,
 }
 
 fn now() -> u64 {
@@ -265,6 +270,11 @@ impl Agent {
                 running: Mutex::new(BTreeSet::new()),
                 work: Mutex::new(HashMap::new()),
                 progress: watch::Sender::new(0),
+                serial: std::sync::atomic::AtomicU64::new(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis() as u64),
+                ),
             }),
         })
     }
@@ -278,9 +288,12 @@ impl Agent {
         self.inner.node_id
     }
 
-    /// Polls the server until `stop` is cancelled.
+    /// Polls the server, and reports finished changes, until `stop` is cancelled.
     pub async fn run(&self, stop: CancellationToken) {
-        self.inner.clone().poll_loop(stop).await
+        tokio::join!(
+            self.inner.clone().poll_loop(stop.clone()),
+            self.inner.clone().report_loop(stop)
+        );
     }
 }
 
@@ -356,6 +369,23 @@ impl Inner {
             }),
             applied: self.applied(),
             running_commands: self.running.lock().expect("running").iter().copied().collect(),
+            serial: self.serial.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+        }
+    }
+
+    /// Sends a report whenever a change finishes. If it can't, the next poll carries the news anyway.
+    async fn report_loop(self: Arc<Self>, stop: CancellationToken) {
+        loop {
+            tokio::select! {
+                _ = stop.cancelled() => return,
+                _ = self.report_now.notified() => {}
+            }
+            let report = self.report().await;
+            let applied = report.applied.clone();
+            match self.link.report(&report).await {
+                Ok(()) => self.prune(&applied).await,
+                Err(e) => tracing::debug!(error = %e, "sending a report failed; the next poll carries it"),
+            }
         }
     }
 
@@ -374,8 +404,6 @@ impl Inner {
             };
             let result = tokio::select! {
                 _ = stop.cancelled() => return,
-                // Something finished: report it now, rather than when this poll answers.
-                _ = self.report_now.notified() => continue,
                 r = self.link.poll(&req, self.cfg.poll_wait) => r,
             };
             match result {
@@ -625,7 +653,13 @@ impl Inner {
                 };
                 let r = self
                     .apps
-                    .volume_load(&c.name, LoadSource::Zip(upload.path().to_path_buf()))
+                    .volume_load(
+                        &c.name,
+                        LoadSource::Digest {
+                            zip: upload.path().to_path_buf(),
+                            digest: digest.clone(),
+                        },
+                    )
                     .await;
                 drop(upload);
                 match r {

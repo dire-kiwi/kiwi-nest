@@ -9,6 +9,7 @@
 //! | --- | --- | --- |
 //! | `POST /agent/join` | [`JoinRequest`] | [`JoinResponse`] |
 //! | `POST /agent/poll` | [`PollRequest`] | [`PollResponse`], once something changed or the wait is over |
+//! | `POST /agent/report` | [`Report`] | `204 No Content`, at once |
 //! | `GET /agent/bundles/{digest}` | | the bundle's ZIP |
 //! | `POST /agent/commands/{id}/result` | [`CommandResult`] | `204 No Content` |
 //! | `POST /agent/commands/{id}/output` | the command's output, streamed | `204 No Content` |
@@ -21,7 +22,8 @@
 //!
 //! **Applying.** The node applies one change at a time per app or volume, and records each one it finishes (done or
 //! failed) with its generation ([`Applied`]), so a change it gets again, after a restart or a lost response, never
-//! runs twice. A change cut off by a restart wasn't finished, so it runs again.
+//! runs twice. A change cut off by a restart wasn't finished, so it runs again. Once one finishes, the node sends a
+//! report straight away on `/agent/report`, beside its open poll, so the server hears without waiting for the poll.
 //!
 //! **Commands** are one-off actions (logs, suspend, …). Each is handed out in at most one poll response, and never
 //! again. The node runs it in a task of its own, so polling carries on, lists it in
@@ -131,6 +133,10 @@ pub struct Report {
     /// Commands it has been given and not yet sent the result of.
     #[serde(default)]
     pub running_commands: Vec<u64>,
+    /// Increases with every report the node makes, so the server never replaces a report with an older one that
+    /// arrived late.
+    #[serde(default)]
+    pub serial: u64,
 }
 
 /// One app on a node.

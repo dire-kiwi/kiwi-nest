@@ -619,8 +619,20 @@ pub fn desired_since(c: &Connection, node_id: u64, since: u64) -> Result<(u64, V
 
 /// Records a node's report, and finishes the deletes it says are done: their names and domains are released. A
 /// delete that failed leaves the app (or volume) in place. Returns whether any delete finished or failed.
+///
+/// A report older than the one recorded (by its serial: it arrived late) only counts as a sign of life.
 pub fn record_report(c: &mut Connection, bundles: &Bundles, node_id: u64, report: &Report, now: u64) -> Result<bool> {
     let tx = c.transaction()?;
+    let recorded: Option<u64> = tx.query_row(
+        "SELECT json_extract(report, '$.serial') FROM nodes WHERE id = ?1",
+        [node_id],
+        |r| r.get(0),
+    )?;
+    if recorded.is_some_and(|r| report.serial < r) {
+        tx.execute("UPDATE nodes SET last_seen = ?2 WHERE id = ?1", params![node_id, now])?;
+        tx.commit()?;
+        return Ok(false);
+    }
     tx.execute(
         "UPDATE nodes SET facts = ?2, report = ?3, last_seen = ?4 WHERE id = ?1",
         params![
@@ -683,6 +695,21 @@ pub fn record_report(c: &mut Connection, bundles: &Bundles, node_id: u64, report
             }
             _ => {}
         }
+    }
+    // A node that has applied generations beyond what's recorded (the database was restored from an older backup):
+    // the next change must come after them, or the node would take it for one it has already applied.
+    for (name, o) in &report.applied.apps {
+        tx.execute(
+            "UPDATE apps SET generation = ?3 WHERE name = ?1 AND node_id = ?2 AND state != 'deleted' AND generation < ?3",
+            params![name, node_id, o.generation],
+        )?;
+    }
+    for (name, o) in &report.applied.volumes {
+        tx.execute(
+            "UPDATE volumes SET generation = ?3 WHERE name = ?1 AND node_id = ?2 AND state != 'deleted'
+             AND generation < ?3",
+            params![name, node_id, o.generation],
+        )?;
     }
     tx.commit()?;
     if settled {

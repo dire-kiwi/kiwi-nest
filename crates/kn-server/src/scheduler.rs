@@ -17,7 +17,7 @@ pub fn free_memory(memory: u64, placed: u64) -> i128 {
 }
 
 pub fn pick(c: &Connection, online: &dyn Fn(u64) -> bool, arch: Option<&str>) -> Result<u64> {
-    let all = nodes::list(c)?;
+    let all = nodes::list_facts(c)?;
     if all.is_empty() {
         return Err(Error::Conflict(
             "no node has joined the cluster yet: make a join token with `kiwi-nest token create join`".into(),

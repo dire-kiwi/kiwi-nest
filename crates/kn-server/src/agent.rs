@@ -26,6 +26,7 @@ pub fn router() -> Router<Server> {
     Router::new()
         .route(&format!("{p}/agent/join"), post(join))
         .route(&format!("{p}/agent/poll"), post(poll))
+        .route(&format!("{p}/agent/report"), post(report))
         .route(&format!("{p}/agent/bundles/{{digest}}"), get(bundle))
         .route(&format!("{p}/agent/commands/{{id}}/result"), post(command_result))
         .route(&format!("{p}/agent/commands/{{id}}/output"), post(command_output))
@@ -88,9 +89,14 @@ async fn poll(
         }
         let running = if first { Some(running.clone()) } else { None };
         first = false;
+        let superseded = open.ticket();
         let ((seq, apps, volumes), reset, lost, commands) = s
             .store
             .call(move |c| {
+                // Checked again here, where nothing else can hand out commands meanwhile.
+                if superseded() {
+                    return Ok(((since, Vec::new(), Vec::new()), false, Vec::new(), Vec::new()));
+                }
                 let mut desired = apps::desired_since(c, id, since)?;
                 // A node that asks from a sequence number the server hasn't reached (the server's database was
                 // restored from an older backup) gets everything again.
@@ -127,6 +133,20 @@ async fn poll(
             }
         }
     }
+}
+
+/// A report on its own, sent when a change finishes, so the server hears without waiting for the poll.
+async fn report(
+    State(s): State<Server>,
+    node: NodeCaller,
+    axum::Json(report): axum::Json<kn_proto::agent::Report>,
+) -> Result<StatusCode> {
+    let (b, id) = (s.bundles.clone(), node.node_id);
+    s.store
+        .call(move |c| apps::record_report(c, &b, id, &report, store::now()))
+        .await?;
+    s.hub.reported(id);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// A bundle, for a node that has an app or volume using it.

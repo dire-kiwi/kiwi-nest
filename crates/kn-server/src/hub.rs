@@ -57,6 +57,12 @@ impl OpenPoll {
     pub fn superseded(&self) -> bool {
         self.node.epoch.load(Ordering::SeqCst) != self.epoch
     }
+
+    /// A check of the same, to make inside the store's transaction that hands out commands.
+    pub fn ticket(&self) -> impl Fn() -> bool + Send + 'static {
+        let (node, epoch) = (self.node.clone(), self.epoch);
+        move || node.epoch.load(Ordering::SeqCst) != epoch
+    }
 }
 
 impl Drop for OpenPoll {

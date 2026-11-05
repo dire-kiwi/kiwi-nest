@@ -304,6 +304,13 @@ async fn deploy(
         .await
         .map_err(|e| Error::Internal(e.into()))??;
     drop(scratch);
+    if !caller.is_admin() && !checked.shared_rw.is_empty() {
+        return Err(Error::Forbidden(format!(
+            "a deploy token can't mount shared volumes read-write ({}); mount them `ro` or `snapshot`, or deploy \
+             with an admin token",
+            checked.shared_rw.join(", ")
+        )));
+    }
     let (b, online) = (s.bundles.clone(), s.online());
     let d = apps::Deploy {
         name: name.clone(),
@@ -611,7 +618,7 @@ async fn volume_delete_snapshot(
 
 async fn node_list(State(s): State<Server>, caller: Caller) -> Result<axum::Json<Vec<NodeInfo>>> {
     caller.admin()?;
-    let (nodes, placed) = s.store.call(|c| Ok((nodes::list(c)?, apps::placed(c)?))).await?;
+    let (nodes, placed) = s.store.call(|c| Ok((nodes::list_facts(c)?, apps::placed(c)?))).await?;
     let placed: HashMap<u64, (u64, u64)> = placed.into_iter().map(|(n, m, c)| (n, (m, c))).collect();
     Ok(axum::Json(
         nodes

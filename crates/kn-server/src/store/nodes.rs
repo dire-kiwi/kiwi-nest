@@ -55,6 +55,14 @@ pub fn list(c: &Connection) -> Result<Vec<Node>> {
     rows.map(|r| node(r?)).collect()
 }
 
+/// Every node without its last report (`report` is `None`), for callers that only need the facts: a report holds
+/// every app and volume, so parsing them all is the costly part.
+pub fn list_facts(c: &Connection) -> Result<Vec<Node>> {
+    let mut st = c.prepare("SELECT id, name, seq, facts, NULL, joined_at, last_seen FROM nodes ORDER BY name")?;
+    let rows = st.query_map([], row)?;
+    rows.map(|r| node(r?)).collect()
+}
+
 pub fn get(c: &Connection, id: u64) -> Result<Node> {
     let r = c
         .query_row(&format!("SELECT {COLUMNS} FROM nodes WHERE id = ?1"), [id], row)

@@ -345,10 +345,15 @@ impl Client {
         }
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        match serde_json::from_str::<ErrorBody>(&text) {
-            Ok(body) => bail!(message(&body.error, &body.problems)),
-            Err(_) => bail!("{what} answered {status}: {}", text.trim()),
+        let message = match serde_json::from_str::<ErrorBody>(&text) {
+            Ok(body) => message(&body.error, &body.problems),
+            Err(_) => format!("{what} answered {status}: {}", text.trim()),
+        };
+        Err(StatusError {
+            status: status.as_u16(),
+            message,
         }
+        .into())
     }
 
     async fn json<T: serde::de::DeserializeOwned>(&self, req: reqwest::RequestBuilder) -> anyhow::Result<T> {
@@ -463,6 +468,31 @@ impl Client {
     }
 }
 
+/// An error answer from the API.
+#[derive(Debug)]
+pub struct StatusError {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StatusError {}
+
+/// Whether an error looks like the server (or a proxy in front of it) being briefly away, such as while it
+/// restarts: no connection, a broken or timed-out one, or a gateway error.
+fn transient(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>().is_some()
+            || c.downcast_ref::<StatusError>()
+                .is_some_and(|s| matches!(s.status, 502..=504))
+    })
+}
+
 fn message(error: &str, problems: &[String]) -> String {
     let mut msg = error.to_string();
     for p in problems {
@@ -516,7 +546,7 @@ async fn wait_for(client: &Client, kind: &str, acc: &Accepted, timeout: Duration
                 st
             }
             // The server may be restarting: the change is saved, so keep following it for a while.
-            Err(e) if e.to_string().starts_with("couldn't reach") => {
+            Err(e) if transient(&e) => {
                 let since = *unreachable_since.get_or_insert_with(Instant::now);
                 if since.elapsed() > Duration::from_secs(120) {
                     return Err(e);
@@ -527,13 +557,15 @@ async fn wait_for(client: &Client, kind: &str, acc: &Accepted, timeout: Duration
             Err(e) => return Err(e),
         };
         if st.done {
+            // Another deploy came after this one (a later push, say): the app is that one's now, which isn't a
+            // failure of this one.
             if let Some(g) = st.superseded_by {
-                bail!(
-                    "generation {} of `{}` was replaced by generation {g} before node `{}` applied it",
-                    acc.generation,
-                    acc.name,
-                    st.node
+                eprintln!(
+                    "generation {} of `{}` was followed by generation {g} before this could see how it went; the app \
+                     is at generation {g} now",
+                    acc.generation, acc.name
                 );
+                return Ok(st);
             }
             if !st.ok {
                 bail!(message(
@@ -602,6 +634,9 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                 acc.name, acc.generation, acc.node
             );
             let st = wait_for(&client, "apps", &acc, timeout).await?;
+            if st.superseded_by.is_some() {
+                return Ok(());
+            }
             match client.inspect(&name).await {
                 Ok(info) => print_deployed(&info, Some(&st.notes)),
                 Err(_) => println!(
@@ -1152,6 +1187,23 @@ mod tests {
             token: None,
             config_dir: Some(dir.to_path_buf()),
         }
+    }
+
+    #[test]
+    fn only_a_server_briefly_away_is_retried() {
+        let gateway: anyhow::Error = StatusError {
+            status: 502,
+            message: "bad gateway".into(),
+        }
+        .into();
+        assert!(transient(&gateway.context("following the deploy")));
+        let refused: anyhow::Error = StatusError {
+            status: 403,
+            message: "no".into(),
+        }
+        .into();
+        assert!(!transient(&refused));
+        assert!(!transient(&anyhow::anyhow!("couldn't reach the server")));
     }
 
     #[test]

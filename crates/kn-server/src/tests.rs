@@ -756,3 +756,84 @@ async fn json_bodies_are_limited_even_before_a_token_is_checked() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+/// A bundle at `domain` mounting shared volume `corpus` in `mode`.
+fn shared_bundle(domain: &str, mode: &str) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("compose.yaml"),
+        format!(
+            "x-kiwi-nest: {{ domain: {domain}, service: web, port: 80, shared: {{ corpus: {{ target: /c, mode: {mode} }} }} }}\n\
+             services:\n  web:\n    image: x\n"
+        ),
+    )
+    .unwrap();
+    kn_bundle::dir::pack(dir.path(), &kn_bundle::Limits::default()).unwrap()
+}
+
+#[tokio::test]
+async fn a_deploy_token_cant_mount_a_shared_volume_read_write() {
+    let env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    env.poll(&mut a).await;
+    let r = env
+        .req(reqwest::Method::PUT, "/volumes/corpus", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    let ci = env.token(json!({"kind": "deploy", "patterns": ["blog-pr*"]})).await;
+    let up = |mode: &'static str, token: String| {
+        env.req(reqwest::Method::PUT, &format!("/apps/blog-pr-{mode}"), &token)
+            .header("content-type", "application/zip")
+            .body(shared_bundle(&format!("{mode}.test"), mode))
+            .send()
+    };
+    let (status, msg) = error(up("rw", ci.clone()).await.unwrap()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(msg.contains("read-write (corpus)"), "{msg}");
+    assert_eq!(up("ro", ci.clone()).await.unwrap().status(), StatusCode::ACCEPTED);
+    assert_eq!(up("snapshot", ci).await.unwrap().status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        up("rw", env.admin.clone()).await.unwrap().status(),
+        StatusCode::ACCEPTED
+    );
+    // Each goes to the volume's node, and the volume can't be deleted while they mount it.
+    let r = env
+        .req(reqwest::Method::DELETE, "/volumes/corpus", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn a_report_that_arrives_late_doesnt_replace_a_newer_one() {
+    let env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    env.poll(&mut a).await;
+    env.deploy(&env.admin, "blog", "blog.test", "").await;
+    env.poll(&mut a).await;
+    a.applied("blog", 1, true, false);
+    a.report.serial = 10;
+    let r = env
+        .req(reqwest::Method::POST, "/agent/report", &a.token)
+        .json(&a.report)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert!(env.status("blog", 1).await.done);
+    // An older report (built before the change finished) arriving afterwards changes nothing.
+    let mut old = a.report.clone();
+    old.serial = 9;
+    old.applied.apps.clear();
+    let r = env
+        .req(reqwest::Method::POST, "/agent/report", &a.token)
+        .json(&old)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NO_CONTENT);
+    assert!(env.status("blog", 1).await.done);
+}

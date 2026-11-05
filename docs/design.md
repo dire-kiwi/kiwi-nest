@@ -285,8 +285,10 @@ VOLUMES/                         one btrfs filesystem per node
   a shared volume waits for that app's or volume's earlier changes; deletes and volume changes wait for every
   earlier change. A change whose bundle can't be downloaded yet is retried. Each poll reports the node's facts
   (architecture, memory, btrfs space including unallocated, disk space, labels, version), each app's generation,
-  state and error, and the changes it has finished; a node that finishes a change polls again at once, so its report
-  arrives without waiting for the poll to time out. A node that was offline catches up when it reconnects: nothing
+  state and error, and the changes it has finished. A node that finishes a change also sends a report at once on a route of its
+  own, beside its open poll (never cancelling it, so a command on its way can't be lost), and reports carry a
+  serial, so one that arrives late never replaces a newer one. A node that has applied generations beyond what the
+  server records (its database restored from an older backup) moves the server's generations up to them. A node that was offline catches up when it reconnects: nothing
   needs re-sending, and nothing runs twice.
 - **Commands for one-off actions** (inspect, logs, suspend, resume, back up now, …) return their result through the
   same link. Each is handed out in at most one poll response, in the same transaction that marks it delivered. The
@@ -294,13 +296,16 @@ VOLUMES/                         one btrfs filesystem per node
   in each report until its result is sent, and sends the result, or streams the output for logs, back to the server,
   which passes it to the caller. A delivered command that the next report doesn't list (its response was lost, or the
   node restarted) has failed, and the caller is told; a command whose caller gave up before it was handed out is
-  cancelled, so it never runs late. Only the newest of a node's polls hands anything out.
+  cancelled, so it never runs late; a caller stops waiting as soon as the node goes offline. Only the newest of a
+  node's polls hands anything out.
 - **Online** means the node has a poll open, or polled within `--offline-after` (15 seconds).
 - **`deploy` waits until the node reports the new generation**, then prints the result. The server saves the deploy
   and answers at once; the CLI then follows the change (`…/changes/GENERATION`, a long poll of its own) until the node
   reports it done or failed, through server restarts and node outages, saying so if the node goes offline. If the
   target node is offline, `deploy` refuses up front and saves nothing, so CI fails rather than waits; `--queue`
-  overrides that, and returns once the deploy is saved. Deletes and `volume create|load|delete` work the same way.
+  overrides that, and returns once the deploy is saved. A deploy followed by another before its outcome was seen
+  (two pushes in a row) says so and succeeds, since the app is the later one's now. Deletes and `volume
+  create|load|delete` work the same way.
 - **The server owns names and domains.** It reserves both, in the transaction that changes the desired state, so two
   apps can never claim the same domain on different nodes. A deleted app keeps its name and domain until its node
   reports the delete done.
@@ -316,7 +321,7 @@ VOLUMES/                         one btrfs filesystem per node
   leaves nothing. Each node keeps a small state file of what it has applied.
 - **Tokens**, all stored only as hashes: admin tokens; deploy tokens limited to name patterns (for example `blog-pr*`
   for a repository's previews), which may also name apps they may use as `--from` (`blog`) without being able to
-  change them; node tokens, which `node forget` revokes; one-time join tokens. The first start of a server prints
+  change them, and may mount shared volumes `ro` or `snapshot` but not `rw`; node tokens, which `node forget` revokes; one-time join tokens. The first start of a server prints
   its first admin token, once. The last admin token can't be revoked.
 - **The CLI's clusters** are in `~/.config/kiwi-nest/clusters.json` (mode 0600): each a server URL and a token, and
   which is current. CI can pass `--server` and `--token` (or `KIWI_NEST_SERVER` and `KIWI_NEST_TOKEN`) instead.

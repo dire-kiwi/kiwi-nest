@@ -8,7 +8,8 @@
 //! - **Deploy** tokens may deploy, delete, inspect, suspend, resume and read the logs of apps whose names match one
 //!   of their patterns, where `*` matches any run of characters (`blog-pr*`). `--from` may name an app that matches
 //!   a pattern or one of the token's `from` patterns, so a token for `blog-pr*` with `from: [blog]` can make
-//!   previews of `blog` without being able to change it. They can't touch volumes, nodes or tokens.
+//!   previews of `blog` without being able to change it. They can't create, load or delete volumes, nor mount one
+//!   read-write (`ro` and `snapshot` mounts can't change it), and they can't touch nodes or tokens.
 //! - **Join** tokens are used once, by a node, to get its node token.
 //! - **Node** tokens are a node's own, for the agent link only.
 

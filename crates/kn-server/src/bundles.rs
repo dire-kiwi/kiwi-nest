@@ -124,6 +124,8 @@ pub struct CheckedApp {
     pub arch: Option<String>,
     /// The shared volumes it mounts.
     pub shared: Vec<String>,
+    /// Those it mounts read-write.
+    pub shared_rw: Vec<String>,
     /// The host paths it mounts, which its node must allow.
     pub host_paths: Vec<String>,
     /// What its services may use: each `mem_limit`, or [`DEFAULT_SERVICE_MEMORY`].
@@ -172,6 +174,12 @@ pub fn check_app(zip: &Path, scratch: &Path, limits: &Limits) -> Result<CheckedA
         domain: m.domain.clone(),
         arch: m.arch.map(|a| a.as_str().to_string()),
         shared: m.shared.keys().cloned().collect(),
+        shared_rw: m
+            .shared
+            .iter()
+            .filter(|(_, s)| s.mode == kn_bundle::manifest::SharedMode::Rw)
+            .map(|(n, _)| n.clone())
+            .collect(),
         host_paths,
         memory_bytes,
     })

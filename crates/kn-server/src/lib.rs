@@ -165,7 +165,22 @@ impl Server {
             id,
         };
         self.hub.wake(node_id);
-        let outcome = tokio::time::timeout(self.cfg.command_timeout, rx).await;
+        // Give up as soon as the node goes offline, rather than waiting out the timeout for an answer that won't
+        // come. (One it's running may still finish; its result is then recorded and dropped.)
+        let offline = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if !self.hub.is_online(node_id) {
+                    return;
+                }
+            }
+        };
+        let outcome = tokio::select! {
+            r = tokio::time::timeout(self.cfg.command_timeout, rx) => r,
+            _ = offline => {
+                return Err(Error::Offline(format!("node `{node}` went offline before answering")));
+            }
+        };
         drop(guard);
         match outcome {
             Ok(Ok(Outcome::Lost)) => Err(Error::Offline(format!(
