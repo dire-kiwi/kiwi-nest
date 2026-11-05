@@ -130,6 +130,8 @@ pub struct CheckedApp {
     pub host_paths: Vec<String>,
     /// What its services may use: each `mem_limit`, or [`DEFAULT_SERVICE_MEMORY`].
     pub memory_bytes: u64,
+    /// Its basic-auth users, checked by the ingress.
+    pub auth: Vec<crate::ingress::BasicAuth>,
 }
 
 fn bundle_error(e: kn_bundle::BundleError) -> Error {
@@ -182,6 +184,14 @@ pub fn check_app(zip: &Path, scratch: &Path, limits: &Limits) -> Result<CheckedA
             .collect(),
         host_paths,
         memory_bytes,
+        auth: m
+            .auth
+            .iter()
+            .map(|a| crate::ingress::BasicAuth {
+                user: a.user.clone(),
+                hash: a.hash.clone(),
+            })
+            .collect(),
     })
 }
 

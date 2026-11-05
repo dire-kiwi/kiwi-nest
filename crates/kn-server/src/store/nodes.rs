@@ -94,8 +94,8 @@ pub fn by_token(c: &Connection, hash: &str) -> Result<Option<(u64, String)>> {
     .optional()?)
 }
 
-/// Swaps a join token for a node: records the node and its token's hash, and uses up the join token, in one
-/// transaction. A node that joined but never polled (it didn't get the answer) may join again under the same name
+/// Swaps a join token for a node: records the node, its token's hash and its ingress token, and uses up the join
+/// token, in one transaction. A node that joined but never polled (it didn't get the answer) may join again under the same name
 /// with a new join token; its old token is revoked.
 pub fn join(
     c: &mut Connection,
@@ -103,6 +103,7 @@ pub fn join(
     name: &str,
     facts: &NodeFacts,
     node_hash: &str,
+    ingress_token: &str,
     now: u64,
 ) -> Result<u64> {
     let tx = c.transaction()?;
@@ -129,13 +130,16 @@ pub fn join(
                 "UPDATE tokens SET revoked_at = ?2 WHERE node_id = ?1 AND revoked_at IS NULL",
                 params![id, now],
             )?;
-            tx.execute("UPDATE nodes SET facts = ?2 WHERE id = ?1", params![id, facts_json])?;
+            tx.execute(
+                "UPDATE nodes SET facts = ?2, ingress_token = ?3 WHERE id = ?1",
+                params![id, facts_json, ingress_token],
+            )?;
             id
         }
         None => {
             tx.execute(
-                "INSERT INTO nodes (name, facts, joined_at) VALUES (?1, ?2, ?3)",
-                params![name, facts_json, now],
+                "INSERT INTO nodes (name, facts, joined_at, ingress_token) VALUES (?1, ?2, ?3, ?4)",
+                params![name, facts_json, now, ingress_token],
             )?;
             tx.last_insert_rowid() as u64
         }
@@ -144,6 +148,12 @@ pub fn join(
     tokens::create(&tx, TokenKind::Node, node_hash, name, &[], &[], Some(id), now)?;
     tx.commit()?;
     Ok(id)
+}
+
+/// The node's ingress token.
+pub fn ingress_token(c: &Connection, id: u64) -> Result<String> {
+    let t: Option<String> = c.query_row("SELECT ingress_token FROM nodes WHERE id = ?1", [id], |r| r.get(0))?;
+    t.ok_or_else(|| Error::Internal(anyhow::anyhow!("node {id} has no ingress token")))
 }
 
 /// The node's facts as a struct, for placement.

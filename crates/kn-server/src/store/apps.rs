@@ -346,11 +346,11 @@ pub fn deploy(
     let created_at = live.map_or(now, |a| a.created_at);
     tx.execute(
         "INSERT INTO apps (name, state, node_id, domain, generation, seq, bundle_digest, from_app, shared,
-                           memory_bytes, keep_data, created_at, updated_at)
-         VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11)
+                           memory_bytes, keep_data, created_at, updated_at, auth)
+         VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12)
          ON CONFLICT (name) DO UPDATE SET state = 'active', node_id = ?2, domain = ?3, generation = ?4, seq = ?5,
              bundle_digest = ?6, from_app = ?7, shared = ?8, memory_bytes = ?9, keep_data = 0, created_at = ?10,
-             updated_at = ?11",
+             updated_at = ?11, auth = ?12",
         params![
             d.name,
             node_id,
@@ -362,7 +362,8 @@ pub fn deploy(
             serde_json::to_string(&d.bundle.shared)?,
             d.bundle.memory_bytes,
             created_at,
-            now
+            now,
+            serde_json::to_string(&d.bundle.auth)?
         ],
     )?;
     tx.commit()?;
@@ -729,6 +730,43 @@ pub fn gc(c: &Connection, bundles: &Bundles) -> Result<()> {
     let gone: Vec<String> = st.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     for d in gone {
         bundles.remove(&d);
+    }
+    Ok(())
+}
+
+/// Reads the basic-auth users of apps deployed before the server kept them, from their bundles. An app whose
+/// bundle can't be read keeps none recorded, and the ingress doesn't route it until it's deployed again.
+pub fn backfill_auth(c: &Connection, bundles: &Bundles, limits: &kn_bundle::Limits) -> Result<()> {
+    let missing: Vec<(String, String)> = {
+        let mut st = c.prepare(
+            "SELECT name, bundle_digest FROM apps
+             WHERE auth IS NULL AND state != 'deleted' AND bundle_digest IS NOT NULL",
+        )?;
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for (name, digest) in missing {
+        let checked = (|| {
+            let zip = bundles
+                .path(&digest)
+                .ok_or_else(|| Error::Internal(anyhow::anyhow!("bad digest {digest}")))?;
+            let scratch = bundles.temp_dir()?;
+            crate::bundles::check_app(&zip, scratch.path(), limits)
+        })();
+        match checked {
+            Ok(b) => {
+                c.execute(
+                    "UPDATE apps SET auth = ?2 WHERE name = ?1",
+                    params![name, serde_json::to_string(&b.auth)?],
+                )?;
+            }
+            Err(e) => tracing::warn!(
+                app = name,
+                error = %e,
+                "couldn't read the app's basic-auth users from its bundle; the ingress won't route it until it's \
+                 deployed again"
+            ),
+        }
     }
     Ok(())
 }
