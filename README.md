@@ -6,4 +6,5 @@ Apps run as single instances on a small cluster of machines. Apps that share dat
 pull-request previews, live together in a *nest* on one node, so previews can start from instant btrfs snapshots of
 production's data. Idle apps stop and wake on their next request.
 
-kiwi-nest is at the design stage: see [docs/design.md](docs/design.md) for the design and the build plan.
+kiwi-nest is being built: see [docs/design.md](docs/design.md) for the design and the build plan. So far a single node
+runs apps from bundles (`kiwi-nest node --standalone`), driven by the CLI (`kiwi-nest deploy|list|inspect|logs|delete`).

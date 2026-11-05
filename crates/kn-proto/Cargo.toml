@@ -1,0 +1,9 @@
+[package]
+name = "kn-proto"
+description = "Types shared by the kiwi-nest CLI, server and nodes"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
