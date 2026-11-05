@@ -49,6 +49,9 @@ pub struct Backups {
     running: Mutex<HashSet<(Kind, String)>>,
     /// When a scheduled backup last failed, by target, kind and name.
     failed: Mutex<HashMap<(String, Kind, String), Instant>>,
+    /// Run right after the database is copied, before the bundles are linked (tests race deletes against it).
+    #[cfg(test)]
+    pub(crate) after_copy: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Backups {
@@ -60,6 +63,8 @@ impl Backups {
             own: tokio::sync::Mutex::new(()),
             running: Mutex::new(HashSet::new()),
             failed: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            after_copy: Mutex::new(None),
         })
     }
 
@@ -166,9 +171,15 @@ impl Server {
             dest.to_path_buf(),
             self.bundles.clone(),
         );
+        #[cfg(test)]
+        let hook = self.backups.after_copy.lock().expect("hook").take();
         let copied = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<String>, usize)> {
             let copy = dest_owned.join(DATABASE);
             copy_database(&db, &copy)?;
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook();
+            }
             let conn = rusqlite::Connection::open(&copy)?;
             let digests: Vec<String> = conn
                 .prepare("SELECT digest FROM bundles ORDER BY digest")?
@@ -212,10 +223,21 @@ pub fn copy_database(from: &Path, to: &Path) -> anyhow::Result<()> {
     src.busy_timeout(Duration::from_secs(30))?;
     let mut dst = rusqlite::Connection::open(to).with_context(|| format!("creating {}", to.display()))?;
     {
+        use rusqlite::backup::StepResult;
         let backup = rusqlite::backup::Backup::new(&src, &mut dst)?;
-        backup
-            .run_to_completion(-1, Duration::from_millis(50), None)
-            .context("copying the database")?;
+        // Every page in one step: one read transaction, so the copy is of one instant. A step that finds the
+        // database locked (it can't, in WAL mode, but a checkpoint might briefly) is tried again.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match backup.step(-1).context("copying the database")? {
+                StepResult::Done => break,
+                StepResult::More => {}
+                StepResult::Busy | StepResult::Locked if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                r => anyhow::bail!("copying the database: {r:?}"),
+            }
+        }
     }
     // A plain file, without a WAL beside it.
     dst.pragma_update(None, "journal_mode", "DELETE")?;

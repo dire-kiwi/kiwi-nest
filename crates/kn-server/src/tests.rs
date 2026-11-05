@@ -16,6 +16,10 @@ use super::*;
 
 struct Env {
     dir: tempfile::TempDir,
+    /// Backup targets the server is given.
+    targets: Vec<kn_proto::backup::TargetConfig>,
+    /// The running server, for what tests reach into.
+    server: Option<Server>,
     url: String,
     admin: String,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -23,20 +27,28 @@ struct Env {
     http: reqwest::Client,
 }
 
-fn config(dir: &std::path::Path) -> ServerConfig {
+fn config(dir: &std::path::Path, targets: &[kn_proto::backup::TargetConfig]) -> ServerConfig {
     let mut cfg = ServerConfig::new(dir.join("server"));
     cfg.poll_timeout = Duration::from_millis(500);
     cfg.offline_after = Duration::from_millis(1500);
     cfg.command_timeout = Duration::from_secs(10);
+    cfg.backup_targets = targets.to_vec();
+    cfg.backup_check_interval = Duration::from_millis(200);
     cfg
 }
 
 impl Env {
     async fn new() -> Env {
+        Env::with_targets(Vec::new()).await
+    }
+
+    async fn with_targets(targets: Vec<kn_proto::backup::TargetConfig>) -> Env {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env {
             dir,
+            targets,
+            server: None,
             url: String::new(),
             admin: String::new(),
             stop: None,
@@ -49,7 +61,8 @@ impl Env {
     }
 
     async fn start(&mut self) -> Option<String> {
-        let (server, first) = Server::open(config(self.dir.path())).await.unwrap();
+        let (server, first) = Server::open(config(self.dir.path(), &self.targets)).await.unwrap();
+        self.server = Some(server.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         self.url = format!("http://{}{}", listener.local_addr().unwrap(), kn_proto::API_PREFIX);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1368,4 +1381,402 @@ async fn a_forgotten_node_is_told_so_and_its_names_are_released() {
     let (status, _) = poll_status(&env, &a.token).await;
     assert_eq!(status, StatusCode::GONE);
     assert!(env.poll(&mut again).await.apps.is_empty());
+}
+
+/// A backup target in a local directory.
+fn dir_target(dir: &std::path::Path, every: Option<&str>) -> kn_proto::backup::TargetConfig {
+    kn_proto::backup::TargetConfig {
+        name: "local".into(),
+        s3: None,
+        ssh: None,
+        dir: Some(kn_proto::backup::DirConfig {
+            path: dir.to_string_lossy().into_owned(),
+        }),
+        prefix: "home/".into(),
+        format: kn_proto::backup::Format::Tar,
+        every: every.map(str::to_string),
+        full_every: None,
+        keep: Default::default(),
+    }
+}
+
+impl Env {
+    async fn backup_server(&self) -> kn_proto::backup::BackupResult {
+        let r = self
+            .req(reqwest::Method::POST, "/backups/server", &self.admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
+        r.json().await.unwrap()
+    }
+
+    /// Restores a server backup into a fresh state directory, and returns it.
+    async fn restore_server(&self, key: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let targets = kn_backup::target::open_all(self.targets.clone()).unwrap();
+        backups::restore(&dir.path().join("server"), &targets, None, key)
+            .await
+            .unwrap();
+        dir
+    }
+}
+
+/// The apps and bundle references in a database, and whether every bundle it refers to is in `bundles`.
+fn restored(state: &std::path::Path) -> (Vec<String>, Vec<String>) {
+    let c = rusqlite::Connection::open(state.join("server.sqlite")).unwrap();
+    let check: String = c.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+    assert_eq!(check, "ok");
+    let apps: Vec<String> = c
+        .prepare("SELECT name FROM apps WHERE state = 'active' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let digests: Vec<String> = c
+        .prepare(
+            "SELECT bundle_digest FROM apps WHERE bundle_digest IS NOT NULL
+             UNION SELECT digest FROM bundles",
+        )
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let missing: Vec<String> = digests
+        .into_iter()
+        .filter(|d| {
+            !state
+                .join("bundles")
+                .join(format!("{}.zip", d.replace(':', "-")))
+                .exists()
+        })
+        .collect();
+    (apps, missing)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_servers_backup_is_consistent_while_deploys_write() {
+    let store = tempfile::tempdir().unwrap();
+    let mut env = Env::with_targets(vec![dir_target(store.path(), None)]).await;
+    let mut a = env.join("a", 64 << 30).await;
+    env.poll(&mut a).await;
+    let node_token = a.token.clone();
+    // Keep the node online while deploys run.
+    let (url, http) = (env.url.clone(), env.http.clone());
+    let keepalive = tokio::spawn(async move {
+        loop {
+            let _ = http
+                .post(format!("{url}/agent/report"))
+                .bearer_auth(&node_token)
+                .json(&Report::default())
+                .send()
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+
+    // Deploys as fast as they go, each recording when it was saved.
+    let saved = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, std::time::Instant)>::new()));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut writers = Vec::new();
+    for w in 0..3 {
+        let (url, http, admin, saved, stop) = (
+            env.url.clone(),
+            env.http.clone(),
+            env.admin.clone(),
+            saved.clone(),
+            stop.clone(),
+        );
+        writers.push(tokio::spawn(async move {
+            let mut i = 0;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let name = format!("app-{w}-{i}");
+                let r = http
+                    .put(format!("{url}/apps/{name}"))
+                    .bearer_auth(&admin)
+                    .header("content-type", "application/zip")
+                    .body(bundle(&format!("{name}.test")))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::ACCEPTED, "{}", r.text().await.unwrap());
+                saved.lock().unwrap().push((name, std::time::Instant::now()));
+                i += 1;
+            }
+        }));
+    }
+    let mut checks = Vec::new();
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let began = std::time::Instant::now();
+        let before: Vec<String> = saved
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, t)| *t < began)
+            .map(|(n, _)| n.clone())
+            .collect();
+        let r = env.backup_server().await;
+        assert!(r.failed.is_empty(), "{r:?}");
+        checks.push((r.made[0].key.clone(), before));
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    for w in writers {
+        w.await.unwrap();
+    }
+    keepalive.abort();
+    assert!(saved.lock().unwrap().len() > 8, "the deploys should have kept writing");
+
+    for (key, before) in &checks {
+        let dir = env.restore_server(key).await;
+        let (apps, missing) = restored(&dir.path().join("server"));
+        assert!(missing.is_empty(), "{key} lacks bundles {missing:?}");
+        for n in before {
+            assert!(apps.contains(n), "{key} lacks {n}, deployed before it began");
+        }
+    }
+
+    // A server started on a restored state has the apps, and its admin token still works.
+    let (key, before) = checks.last().unwrap();
+    let dir = env.restore_server(key).await;
+    std::mem::swap(&mut env.dir, &mut { dir });
+    env.restart().await;
+    let names: Vec<String> = env.apps().await.into_iter().map(|a| a.name).collect();
+    for n in before {
+        assert!(names.contains(n), "{n}");
+    }
+    // Restoring over a database is refused.
+    let targets = kn_backup::target::open_all(env.targets.clone()).unwrap();
+    let e = backups::restore(&env.dir.path().join("server"), &targets, None, key)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("already has a database"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_during_the_servers_backup_never_loses_a_bundle_it_refers_to() {
+    let store = tempfile::tempdir().unwrap();
+    let env = Env::with_targets(vec![dir_target(store.path(), None)]).await;
+    let mut a = env.join("a", 8 << 30).await;
+    env.poll(&mut a).await;
+    for (name, domain) in [("blog", "blog.test"), ("shop", "shop.test")] {
+        assert_eq!(
+            env.deploy(&env.admin, name, domain, "").await.status(),
+            StatusCode::ACCEPTED
+        );
+        a.applied(name, 1, true, false);
+    }
+    env.poll(&mut a).await;
+    assert_eq!(env.bundle_files(), 2);
+
+    // Right after the database is copied (so the copy refers to both bundles), blog is redeployed with a new
+    // bundle (so its old one has nothing referring to it) and shop is deleted, all the way.
+    let (url, http, admin, token) = (env.url.clone(), env.http.clone(), env.admin.clone(), a.token.clone());
+    let mut report = a.report.clone();
+    let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+        tokio::runtime::Handle::current().block_on(async move {
+            let r = http
+                .put(format!("{url}/apps/blog"))
+                .bearer_auth(&admin)
+                .header("content-type", "application/zip")
+                .body(bundle("blog2.test"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::ACCEPTED);
+            let r = http
+                .delete(format!("{url}/apps/shop"))
+                .bearer_auth(&admin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::ACCEPTED);
+            report.applied.apps.insert(
+                "shop".into(),
+                Outcome {
+                    generation: 2,
+                    ok: true,
+                    error: None,
+                    problems: vec![],
+                    notes: vec![],
+                    deleted: true,
+                    data_digest: None,
+                    finished_at: 0,
+                },
+            );
+            report.serial = u64::MAX;
+            let r = http
+                .post(format!("{url}/agent/report"))
+                .bearer_auth(&token)
+                .json(&report)
+                .send()
+                .await
+                .unwrap();
+            assert!(r.status().is_success());
+        });
+    });
+    *env.server.as_ref().unwrap().backups.after_copy.lock().unwrap() = Some(hook);
+    let r = env.backup_server().await;
+    assert!(r.failed.is_empty(), "{r:?}");
+    assert!(r.notes.iter().any(|n| n.contains("2 bundles")), "{r:?}");
+    assert!(!r.notes.iter().any(|n| n.contains("couldn't be copied")), "{r:?}");
+    // Deletion resumed afterwards: blog's old bundle and shop's are gone, blog's new one is there.
+    assert_eq!(env.bundle_files(), 1);
+
+    let dir = env.restore_server(&r.made[0].key).await;
+    let (apps, missing) = restored(&dir.path().join("server"));
+    assert_eq!(apps, ["blog", "shop"]);
+    assert!(missing.is_empty(), "{missing:?}");
+}
+
+#[tokio::test]
+async fn restores_are_checked_before_anything_is_saved() {
+    let store = tempfile::tempdir().unwrap();
+    let env = Env::with_targets(vec![dir_target(store.path(), None)]).await;
+    let mut a = env.join("a", 8 << 30).await;
+    env.poll(&mut a).await;
+    // A backup of `blog`, as a node would have made it.
+    let key = "apps/blog/20261106T030000Z.tar.zst";
+    let t = kn_backup::target::open_all(env.targets.clone()).unwrap();
+    let k = kn_backup::Key::parse(key).unwrap();
+    t[0].upload(&k, Box::new(|_| Ok(()))).await.unwrap();
+
+    let r = env
+        .deploy(&env.admin, "blog", "blog.test", &format!("restore={key}"))
+        .await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED, "{}", r.text().await.unwrap());
+    let resp = env.poll(&mut a).await;
+    match &resp.apps[0].want {
+        AppWant::Deploy { restore, .. } => {
+            let r = restore.as_ref().unwrap();
+            assert_eq!((r.target.as_str(), r.key.as_str()), ("local", key));
+        }
+        w => panic!("{w:?}"),
+    }
+    // A key that isn't there, a broken one, or one of the wrong kind: refused, and nothing saved.
+    for (q, want) in [
+        ("restore=apps/blog/20261107T030000Z.tar.zst", StatusCode::NOT_FOUND),
+        ("restore=apps/blog/nope", StatusCode::BAD_REQUEST),
+        ("restore=volumes/blog/20261106T030000Z.tar.zst", StatusCode::BAD_REQUEST),
+        (&format!("restore={key}&target=other"), StatusCode::NOT_FOUND),
+        (&format!("restore={key}&from=blog"), StatusCode::BAD_REQUEST),
+    ] {
+        let r = env.deploy(&env.admin, "copy", "copy.test", q).await;
+        assert_eq!(r.status(), want, "{q}: {}", r.text().await.unwrap());
+    }
+    assert!(!env.apps().await.iter().any(|a| a.name == "copy"));
+    // A deploy token may restore another app's backup only where it may use that app as --from.
+    let t1 = env.token(json!({"kind": "deploy", "patterns": ["blog-pr*"]})).await;
+    let r = env.deploy(&t1, "blog-pr1", "pr1.test", &format!("restore={key}")).await;
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let t2 = env
+        .token(json!({"kind": "deploy", "patterns": ["blog-pr*"], "from": ["blog"]}))
+        .await;
+    let r = env.deploy(&t2, "blog-pr1", "pr1.test", &format!("restore={key}")).await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED, "{}", r.text().await.unwrap());
+    // And deploy tokens list only their own apps' backups.
+    let list: Vec<kn_proto::backup::BackupInfo> = env
+        .req(reqwest::Method::GET, "/backups", &t2)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list.is_empty(), "{list:?}");
+    let list: Vec<kn_proto::backup::BackupInfo> = env
+        .req(reqwest::Method::GET, "/backups?kind=app&name=blog", &env.admin)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!((list[0].key.as_str(), list[0].target.as_str()), (key, "local"));
+}
+
+#[tokio::test]
+async fn scheduled_backups_go_to_nodes_and_skip_apps_that_opt_out() {
+    let store = tempfile::tempdir().unwrap();
+    let env = Env::with_targets(vec![dir_target(store.path(), Some("1h"))]).await;
+    let mut a = env.join("a", 8 << 30).await;
+    env.poll(&mut a).await;
+    assert_eq!(
+        env.deploy(&env.admin, "blog", "blog.test", "").await.status(),
+        StatusCode::ACCEPTED
+    );
+    let preview = {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("compose.yaml"),
+            "x-kiwi-nest: { domain: pr.test, service: web, port: 80, backups: false }\nservices:\n  web:\n    image: x\n",
+        )
+        .unwrap();
+        kn_bundle::dir::pack(dir.path(), &kn_bundle::Limits::default()).unwrap()
+    };
+    let r = env
+        .req(reqwest::Method::PUT, "/apps/blog-pr1", &env.admin)
+        .header("content-type", "application/zip")
+        .body(preview)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    a.applied("blog", 1, true, false);
+    a.applied("blog-pr1", 1, true, false);
+    env.poll(&mut a).await;
+
+    // Within a few checks: a backup command for blog (not the preview), naming the due target; and the server
+    // backed up itself.
+    let mut got = None;
+    for _ in 0..50 {
+        let resp = env.poll(&mut a).await;
+        if let Some(c) = resp
+            .commands
+            .into_iter()
+            .find(|c| matches!(c.action, Action::Backup { .. }))
+        {
+            got = Some(c);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let c = got.expect("a scheduled backup");
+    assert_eq!(
+        c.action,
+        Action::Backup {
+            what: kn_proto::backup::Kind::App,
+            name: "blog".into(),
+            targets: vec!["local".into()],
+            full: false,
+        }
+    );
+    let t = kn_backup::target::open_all(env.targets.clone()).unwrap();
+    let mut server_backups = Vec::new();
+    for _ in 0..50 {
+        server_backups = t[0].list(Some((kn_proto::backup::Kind::Server, ""))).await.unwrap();
+        if !server_backups.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(server_backups.len(), 1);
+    // Nodes get the targets, credentials included; the CLI's tokens don't.
+    let r = env
+        .req(reqwest::Method::GET, "/agent/backup-targets", &a.token)
+        .send()
+        .await
+        .unwrap();
+    let cfgs: Vec<kn_proto::backup::TargetConfig> = r.json().await.unwrap();
+    assert_eq!(cfgs, env.targets);
+    let r = env
+        .req(reqwest::Method::GET, "/agent/backup-targets", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    let _ = CommandResult::Ok { value: json!(null) };
 }
