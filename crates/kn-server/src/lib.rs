@@ -7,6 +7,7 @@
 //! - [`scheduler`] places new nests on nodes.
 //! - [`hub`] is what's only in memory: which nodes are online, waking polls, and callers waiting for results.
 //! - [`api`] is the API for the CLI, and [`agent`] the link for nodes.
+//! - [`backups`] is the backup targets, the schedule, and backups (and restores) of the server's own state.
 //! - [`ingress`] configures the cluster's Caddy.
 //! - [`registry`] runs the cluster's image registry, checks its credentials and collects its garbage.
 //!
@@ -16,12 +17,14 @@
 //! STATE/server.sqlite     the database (WAL mode)
 //! STATE/bundles/          bundles by digest; see [`bundles`]
 //! STATE/ingress-ca.crt    the ingress's internal CA's root certificate, with `--ingress internal`
+//! STATE/bundles/tmp/      uploads being checked, and the server's state being copied for a backup
 //! STATE/registry/         the image registry's configuration and storage; see [`registry::container`]
 //! ```
 
 pub mod agent;
 pub mod api;
 pub mod auth;
+pub mod backups;
 pub mod bundles;
 pub mod error;
 pub mod hub;
@@ -72,6 +75,12 @@ pub struct ServerConfig {
     pub scheduler: scheduler::Settings,
     /// The image registry to run, if any. It needs the ingress.
     pub registry: Option<registry::RegistryConfig>,
+    /// Where backups go: handed to nodes, and used for the server's own.
+    pub backup_targets: Vec<kn_proto::backup::TargetConfig>,
+    /// How often the schedule looks for backups that are due.
+    pub backup_check_interval: Duration,
+    /// How long a backup on a node may take before its caller gives up (the node carries on).
+    pub backup_timeout: Duration,
 }
 
 impl ServerConfig {
@@ -86,6 +95,9 @@ impl ServerConfig {
             ingress: None,
             scheduler: scheduler::Settings::default(),
             registry: None,
+            backup_targets: Vec::new(),
+            backup_check_interval: Duration::from_secs(60),
+            backup_timeout: Duration::from_secs(6 * 3600),
         }
     }
 }
@@ -99,6 +111,7 @@ pub struct Inner {
     pub store: Store,
     pub bundles: Arc<Bundles>,
     pub hub: Arc<Hub>,
+    pub backups: Arc<backups::Backups>,
     /// Cancelled when the server shuts down, so open polls answer at once.
     pub stop: CancellationToken,
     pub ingress: Option<Arc<ingress::Ingress>>,
@@ -126,6 +139,7 @@ impl Server {
         container: Option<Arc<dyn registry::container::Container>>,
     ) -> anyhow::Result<(Server, Option<String>)> {
         std::fs::create_dir_all(&cfg.state_dir).with_context(|| format!("creating {}", cfg.state_dir.display()))?;
+        let backups = Arc::new(backups::Backups::new(cfg.backup_targets.clone()).context("the backup targets")?);
         let registry = match (&cfg.registry, &mut cfg.ingress) {
             (None, _) => None,
             (Some(_), None) => anyhow::bail!("the registry is served by the ingress, so it needs one"),
@@ -175,6 +189,7 @@ impl Server {
             store,
             bundles,
             hub,
+            backups,
             stop: CancellationToken::new(),
             ingress,
             registry,
@@ -217,6 +232,11 @@ impl Server {
 
     /// Runs a command on a node and waits for its outcome. Refused at once if the node is offline.
     pub async fn command(&self, node_id: u64, node: &str, action: Action) -> Result<Outcome> {
+        self.command_with(node_id, node, action, self.cfg.command_timeout).await
+    }
+
+    /// [`Server::command`], waiting up to `timeout`.
+    pub async fn command_with(&self, node_id: u64, node: &str, action: Action, timeout: Duration) -> Result<Outcome> {
         if !self.hub.is_online(node_id) {
             return Err(Error::Offline(format!("node `{node}` is offline")));
         }
@@ -244,7 +264,7 @@ impl Server {
             }
         };
         let outcome = tokio::select! {
-            r = tokio::time::timeout(self.cfg.command_timeout, rx) => r,
+            r = tokio::time::timeout(timeout, rx) => r,
             _ = offline => {
                 return Err(Error::Offline(format!("node `{node}` went offline before answering")));
             }
@@ -294,6 +314,7 @@ pub async fn serve(
             stop.cancel();
         }
     });
+    tokio::spawn(backups::schedule(server.clone(), stop.clone()));
     if let Some(ingress) = server.ingress.clone() {
         let api = ingress::reachable(listener.local_addr()?);
         let (server, stop) = (server.clone(), stop.clone());

@@ -13,6 +13,7 @@
 //!   nest: blog              # optional
 //!   arch: arm64             # optional: amd64 or arm64
 //!   node_labels: { disk: ssd }
+//!   backups: false          # optional: skip scheduled backups (previews); `kiwi-nest backup` still works
 //! ```
 
 use std::collections::BTreeMap;
@@ -34,6 +35,8 @@ pub struct Manifest {
     pub nest: Option<String>,
     pub arch: Option<Arch>,
     pub node_labels: BTreeMap<String, String>,
+    /// Whether the server's scheduled backups include the app (`backup app` always works).
+    pub backups: bool,
 }
 
 /// One basic-auth user, with a bcrypt hash of their password.
@@ -218,6 +221,7 @@ pub fn parse(value: &Value) -> Result<Manifest, Vec<Problem>> {
         nest: None,
         arch: None,
         node_labels: BTreeMap::new(),
+        backups: true,
     };
     let (mut domain, mut service, mut port) = (false, false, false);
     for (k, v) in map {
@@ -364,6 +368,13 @@ pub fn parse(value: &Value) -> Result<Manifest, Vec<Problem>> {
                     }
                 }
             }
+            "backups" => match v.as_bool() {
+                Some(b) => m.backups = b,
+                None => refuse(
+                    key,
+                    "must be `true` or `false` (whether scheduled backups include the app)".into(),
+                ),
+            },
             other => refuse(other, "isn't a known `x-kiwi-nest` setting".into()),
         }
     }
@@ -435,6 +446,7 @@ shared:
 nest: blog
 arch: arm64
 node_labels: {{ disk: ssd, gen: 3 }}
+backups: false
 "#
         ))
         .unwrap();
@@ -458,6 +470,7 @@ node_labels: {{ disk: ssd, gen: 3 }}
         assert_eq!(m.nest.as_deref(), Some("blog"));
         assert_eq!(m.arch, Some(Arch::Arm64));
         assert_eq!(m.node_labels["gen"], "3");
+        assert!(!m.backups);
     }
 
     #[test]
@@ -465,6 +478,7 @@ node_labels: {{ disk: ssd, gen: 3 }}
         let m = parse_str("{ domain: a.example.com, service: web, port: 80 }").unwrap();
         assert_eq!(m.idle_timeout_secs, 0);
         assert!(m.auth.is_empty() && m.shared.is_empty() && m.nest.is_none() && m.arch.is_none());
+        assert!(m.backups, "scheduled backups are on unless turned off");
     }
 
     #[test]
@@ -537,6 +551,8 @@ node_labels: {{ disk: ssd, gen: 3 }}
             ("arch: x86_64", "x-kiwi-nest.arch"),
             ("node_labels: [ssd]", "x-kiwi-nest.node_labels"),
             ("replicas: 2", "x-kiwi-nest.replicas: isn't a known"),
+            ("backups: 'no'", "x-kiwi-nest.backups"),
+            ("backups: daily", "x-kiwi-nest.backups"),
         ] {
             let key = extra.split(':').next().unwrap();
             let yaml = base

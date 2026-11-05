@@ -45,7 +45,10 @@ enum IngressMode {
 }
 
 #[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct ServerArgs {
+    #[command(subcommand)]
+    cmd: Option<ServerCommand>,
     /// The address to listen on, for the CLI and the nodes (directly, or through the ingress at --api-domain).
     #[arg(long, default_value = "127.0.0.1:7400")]
     listen: SocketAddr,
@@ -119,6 +122,36 @@ struct ServerArgs {
     /// The Docker CLI, for the registry's container.
     #[arg(long, default_value = "docker")]
     docker: PathBuf,
+    /// The backup targets: a YAML (or JSON) file of `targets:`, each with its storage (`s3`, `ssh` or `dir`),
+    /// `format`, `every` and `keep`. Nodes get them from the server.
+    #[arg(long, env = "KIWI_NEST_BACKUP_TARGETS", value_name = "FILE")]
+    backup_targets: Option<PathBuf>,
+    /// How often to look for scheduled backups that are due.
+    #[arg(long, default_value = "1m")]
+    backup_check: String,
+}
+
+#[derive(Subcommand)]
+enum ServerCommand {
+    /// Restore the server's state (its database and bundles) from a backup into an empty state directory; then
+    /// start the server on it. Nodes keep their tokens, and reconnect.
+    Restore {
+        /// The backup's key, such as server/20261106T030000Z.tar.zst (`backup list server` shows them).
+        key: String,
+        /// Where the server keeps its database and bundles.
+        #[arg(
+            long,
+            env = "KIWI_NEST_SERVER_STATE_DIR",
+            default_value = "/var/lib/kiwi-nest-server"
+        )]
+        state_dir: PathBuf,
+        /// The backup targets, as for the server.
+        #[arg(long, env = "KIWI_NEST_BACKUP_TARGETS", value_name = "FILE")]
+        backup_targets: PathBuf,
+        /// The target the key is in [default: the first that has it].
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -183,6 +216,9 @@ struct NodeArgs {
     /// How often images that nothing uses (beyond the grace period) are removed; 0 for never.
     #[arg(long, default_value = "1h")]
     prune_interval: String,
+    /// A standalone node's backup targets, as for the server (a node joined to a server uses the server's).
+    #[arg(long, env = "KIWI_NEST_BACKUP_TARGETS", value_name = "FILE")]
+    backup_targets: Option<PathBuf>,
 }
 
 fn duration(flag: &str, value: &str) -> anyhow::Result<Duration> {
@@ -222,8 +258,34 @@ fn host_name() -> String {
     if name.is_empty() { "node".into() } else { name }
 }
 
+/// Reads a targets file, with the files its targets name (S3 secret keys, SSH keys and known hosts) read in, so the
+/// nodes the server hands them to needn't have those files.
+fn read_targets(path: &std::path::Path) -> anyhow::Result<Vec<kn_proto::backup::TargetConfig>> {
+    let targets = kn_backup::target::read(path)?;
+    // Checked now, so a mistake stops the start rather than the first backup.
+    kn_backup::target::open_all(targets.clone())
+        .with_context(|| format!("the backup targets in {}", path.display()))?;
+    Ok(targets)
+}
+
 async fn server(args: ServerArgs) -> anyhow::Result<()> {
+    if let Some(ServerCommand::Restore {
+        key,
+        state_dir,
+        backup_targets,
+        target,
+    }) = args.cmd
+    {
+        let targets = kn_backup::target::open_all(read_targets(&backup_targets)?)?;
+        let msg = kn_server::backups::restore(&absolute(state_dir)?, &targets, target.as_deref(), &key).await?;
+        println!("{msg}");
+        return Ok(());
+    }
     let mut cfg = kn_server::ServerConfig::new(absolute(args.state_dir)?);
+    if let Some(f) = &args.backup_targets {
+        cfg.backup_targets = read_targets(f)?;
+    }
+    cfg.backup_check_interval = duration("--backup-check", &args.backup_check)?;
     cfg.poll_timeout = duration("--poll-timeout", &args.poll_timeout)?;
     cfg.offline_after = duration("--offline-after", &args.offline_after)?;
     cfg.scheduler.memory_reserve = kn_server::bundles::parse_bytes(&args.memory_reserve)
@@ -319,11 +381,15 @@ async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result<()>
     cfg.image_grace = duration("--image-grace", &args.image_grace)?;
     cfg.prune_interval = duration("--prune-interval", &args.prune_interval)?;
     let Some(server) = server else {
+        cfg.backup_targets = args.backup_targets.map(absolute).transpose()?;
         if args.ingress_listen.is_some() {
             bail!("a standalone node has no ingress, so no --ingress-listen");
         }
         return kn_node::run_standalone(cfg, args.listen, args.gateway_listen).await;
     };
+    if args.backup_targets.is_some() {
+        bail!("a node joined to a server uses the server's backup targets; give --backup-targets to the server");
+    }
     let mut agent = kn_node::agent::AgentConfig::new(server, args.name.unwrap_or_else(host_name));
     agent.join_token = args.join_token;
     agent.ca_certs = global.read_ca_cert()?;

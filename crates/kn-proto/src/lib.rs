@@ -2,12 +2,14 @@
 //!
 //! - [`api`]: requests and responses of the HTTP APIs for the CLI.
 //! - [`agent`]: the link between nodes and the server: polls, reports, desired state and commands.
+//! - [`backup`]: backup targets' configuration, and the backup routes' requests and answers.
 //! - [`state`]: what a node has applied, as it reports it.
 //!
 //! The API is versioned by its path prefix ([`API_PREFIX`]), so a newer side can keep serving an older one.
 
 pub mod agent;
 pub mod api;
+pub mod backup;
 pub mod state;
 
 /// The path prefix of every API route in this version.

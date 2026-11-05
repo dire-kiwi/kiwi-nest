@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+kn-backup.workspace = true
 kn-bundle.workspace = true
 kn-cli.workspace = true
 kn-node.workspace = true

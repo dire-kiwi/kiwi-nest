@@ -19,6 +19,8 @@
 //! | `DELETE /volumes/{name}` | | `204 No Content` |
 //! | `DELETE /volumes/{name}/snapshots/{app}` | | `204 No Content` |
 //!
+//! Both also have the backup routes in [`crate::backup`]; a standalone node needs `--backup-targets` for them.
+//!
 //! Errors are an [`ErrorBody`] with a 4xx or 5xx status.
 //!
 //! **The server** needs `Authorization: Bearer TOKEN` on every route but `/version`. Its changes (deploy, delete,
@@ -80,6 +82,12 @@ pub struct DeployQuery {
     /// Server only: save the deploy even if its node is offline, to be applied when it's back.
     #[serde(default)]
     pub queue: bool,
+    /// On the app's first deploy, restore its volumes from this backup (a key, as `backup list` shows it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<String>,
+    /// The backup target `restore` is in; by default, the first target that has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// The query of `DELETE /apps/{name}`.
@@ -105,6 +113,12 @@ pub struct VolumeQuery {
     /// Save the change even if the volume's node is offline.
     #[serde(default)]
     pub queue: bool,
+    /// For a new volume: restore its data from this backup (a key, as `backup list` shows it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<String>,
+    /// The backup target `restore` is in; by default, the first target that has it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// The server's answer to a change: it's saved, as `generation` of the app or volume.
@@ -224,6 +238,9 @@ pub struct AppInfo {
     /// The app whose volumes this one's started as snapshots of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// The backup its volumes were restored from, as `TARGET:KEY`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from: Option<String>,
     /// What the deploy did with the app's volumes, such as which ones it snapshotted; only in a deploy's response.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,

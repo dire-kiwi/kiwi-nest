@@ -32,6 +32,8 @@ fn ioctl_numbers_match_the_kernel_headers() {
     assert_eq!(size_of::<DevInfoArgs>(), 4096);
     assert_eq!(IOC_SUBVOL_SETFLAGS, 0x4008_941a);
     assert_eq!(IOC_FS_INFO, 0x8400_941f);
+    assert_eq!(IOC_SEND, 0x4048_9426);
+    assert_eq!(size_of::<SendArgs>(), 72);
     assert_eq!(std::mem::offset_of!(VolArgsV2, flags), 16);
     assert_eq!(std::mem::offset_of!(VolArgsV2, name), 56);
     assert_eq!(std::mem::offset_of!(FsInfoArgs, fsid), 16);

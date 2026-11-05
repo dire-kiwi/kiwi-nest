@@ -725,3 +725,26 @@ async fn the_registry_isnt_started_again_in_the_middle_of_a_collection_asked_for
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(container.calls().len() > calls.len() + 3, "the check carries on");
 }
+
+#[tokio::test]
+async fn a_node_from_before_the_registry_isnt_sent_a_prune() {
+    let Setup { env, .. } = setup().await;
+    let mut old = env
+        .join_with(
+            "old",
+            kn_proto::agent::NodeFacts {
+                protocol: kn_proto::agent::BACKUPS_PROTOCOL,
+                ..facts(4 << 30)
+            },
+        )
+        .await;
+    env.poll(&mut old).await;
+    let r = env
+        .req(reqwest::Method::POST, "/nodes/old/prune", &env.admin)
+        .send()
+        .await
+        .unwrap();
+    let (s, msg) = error(r).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert!(msg.contains("from before the image registry"), "{msg}");
+}

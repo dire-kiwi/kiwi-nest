@@ -13,6 +13,7 @@
 //! | `POST /agent/poll` | [`PollRequest`] | [`PollResponse`], once something changed or the wait is over |
 //! | `POST /agent/report` | [`Report`] | `204 No Content`, at once |
 //! | `GET /agent/bundles/{digest}` | | the bundle's ZIP |
+//! | `GET /agent/backup-targets` | | `Vec<`[`crate::backup::TargetConfig`]`>`: the server's targets, secrets included |
 //! | `POST /agent/commands/{id}/result` | [`CommandResult`] | `204 No Content` |
 //! | `POST /agent/commands/{id}/output` | the command's output, streamed | `204 No Content` |
 //!
@@ -40,10 +41,22 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{ErrorBody, LogsQuery, VolumeInfo};
+use crate::backup::{Kind, Restore};
 use crate::state::AppStatus;
 
-/// The version of the agent link that this build speaks.
-pub const PROTOCOL: u32 = 1;
+/// The version of the agent link that this build speaks. Version 2 added backups: [`Action::Backup`], restores in
+/// [`AppWant::Deploy`] and [`VolumeWant::Present`], `GET /agent/backup-targets`, and [`NodeFacts::protocol`]. Version 3
+/// added the image registry: [`JoinResponse::registry`], `POST /agent/registry`, [`AppReport::starting`] and
+/// [`Action::PruneImages`].
+pub const PROTOCOL: u32 = 3;
+
+/// The first version with backups: a server sends a node older than this no backup command and no restore (an
+/// older node would ignore the restore, and deploy the app empty).
+pub const BACKUPS_PROTOCOL: u32 = 2;
+
+/// The first version with the image registry: a server sends a node older than this no [`Action::PruneImages`]
+/// (it couldn't read it). Such a node has no registry credential, and doesn't say when an app is starting.
+pub const REGISTRY_PROTOCOL: u32 = 3;
 
 /// The oldest version a server built from this code still serves.
 pub const OLDEST_PROTOCOL: u32 = 1;
@@ -131,6 +144,9 @@ pub struct NodeFacts {
     /// ingress token; empty if it has none, so the ingress can't reach its apps.
     #[serde(default)]
     pub ingress: String,
+    /// The version of the agent link it speaks ([`PROTOCOL`]); 0 from a node of version 1, which didn't say.
+    #[serde(default)]
+    pub protocol: u32,
 }
 
 /// A filesystem's size and free space.
@@ -268,6 +284,9 @@ pub enum AppWant {
         /// The shared volumes it mounts, which must be in place first.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         shared: Vec<String>,
+        /// On the app's first deploy, restore its volumes from this backup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore: Option<Restore>,
     },
     /// Delete the app.
     Delete {
@@ -292,6 +311,9 @@ pub enum VolumeWant {
     Present {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data_digest: Option<String>,
+        /// When it's created: its data, restored from this backup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore: Option<Restore>,
     },
     Delete,
 }
@@ -324,6 +346,16 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grace_secs: Option<u64>,
     },
+    /// Backs up an app or a shared volume to the targets named (every target, if none is); answers with a
+    /// [`crate::backup::BackupResult`].
+    Backup {
+        what: Kind,
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        targets: Vec<String>,
+        #[serde(default)]
+        full: bool,
+    },
 }
 
 impl Action {
@@ -333,7 +365,7 @@ impl Action {
             Action::Inspect { app } | Action::Logs { app, .. } | Action::Suspend { app } | Action::Resume { app } => {
                 app
             }
-            Action::VolumeInfo { name } | Action::DeleteSnapshot { name, .. } => name,
+            Action::VolumeInfo { name } | Action::DeleteSnapshot { name, .. } | Action::Backup { name, .. } => name,
             Action::PruneImages { .. } => "",
         }
     }
@@ -383,6 +415,7 @@ mod tests {
                 bundle_digest: "sha256:ab".into(),
                 from: None,
                 shared: vec![],
+                restore: None,
             },
         };
         let json = serde_json::to_value(&c).unwrap();

@@ -18,6 +18,10 @@
 #   kiwi-nest node list
 #   kiwi-nest deploy blog ./path/to/bundle
 #
+# The server has one backup target, `local`: tar archives in .dev-cluster/backups (backup-targets.yaml says so):
+#
+#   kiwi-nest backup app blog && kiwi-nest backup list
+#   kiwi-nest deploy blog-copy ./path/to/bundle --restore apps/blog/STAMP.tar.zst --node b
 # With Caddy (`caddy` on the PATH, or KIWI_NEST_DEV_CADDY naming it; KIWI_NEST_DEV_CADDY=none skips it), the
 # cluster has an ingress: Caddy with its admin API on 127.0.0.1:7490, HTTPS on :7443 and HTTP on :7480, configured
 # by the server with Caddy's internal CA. The server's API is then https://kn.localhost:7443, which the nodes and
@@ -151,7 +155,14 @@ up() {
   fi
   if ! running server; then
     : >"$dir/server.log"
-    "$bin" server --listen "$server" --state-dir "$dir/server" "${ingress[@]}" >>"$dir/server.log" 2>&1 &
+    # One backup target, a directory, as tar (the nodes run without root, and `send` needs it); edit it to try others.
+    if [ ! -f "$dir/backup-targets.yaml" ]; then
+      mkdir -p "$dir/backups"
+      printf 'targets:\n  - name: local\n    dir: { path: %s }\n    format: tar\n    keep: { last: 5 }\n' \
+        "$dir/backups" >"$dir/backup-targets.yaml"
+    fi
+    "$bin" server --listen "$server" --state-dir "$dir/server" --backup-targets "$dir/backup-targets.yaml" \
+      "${ingress[@]}" >>"$dir/server.log" 2>&1 &
     echo $! >"$dir/server.pid"
     wait_for "$dir/server.log" "^listening on" "the server"
     # Only the first start prints an admin token.

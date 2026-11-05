@@ -18,6 +18,11 @@ kiwi-nest is written from scratch; don't copy from or refer to other deployment 
 - The ingress's and the registry's end-to-end tests (`crates/kiwi-nest/tests/ingress.rs`, `registry.rs`) also need
   Caddy: `KIWI_NEST_TEST_CADDY` naming the binary, or `caddy` on the PATH. They're skipped otherwise. CI downloads
   a pinned Caddy release for them. The registry's runs `registry:3` in a container of its own, removed at the end.
+- `btrfs send` needs root, so the tests of the `send` format (in `kn-btrfs`, `kn-backup`, `kn-node` and
+  `kiwi-nest/tests/backup.rs`) skip themselves otherwise. `make test-root` builds them as you and runs them as root
+  through `sudo` (Cargo's runner), as CI's `root` job does; they clean up their read-only snapshots with
+  `kn_btrfs::remove_tree`. The tests against S3 need `KIWI_NEST_TEST_S3` (`ENDPOINT BUCKET ACCESS SECRET`):
+  `make test-s3` (`scripts/test-s3.sh`) starts versitygw in Docker with a bucket and prints it.
 - `make release` builds static binaries for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` into
   `dist/`, with `cargo zigbuild` (needs `zig` and `cargo-zigbuild`).
 - `cargo run -- version` prints the version (from the workspace `Cargo.toml`) and the git commit.
@@ -34,6 +39,11 @@ cargo run -- volume create corpus && cargo run -- volume load corpus ./dir
 cargo run -- list
 curl -H 'Host: blog.example.com' http://127.0.0.1:7381/  # through the gateway, which wakes the app if it's idle
 ```
+
+Backups need targets: a YAML file such as `targets: [{ name: local, dir: { path: /tmp/kn-backups }, format: tar }]`,
+given to a standalone node (or the server) as `--backup-targets FILE`. Then `cargo run -- backup app blog`,
+`cargo run -- backup list`, and `cargo run -- deploy blog-copy ./path/to/bundle --restore KEY`. The `send` format needs
+the node to run as root.
 
 Or as a cluster: `scripts/dev-cluster.sh` starts a server and two nodes (`a` and `b`, each with its own state,
 gateway port, loop-mounted btrfs file and project prefix; `KIWI_NEST_DEV_BTRFS=DIR` uses directories on an existing
@@ -67,10 +77,16 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
   reports, desired state, commands; versioned by `PROTOCOL`), and the version.
 - `crates/kn-bundle`: safe ZIP and directory reading, the Compose subset, `x-kiwi-nest`, the generated Compose file.
   No I/O beyond the bundle, so plain unit tests cover it.
-- `crates/kn-btrfs`: the btrfs ioctls (create, snapshot, destroy), subvolume checks, paths opened without symlinks.
+- `crates/kn-btrfs`: the btrfs ioctls (create, snapshot, destroy, send), subvolume checks, paths opened without
+  symlinks.
+- `crates/kn-backup`: backups. `key` (keys, chains, choosing a parent, retention), `target` (a configured target,
+  uploads and downloads through zstd), `store` with `s3` and `ssh` (where backups are kept; a failed upload never
+  looks complete), `sendstream` and `receive` (the send stream format, received as file operations confined by
+  `fsops`), `tarball` (tar archives and extracting them).
 - `crates/kn-node`: `volumes` (the subvolume layout and the check before every start, with a fake backend for unit
   tests), `runtime` (the `Runtime` trait, and `Docker`, which runs `docker compose`), `apps` (one task per app, the
   state file, `--from`; `apps/shared.rs` for shared volumes; `apps/lifecycle.rs` starts, stops and adopts apps),
+  `apps/backup.rs` backs up snapshot sets and restores into first deploys and new volumes;
   `gateway` (the proxy, each app's `gate` of phases and leases, the starting page, the ingress listener's token
   check), `agent` (the link to the server: joining, the poll loop, the per-app applier and commands, the registry
   credential in the node's own Docker configuration; `agent/link.rs` is its HTTP client; `agent/forgotten.rs` takes
@@ -79,8 +95,9 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
 - `crates/kn-server`: `store` (SQLite on its own thread, numbered migrations; `tokens`, `nodes` (cordons, labels,
   forgetting and tombstones), `apps` for apps, volumes, their nests, desired state and change status, `nests`,
   `commands`, `registry` for images in use, pushes and releases), `bundles` (the store by digest, checking uploads),
-  `auth`, `scheduler` (placing new nests: a pure filter and score, with table tests), `hub` (in memory: online nodes,
-  waking polls, callers waiting on commands), `api` (for the CLI), `agent` (for nodes), `ingress` (Caddy's generated
+  `backups` (the targets, the schedule, the server's own backups and `server restore`), `auth`, `scheduler`
+  (placing new nests: a pure filter and score, with table tests), `hub` (in memory: online nodes, waking polls,
+  callers waiting on commands), `api` (for the CLI), `agent` (for nodes), `ingress` (Caddy's generated
   configuration, kept loaded through its admin API) and `registry` (the `registry:3` container, the credential check
   Caddy asks for every request, garbage collection in `gc.rs` with table tests, image references in `refs.rs`; its
   `tests.rs` uses a fake registry).

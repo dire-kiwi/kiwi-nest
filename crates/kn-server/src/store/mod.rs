@@ -58,10 +58,15 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: MIGRATION_3,
         then: None,
     },
-    // 4: the image registry: each app's images, when images were released and tags pushed, and each node's
-    // registry credential.
+    // 4: backups: whether scheduled backups include an app, and the backup an app or volume was restored from.
     Migration {
         sql: MIGRATION_4,
+        then: None,
+    },
+    // 5: the image registry: each app's images, when images were released and tags pushed, and each node's
+    // registry credential.
+    Migration {
+        sql: MIGRATION_5,
         then: None,
     },
 ];
@@ -187,8 +192,16 @@ const MIGRATION_3: &str = r#"
     UPDATE nodes SET ingress_token = 'kni_' || lower(hex(randomblob(32)));
     "#;
 
-// 4: what the registry's garbage collection needs.
+// 4: backups: whether scheduled backups include an app, and the backup an app or volume was restored from.
 const MIGRATION_4: &str = r#"
+    ALTER TABLE apps ADD COLUMN backups INTEGER NOT NULL DEFAULT 1;
+    -- `{"target": …, "key": …}`, given with `--restore`; the node only uses it on the app's first deploy.
+    ALTER TABLE apps ADD COLUMN restore TEXT;
+    ALTER TABLE volumes ADD COLUMN restore TEXT;
+    "#;
+
+// 5: what the registry's garbage collection needs.
+const MIGRATION_5: &str = r#"
     -- The image references of the app's bundle, as JSON. NULL for an app deployed before this migration until the
     -- server has read them from its bundle; garbage collection deletes nothing while any app's images aren't known.
     ALTER TABLE apps ADD COLUMN images TEXT;
