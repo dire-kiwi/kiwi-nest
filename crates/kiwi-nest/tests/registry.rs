@@ -19,10 +19,11 @@ const MANIFESTS: &str = "application/vnd.oci.image.index.v1+json, application/vn
                          application/vnd.docker.distribution.manifest.list.v2+json, \
                          application/vnd.docker.distribution.manifest.v2+json";
 
-/// Removes the registry's container and the test's images when dropped.
+/// Removes the registry's container and the test's images (those whose names start with one of `images`) when
+/// dropped.
 struct Cleanup {
     container: String,
-    images: String,
+    images: Vec<String>,
 }
 
 impl Drop for Cleanup {
@@ -33,7 +34,7 @@ impl Drop for Cleanup {
             .output()
         {
             for image in String::from_utf8_lossy(&out.stdout).lines() {
-                if image.starts_with(&self.images) {
+                if self.images.iter().any(|p| image.starts_with(p)) {
                     let _ = Command::new("docker").args(["image", "rm", image]).output();
                 }
             }
@@ -57,6 +58,14 @@ fn docker_ok(args: &[&str]) -> String {
 
 fn has_image(reference: &str) -> bool {
     docker(&["image", "inspect", reference]).status.success()
+}
+
+/// Pulls an image from Docker Hub, unless it's here already.
+fn pulled(reference: &str) -> &str {
+    if !has_image(reference) {
+        docker_ok(&["pull", "--quiet", reference]);
+    }
+    reference
 }
 
 /// The `user:password` a node's Docker configuration holds for `host`.
@@ -152,7 +161,7 @@ fn images_are_pushed_once_pulled_by_every_node_and_collected_when_nothing_uses_t
     let container = format!("{prefix}registry");
     let _cleanup = Cleanup {
         container: container.clone(),
-        images: format!("{host}/"),
+        images: vec![format!("{host}/"), prefix.clone()],
     };
     let mut server = Server::start_with(&[
         "--ingress",
@@ -189,12 +198,20 @@ fn images_are_pushed_once_pulled_by_every_node_and_collected_when_nothing_uses_t
     server.wait_online("a", true);
     server.wait_online("b", true);
 
-    // Pushed once (with the CLI's admin token), then deployed on both nodes, which pull it with their own
-    // credentials: the local tag is removed first, so the nodes have to pull.
+    // An image of the test's own (so no other tag shares it), pushed once with the CLI's admin token, then deployed
+    // on both nodes, which pull it with their own credentials: the local tags are removed first, so they have to.
+    let context = tempfile::tempdir().unwrap();
+    std::fs::write(
+        context.path().join("Dockerfile"),
+        format!("FROM {}\nLABEL kiwi-nest-test={prefix}\n", pulled("python:3.13-alpine")),
+    )
+    .unwrap();
+    let local = format!("{prefix}app:dev");
+    docker_ok(&["build", "--quiet", "--tag", &local, context.path().to_str().unwrap()]);
     let image = format!("{host}/app:1");
-    let out = server.ok(&["push", "python:3.13-alpine", "app:1"]);
+    let out = server.ok(&["push", &local, "app:1"]);
     assert_eq!(out.trim(), image);
-    docker_ok(&["image", "rm", &image]);
+    docker_ok(&["image", "rm", &local, &image]);
     assert!(!has_image(&image));
     deploy(&server, "blog-a", "a", &image);
     deploy(&server, "blog-b", "b", &image);
@@ -211,7 +228,7 @@ fn images_are_pushed_once_pulled_by_every_node_and_collected_when_nothing_uses_t
     assert_eq!(status(http, &host, &login, "PUT", "/v2/app/manifests/2"), 403);
     let node_docker = a.dir.path().join("state/docker");
     let pushed = format!("{host}/app:from-a-node");
-    docker_ok(&["tag", "busybox:1.37", &pushed]);
+    docker_ok(&["tag", pulled("busybox:1.37"), &pushed]);
     let out = Command::new("docker")
         .env("DOCKER_CONFIG", &node_docker)
         .args(["push", &pushed])

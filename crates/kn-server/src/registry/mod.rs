@@ -294,6 +294,23 @@ async fn auth(State(s): State<Server>, headers: HeaderMap) -> Response {
     StatusCode::OK.into_response()
 }
 
+/// The images on the registry at `host` that apps use, from (app, node, images).
+fn on_host(apps: Vec<(String, String, Vec<String>)>, host: &str) -> Vec<gc::Use> {
+    let mut out = Vec::new();
+    for (app, node, images) in apps {
+        for image in images {
+            if let Some(r) = ImageRef::parse(&image).filter(|r| r.is_on(host)) {
+                out.push(gc::Use {
+                    app: app.clone(),
+                    node: node.clone(),
+                    image: r,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// An image the registry holds, and the architectures it's built for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Platforms {
@@ -449,21 +466,11 @@ impl Registry {
                 let uses = store::registry::uses(c)?;
                 let mut inputs = gc::Inputs {
                     tags: l,
+                    uses: on_host(uses.apps, &host),
                     now,
                     grace,
                     ..Default::default()
                 };
-                for (app, node, images) in uses.apps {
-                    for image in images {
-                        if let Some(r) = ImageRef::parse(&image).filter(|r| r.is_on(&host)) {
-                            inputs.uses.push(gc::Use {
-                                app: app.clone(),
-                                node: node.clone(),
-                                image: r,
-                            });
-                        }
-                    }
-                }
                 for (reference, at) in store::registry::releases(c)? {
                     if let Some(r) = ImageRef::parse(&reference).filter(|r| r.is_on(&host)) {
                         inputs.event(&r.repository, r.reference(), "released", at);
@@ -563,17 +570,27 @@ impl Registry {
                 }
             }
         };
-        // Manifests that apps use by digest alone, and no tag names, would go with the untagged ones.
+        // Manifests that apps use by digest alone, and no tag names, would go with the untagged ones. What apps use
+        // is read again, as deploys may have been saved while it waited.
+        let deleted: HashSet<(&str, &str)> = plan.delete.iter().map(|(r, d)| (r.as_str(), d.as_str())).collect();
         let tagged: HashSet<(&str, &str)> = listed
             .iter()
             .map(|l| (l.repository.as_str(), l.digest.as_str()))
+            .filter(|k| !deleted.contains(k))
             .collect();
-        let untagged_in_use = inputs.uses.iter().any(|u| {
-            u.image
-                .digest
-                .as_deref()
-                .is_some_and(|d| !tagged.contains(&(u.image.repository.as_str(), d)))
-        });
+        let apps = server.store.call(|c| Ok(store::registry::uses(c)?.apps)).await;
+        let untagged_in_use = match apps {
+            Ok(apps) => on_host(apps, &self.host).iter().any(|u| {
+                u.image
+                    .digest
+                    .as_deref()
+                    .is_some_and(|d| !tagged.contains(&(u.image.repository.as_str(), d)))
+            }),
+            Err(e) => {
+                drop(lock);
+                return Err(e);
+            }
+        };
         let collected = self.collect(!untagged_in_use).await;
         drop(lock);
         collected?;
