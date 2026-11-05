@@ -417,6 +417,25 @@ fn refuses_bad_requests_without_docker() {
     let err = node.fails(&["delete", "nothing"]);
     assert!(err.contains("app `nothing` doesn't exist"), "{err}");
 
+    // Requests a web page could make (DNS rebinding) are refused: another Host, or any Origin.
+    let port: u16 = node.url.rsplit(':').next().unwrap().parse().unwrap();
+    let raw = |request: &str| {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(request.as_bytes()).unwrap();
+        let mut resp = String::new();
+        s.read_to_string(&mut resp).unwrap();
+        resp
+    };
+    let resp = raw("DELETE /v1/apps/web HTTP/1.1\r\nHost: evil.example:7380\r\nConnection: close\r\n\r\n");
+    assert!(resp.starts_with("HTTP/1.1 421"), "{resp}");
+    let resp = raw("GET /v1/version HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n");
+    assert!(resp.starts_with("HTTP/1.1 421"), "{resp}");
+    let resp =
+        raw("GET /v1/version HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.example\r\nConnection: close\r\n\r\n");
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+    let resp = raw("GET /v1/version HTTP/1.1\r\nHost: localhost:1\r\nConnection: close\r\n\r\n");
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+
     // A non-loopback address is refused outright.
     let out = Command::new(BIN)
         .args(["node", "--standalone", "--listen", "0.0.0.0:0", "--state-dir"])

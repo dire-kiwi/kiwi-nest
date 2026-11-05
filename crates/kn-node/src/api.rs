@@ -88,7 +88,51 @@ pub fn router(apps: Apps) -> Router {
         .route(&format!("{p}/apps/{{name}}/logs"), get(logs))
         // Uploads are streamed to disk under the bundle limits instead.
         .layer(DefaultBodyLimit::disable())
+        .layer(axum::middleware::from_fn(loopback_only))
         .with_state(apps)
+}
+
+/// Whether a `Host` header names this machine's loopback: `localhost`, `127.x.x.x` or `[::1]`, with any port.
+pub fn is_loopback_host(host: &str) -> bool {
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((ip, port)) if port.is_empty() || port.strip_prefix(':').is_some_and(is_port) => ip,
+            _ => return false,
+        }
+    } else {
+        match host.split_once(':') {
+            Some((name, port)) if is_port(port) => name,
+            Some(_) => return false,
+            None => host,
+        }
+    };
+    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+fn is_port(p: &str) -> bool {
+    !p.is_empty() && p.parse::<u16>().is_ok()
+}
+
+/// Refuses requests that a web page could have made: listening on loopback isn't enough, because a page whose DNS
+/// name is rebound to 127.0.0.1 is same-origin with it. Such a request names the page's host in `Host`, and a
+/// browser adds `Origin` to it; the CLI does neither.
+async fn loopback_only(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    if !is_loopback_host(host) {
+        return ApiError::new(
+            StatusCode::MISDIRECTED_REQUEST,
+            "this API only answers requests for localhost",
+        )
+        .into_response();
+    }
+    if req.headers().contains_key(header::ORIGIN) {
+        return ApiError::new(StatusCode::FORBIDDEN, "this API doesn't answer requests from web pages").into_response();
+    }
+    next.run(req).await
 }
 
 /// Serves the API until `shutdown` completes.
@@ -222,5 +266,40 @@ impl Stream for ChildStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.get_mut().inner).poll_next(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_loopback_host;
+
+    #[test]
+    fn loopback_hosts() {
+        for ok in [
+            "localhost",
+            "LOCALHOST:7380",
+            "127.0.0.1",
+            "127.0.0.1:7380",
+            "127.1.2.3:1",
+            "[::1]",
+            "[::1]:7380",
+        ] {
+            assert!(is_loopback_host(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "evil.example",
+            "evil.example:7380",
+            "localhost.evil.example",
+            "127.0.0.1.evil.example",
+            "10.0.0.1:7380",
+            "[::2]:7380",
+            "[::1]x",
+            "localhost:",
+            "localhost:99999",
+            "0.0.0.0",
+        ] {
+            assert!(!is_loopback_host(bad), "{bad}");
+        }
     }
 }

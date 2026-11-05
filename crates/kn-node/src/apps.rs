@@ -425,6 +425,12 @@ async fn actor(inner: Arc<Inner>, name: String, mut rx: mpsc::UnboundedReceiver<
     }
 }
 
+/// How a deploy failed: before the new generation was started (the previous one may still be running), or after.
+enum Failure {
+    NotStarted(AppsError),
+    Started(AppsError),
+}
+
 /// One app's operations, run by its task.
 struct App<'a> {
     inner: &'a Inner,
@@ -530,35 +536,61 @@ impl App<'_> {
         };
         tracing::info!(app = self.name, generation = record.generation, digest = %record.bundle_digest, "deploying");
 
-        let result = self.apply(&record, previous.as_ref(), staged).await;
-        self.cleanup_generations(record.generation).await;
-        let message = result.as_ref().err().map(|e| e.to_string());
-        let record = self
-            .update(|r| match &message {
-                None => r.status = AppStatus::Running,
-                Some(e) => {
-                    r.status = AppStatus::Failed;
-                    r.error = Some(e.clone());
-                }
-            })
-            .await?;
-        match message {
-            None => {
-                tracing::info!(app = self.name, generation = record.generation, "deployed");
-                self.info(record).await
+        let generation = record.generation;
+        let failed = match self.apply(&record, previous.as_ref(), staged).await {
+            Ok(()) => {
+                self.cleanup_generations(generation).await;
+                let record = self.update(|r| r.status = AppStatus::Running).await?;
+                tracing::info!(app = self.name, generation, "deployed");
+                return self.info(record).await;
             }
-            Some(message) => {
-                tracing::warn!(app = self.name, generation = record.generation, %message, "deploy failed");
-                Err(AppsError::DeployFailed {
+            // The previous generation was stopped, so the new one is the app now, even though it failed.
+            Err(Failure::Started(e)) | Err(Failure::NotStarted(e)) if previous.is_none() => e,
+            Err(Failure::Started(e)) => {
+                self.cleanup_generations(generation).await;
+                e
+            }
+            // The previous generation may still be running from its own bundle and file: keep them, drop the new
+            // generation's, and put the previous record back.
+            Err(Failure::NotStarted(e)) => {
+                self.remove_generation(generation).await;
+                let mut prev = previous.expect("a previous generation");
+                let message = e.to_string();
+                tracing::warn!(app = self.name, generation, %message, "redeploy failed; the previous generation stays");
+                prev.error = Some(format!(
+                    "redeploying failed, so generation {} is still in place: {message}",
+                    prev.generation
+                ));
+                prev.updated_at = now();
+                let mut state = self.inner.state.lock().await;
+                state.apps.insert(self.name.to_string(), prev);
+                self.persist(&state).await?;
+                return Err(AppsError::DeployFailed {
                     name: self.name.into(),
                     message,
-                })
+                });
             }
-        }
+        };
+        let message = failed.to_string();
+        self.update(|r| {
+            r.status = AppStatus::Failed;
+            r.error = Some(message.clone());
+        })
+        .await?;
+        tracing::warn!(app = self.name, generation, %message, "deploy failed");
+        Err(AppsError::DeployFailed {
+            name: self.name.into(),
+            message,
+        })
     }
 
     /// Puts the new generation's files in place, stops the old project and starts the new one.
-    async fn apply(&self, record: &AppRecord, previous: Option<&AppRecord>, staged: Staged) -> Result<()> {
+    async fn apply(
+        &self,
+        record: &AppRecord,
+        previous: Option<&AppRecord>,
+        staged: Staged,
+    ) -> std::result::Result<(), Failure> {
         let cfg = &self.inner.cfg;
         let app_dir = self.app_dir();
         let bundle_dir = app_dir.join(format!("bundle-{}", record.generation));
@@ -584,7 +616,7 @@ impl App<'_> {
                 labels: &labels,
             },
         )
-        .map_err(|e| AppsError::Internal(e.into()))?;
+        .map_err(|e| Failure::NotStarted(AppsError::Internal(e.into())))?;
         let project = self.project(record);
         let file = project.file.clone();
         blocking(move || -> std::io::Result<()> {
@@ -596,8 +628,9 @@ impl App<'_> {
             }
             write_atomic(&file, generated.as_bytes())
         })
-        .await?
-        .map_err(|e| AppsError::Internal(anyhow::anyhow!("putting the bundle in place: {e}")))?;
+        .await
+        .map_err(Failure::NotStarted)?
+        .map_err(|e| Failure::NotStarted(AppsError::Internal(anyhow::anyhow!("putting the bundle in place: {e}"))))?;
 
         if let Some(prev) = previous {
             tracing::info!(
@@ -605,10 +638,37 @@ impl App<'_> {
                 generation = prev.generation,
                 "stopping the previous generation"
             );
-            self.inner.runtime.down(&self.project(prev)).await?;
+            self.inner
+                .runtime
+                .down(&self.project(prev))
+                .await
+                .map_err(|e| Failure::NotStarted(e.into()))?;
         }
-        self.inner.runtime.up(&project, cfg.up_timeout).await?;
-        Ok(())
+        self.inner
+            .runtime
+            .up(&project, cfg.up_timeout)
+            .await
+            .map_err(|e| Failure::Started(e.into()))
+    }
+
+    /// Removes one generation's bundle and generated file.
+    async fn remove_generation(&self, generation: u64) {
+        let dir = self.app_dir();
+        let r = blocking(move || -> std::io::Result<()> {
+            remove_dir_if_exists(&dir.join(format!("bundle-{generation}")))?;
+            match std::fs::remove_file(dir.join(format!("compose-{generation}.yaml"))) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        })
+        .await;
+        match r {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(app = self.name, generation, error = %e, "couldn't remove a failed generation")
+            }
+            Err(e) => tracing::warn!(app = self.name, generation, error = %e, "couldn't remove a failed generation"),
+        }
     }
 
     /// Removes the bundles and generated files of every generation but `keep`.
@@ -745,4 +805,128 @@ fn allocate_port(state: &StateFile, cfg: &NodeConfig, name: &str) -> Result<u16>
         }
     }
     Err(AppsError::Unsupported(format!("no free port left in {start}-{end}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A stand-in for `docker` that succeeds, unless `fail-down` or `fail-up` exists beside it.
+    const FAKE_DOCKER: &str = r#"#!/bin/sh
+dir=$(dirname "$0")
+case " $* " in
+  *" down "*) if [ -e "$dir/fail-down" ]; then echo "down failed" >&2; exit 1; fi ;;
+  *" up "*) if [ -e "$dir/fail-up" ]; then echo "up failed" >&2; exit 1; fi ;;
+esac
+exit 0
+"#;
+
+    struct Env {
+        dir: tempfile::TempDir,
+        apps: Apps,
+    }
+
+    impl Env {
+        async fn new() -> Env {
+            let dir = tempfile::tempdir().unwrap();
+            let docker = dir.path().join("docker");
+            std::fs::write(&docker, FAKE_DOCKER).unwrap();
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut cfg = NodeConfig::new(dir.path().join("state"));
+            cfg.docker = docker;
+            let apps = Apps::open(cfg).await.unwrap();
+            Env { dir, apps }
+        }
+
+        fn path(&self, p: &str) -> PathBuf {
+            self.dir.path().join(p)
+        }
+
+        async fn deploy(&self, page: &str) -> Result<AppInfo> {
+            let b = self.path("bundle");
+            std::fs::create_dir_all(b.join("site")).unwrap();
+            std::fs::write(b.join("site/index.html"), page).unwrap();
+            std::fs::write(
+                b.join("compose.yaml"),
+                "x-kiwi-nest: { domain: a.localhost, service: web, port: 80 }\n\
+                 services:\n  web:\n    image: x\n    volumes: [\"./site:/www\", \"data:/data\"]\n\
+                 volumes:\n  data: {}\n",
+            )
+            .unwrap();
+            let staged = self.apps.stage_dir(b).await?;
+            self.apps.deploy("app", staged, false).await
+        }
+
+        fn generation_files(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(self.path("state/apps/app"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redeploy_that_fails_before_stopping_keeps_the_running_generation() {
+        let env = Env::new().await;
+        assert_eq!(env.deploy("one").await.unwrap().generation, 1);
+        std::fs::write(env.path("state/volumes/apps/app/data/db"), "data").unwrap();
+
+        // `down` of generation 1 fails: its containers may still be running from its bundle, so that stays.
+        std::fs::write(env.path("fail-down"), "").unwrap();
+        let e = env.deploy("two").await.unwrap_err();
+        assert!(
+            matches!(&e, AppsError::DeployFailed { message, .. } if message.contains("down failed")),
+            "{e}"
+        );
+        assert_eq!(env.generation_files(), ["bundle-1", "compose-1.yaml"]);
+        let page = env.path("state/apps/app/bundle-1/site/index.html");
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), "one");
+        let info = env.apps.inspect("app").await.unwrap();
+        assert_eq!(info.generation, 1);
+        assert_eq!(info.status, AppStatus::Running);
+        assert!(
+            info.error
+                .as_deref()
+                .unwrap()
+                .contains("generation 1 is still in place"),
+            "{:?}",
+            info.error
+        );
+
+        // `up` of the new generation fails after generation 1 was stopped: the new one is the app now.
+        std::fs::remove_file(env.path("fail-down")).unwrap();
+        std::fs::write(env.path("fail-up"), "").unwrap();
+        env.deploy("three").await.unwrap_err();
+        assert_eq!(env.generation_files(), ["bundle-2", "compose-2.yaml"]);
+        let info = env.apps.inspect("app").await.unwrap();
+        assert_eq!((info.generation, info.status), (2, AppStatus::Failed));
+
+        // And a working deploy after that, with the data still there.
+        std::fs::remove_file(env.path("fail-up")).unwrap();
+        let info = env.deploy("four").await.unwrap();
+        assert_eq!(
+            (info.generation, info.status, info.error),
+            (3, AppStatus::Running, None)
+        );
+        assert_eq!(env.generation_files(), ["bundle-3", "compose-3.yaml"]);
+        assert_eq!(
+            std::fs::read_to_string(env.path("state/volumes/apps/app/data/db")).unwrap(),
+            "data"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_deploy_that_fails_is_recorded() {
+        let env = Env::new().await;
+        std::fs::write(env.path("fail-up"), "").unwrap();
+        env.deploy("one").await.unwrap_err();
+        let info = env.apps.inspect("app").await.unwrap();
+        assert_eq!((info.generation, info.status), (1, AppStatus::Failed));
+        assert!(info.error.unwrap().contains("up failed"));
+        env.apps.delete("app").await.unwrap();
+        assert!(matches!(env.apps.inspect("app").await, Err(AppsError::NotFound(_))));
+    }
 }

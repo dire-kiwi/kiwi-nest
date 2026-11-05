@@ -163,7 +163,12 @@ volumes:
   ```
 
   Each app's operations go through one task of its own, so they never overlap. A deploy cut off by a node restart is
-  recorded as failed.
+  recorded as failed. A redeploy that fails before the old project is stopped (its files can't be written, or `down`
+  fails) leaves the old generation's bundle, file and record in place, since its containers may still be running;
+  one that fails after that leaves the new generation as a failed app.
+- **The standalone node's API** (step 1, before the server exists) listens on loopback only and has no tokens. It
+  answers only requests whose `Host` is `localhost`, `127.x.x.x` or `[::1]` and that carry no `Origin`, so a web page
+  can't reach it by rebinding its DNS name to 127.0.0.1.
 
 ## Volumes and snapshots
 
