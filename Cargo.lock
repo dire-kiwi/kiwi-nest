@@ -829,6 +829,8 @@ dependencies = [
  "kn-node",
  "kn-proto",
  "kn-server",
+ "reqwest",
+ "rustls",
  "serde_json",
  "tempfile",
  "tokio",

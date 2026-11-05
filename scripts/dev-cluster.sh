@@ -15,6 +15,14 @@
 #   kiwi-nest node list
 #   kiwi-nest deploy blog ./path/to/bundle
 #
+# With Caddy (`caddy` on the PATH, or KIWI_NEST_DEV_CADDY naming it; KIWI_NEST_DEV_CADDY=none skips it), the
+# cluster has an ingress: Caddy with its admin API on 127.0.0.1:7490, HTTPS on :7443 and HTTP on :7480, configured
+# by the server with Caddy's internal CA. The server's API is then https://kn.localhost:7443, which the nodes and
+# the CLI use, trusting .dev-cluster/server/ingress-ca.crt, and the nodes' gateways also listen for the ingress on
+# 127.0.0.1:7491 and :7492, where requests need each node's ingress token:
+#
+#   curl --cacert .dev-cluster/server/ingress-ca.crt https://blog.localhost:7443/
+#
 # To skip the loop mounts (and sudo), set KIWI_NEST_DEV_BTRFS to a directory on a btrfs filesystem you own; each
 # node then keeps its volumes in a directory there. Logs are in .dev-cluster/*.log; KIWI_NEST_LOG sets the level.
 set -euo pipefail
@@ -25,10 +33,17 @@ mnt=${KIWI_NEST_DEV_MNT:-/mnt/kiwi-nest-dev}
 size=${KIWI_NEST_DEV_SIZE:-2G}
 server=127.0.0.1:7400
 bin=$root/target/debug/kiwi-nest
+caddy=${KIWI_NEST_DEV_CADDY:-$(command -v caddy || true)}
+[ "$caddy" = none ] && caddy=
+caddy_admin=127.0.0.1:7490
+http_port=7480
+https_port=7443
+api_domain=kn.localhost
 nodes=(a b)
 export KIWI_NEST_LOG=${KIWI_NEST_LOG:-info}
 
 gateway_port() { case $1 in a) echo 7481 ;; b) echo 7482 ;; esac; }
+ingress_port() { case $1 in a) echo 7491 ;; b) echo 7492 ;; esac; }
 app_ports() { case $1 in a) echo 31000-31999 ;; b) echo 32000-32999 ;; esac; }
 
 # Where a node's volumes live: its loop mount, or a directory under KIWI_NEST_DEV_BTRFS.
@@ -41,6 +56,34 @@ volumes_dir() {
 }
 
 running() { [ -f "$dir/$1.pid" ] && kill -0 "$(cat "$dir/$1.pid")" 2>/dev/null; }
+
+# Waits until a file exists, or gives up.
+wait_for_file() {
+  local file=$1 what=$2 log=$3
+  for _ in $(seq 1 100); do
+    [ -s "$file" ] && return 0
+    sleep 0.1
+  done
+  echo "$what didn't appear; see $log" >&2
+  tail -n 20 "$log" >&2 || true
+  exit 1
+}
+
+start_caddy() {
+  running caddy && return
+  mkdir -p "$dir/caddy"
+  echo "{\"admin\":{\"listen\":\"$caddy_admin\"}}" >"$dir/caddy/boot.json"
+  : >"$dir/caddy.log"
+  XDG_DATA_HOME=$dir/caddy/data XDG_CONFIG_HOME=$dir/caddy/config \
+    "$caddy" run --config "$dir/caddy/boot.json" >>"$dir/caddy.log" 2>&1 &
+  echo $! >"$dir/caddy.pid"
+  for _ in $(seq 1 100); do
+    if (exec 3<>"/dev/tcp/${caddy_admin%:*}/${caddy_admin#*:}") 2>/dev/null; then return 0; fi
+    sleep 0.1
+  done
+  echo "Caddy didn't start; see $dir/caddy.log" >&2
+  exit 1
+}
 
 # Waits for a line matching a pattern in a log, or gives up.
 wait_for() {
@@ -74,9 +117,17 @@ mount_node() {
 up() {
   (cd "$root" && cargo build -q -p kiwi-nest)
   mkdir -p "$dir"
+  local url=http://$server ingress=() ca=() listen
+  if [ -n "$caddy" ]; then
+    start_caddy
+    url=https://$api_domain:$https_port
+    ingress=(--ingress internal --caddy-admin "http://$caddy_admin" --api-domain "$api_domain"
+      --http-port "$http_port" --https-port "$https_port" --ingress-sync 2s)
+    ca=(--ca-cert "$dir/server/ingress-ca.crt")
+  fi
   if ! running server; then
     : >"$dir/server.log"
-    "$bin" server --listen "$server" --state-dir "$dir/server" >>"$dir/server.log" 2>&1 &
+    "$bin" server --listen "$server" --state-dir "$dir/server" "${ingress[@]}" >>"$dir/server.log" 2>&1 &
     echo $! >"$dir/server.pid"
     wait_for "$dir/server.log" "^listening on" "the server"
     # Only the first start prints an admin token.
@@ -87,11 +138,15 @@ up() {
     fi
   fi
   [ -f "$dir/admin-token" ] || { echo "no admin token in $dir/admin-token; try \`$0 clean\`" >&2; exit 1; }
+  if [ -n "$caddy" ]; then
+    # Caddy's internal CA, which the server saves once Caddy has its configuration.
+    wait_for_file "$dir/server/ingress-ca.crt" "the ingress CA" "$dir/server.log"
+  fi
   local admin
   admin=$(cat "$dir/admin-token")
   export KIWI_NEST_CONFIG_DIR=$dir/config
   if [ ! -f "$dir/config/clusters.json" ]; then
-    "$bin" cluster add dev "http://$server" --token "$admin" >/dev/null
+    "$bin" cluster add dev "$url" --token "$admin" "${ca[@]}" >/dev/null
   fi
   for n in "${nodes[@]}"; do
     running "$n" && continue
@@ -100,20 +155,27 @@ up() {
     if [ ! -f "$dir/$n/state/agent.json" ]; then
       join=(--join-token "$("$bin" token create join --name "dev node $n" 2>/dev/null)")
     fi
+    listen=()
+    [ -n "$caddy" ] && listen=(--ingress-listen "127.0.0.1:$(ingress_port "$n")")
     : >"$dir/$n.log"
-    "$bin" node --server "http://$server" "${join[@]}" --name "$n" \
+    "$bin" node --server "$url" "${ca[@]}" "${join[@]}" --name "$n" \
       --state-dir "$dir/$n/state" --volumes-dir "$(volumes_dir "$n")/volumes" \
-      --gateway-listen "127.0.0.1:$(gateway_port "$n")" --ports "$(app_ports "$n")" \
+      --gateway-listen "127.0.0.1:$(gateway_port "$n")" "${listen[@]}" --ports "$(app_ports "$n")" \
       --project-prefix "kn-dev-$n-" >>"$dir/$n.log" 2>&1 &
     echo $! >"$dir/$n.pid"
     wait_for "$dir/$n.log" "^node $n polling" "node $n"
   done
   echo "server on http://$server; nodes a (gateway 127.0.0.1:7481) and b (gateway 127.0.0.1:7482)"
+  if [ -n "$caddy" ]; then
+    echo "ingress: https://DOMAIN:$https_port (CA $dir/server/ingress-ca.crt); the server's API at $url"
+  else
+    echo "no ingress: put caddy on the PATH (or set KIWI_NEST_DEV_CADDY) for one"
+  fi
   echo "use it with: export KIWI_NEST_CONFIG_DIR=$dir/config"
 }
 
 status() {
-  for p in server "${nodes[@]}"; do
+  for p in caddy server "${nodes[@]}"; do
     if running "$p"; then echo "$p: running (pid $(cat "$dir/$p.pid"))"; else echo "$p: stopped"; fi
   done
   if running server; then
@@ -122,7 +184,7 @@ status() {
 }
 
 down() {
-  for p in "${nodes[@]}" server; do
+  for p in "${nodes[@]}" server caddy; do
     if running "$p"; then
       kill "$(cat "$dir/$p.pid")"
       echo "stopped $p"

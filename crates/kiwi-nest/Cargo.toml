@@ -23,5 +23,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 kn-btrfs.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
