@@ -1,0 +1,103 @@
+# Deploys a pull request's preview to a kiwi-nest cluster, `--from` production so it starts from an instant snapshot
+# of production's data in production's nest, and deletes it when the pull request closes.
+#
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, closed]
+#   concurrency: preview-${{ github.event.number }}
+#   jobs:
+#     preview:
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: actions/checkout@v4
+#         - uses: dire-kiwi/kiwi-nest@v0
+#           with:
+#             server: https://kn.example.com
+#             token: ${{ secrets.KIWI_NEST_PREVIEW_TOKEN }}
+#             app: blog
+#             domain: "{name}.example.com"
+#
+# The token should be a deploy token limited to the previews' names, that may use production as `--from`:
+# `kiwi-nest token create deploy --name blog-previews --pattern 'blog-pr*' --from blog`. See docs/install.md.
+name: kiwi-nest preview
+description: Deploy a pull request's preview to a kiwi-nest cluster, from production's data, and delete it when the pull request closes.
+branding:
+  icon: git-pull-request
+  color: green
+
+inputs:
+  server:
+    description: The kiwi-nest server's URL, such as https://kn.example.com.
+    required: true
+  token:
+    description: A deploy token limited to the previews' names (`--pattern 'blog-pr*' --from blog`).
+    required: true
+  app:
+    description: The production app previews start from (`--from`), such as blog.
+    required: true
+  domain:
+    description: >-
+      The preview's domain, in place of the bundle's `x-kiwi-nest.domain`. `{name}` is the preview's name and
+      `{number}` the pull request's, such as `{name}.example.com`. Needed to deploy.
+    required: false
+    default: ""
+  bundle:
+    description: The bundle, a directory with compose.yaml at its root or a ZIP of one.
+    required: false
+    default: "."
+  name:
+    description: The preview's name [default: APP-prNUMBER].
+    required: false
+    default: ""
+  idle-timeout:
+    description: The preview's `idle_timeout`, so it stops when nobody uses it; empty keeps the bundle's.
+    required: false
+    default: "10m"
+  backups:
+    description: Whether scheduled backups include the preview.
+    required: false
+    default: "false"
+  ca-cert:
+    description: A CA certificate (PEM) to trust for the server, such as the ingress's internal CA.
+    required: false
+    default: ""
+  version:
+    description: The kiwi-nest CLI to install [default: the server's version, which the CLI must be at least].
+    required: false
+    default: ""
+  command:
+    description: "`deploy` or `delete` [default: delete when the pull request was closed, deploy otherwise]."
+    required: false
+    default: ""
+  repository:
+    description: Where kiwi-nest's releases are published, on GitHub.
+    required: false
+    default: dire-kiwi/kiwi-nest
+
+outputs:
+  name:
+    description: The preview's name.
+    value: ${{ steps.preview.outputs.name }}
+  url:
+    description: The preview's URL (empty after a delete).
+    value: ${{ steps.preview.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - id: preview
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/scripts/action.sh"'
+      env:
+        KN_SERVER: ${{ inputs.server }}
+        KN_TOKEN: ${{ inputs.token }}
+        KN_APP: ${{ inputs.app }}
+        KN_DOMAIN: ${{ inputs.domain }}
+        KN_BUNDLE: ${{ inputs.bundle }}
+        KN_NAME: ${{ inputs.name }}
+        KN_IDLE_TIMEOUT: ${{ inputs.idle-timeout }}
+        KN_BACKUPS: ${{ inputs.backups }}
+        KN_CA_CERT: ${{ inputs.ca-cert }}
+        KN_VERSION: ${{ inputs.version }}
+        KN_COMMAND: ${{ inputs.command }}
+        KN_REPOSITORY: ${{ inputs.repository }}

@@ -1,12 +1,14 @@
 # Build, test and release kiwi-nest.
 
 TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+# The CLI alone (no server or node), for macOS.
+MACOS_TARGETS := aarch64-apple-darwin x86_64-apple-darwin
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
 
 # The host's target, as Cargo spells it in CARGO_TARGET_<TRIPLE>_RUNNER.
 HOST := $(shell rustc -vV | sed -n 's/^host: //p' | tr 'a-z-' 'A-Z_')
 
-.PHONY: all build web web-check check fmt clippy test integration test-root test-btrfs test-s3 release clean
+.PHONY: all build web web-check check fmt clippy test integration test-root test-btrfs test-s3 release release-macos sums clean
 
 all: build
 
@@ -35,6 +37,8 @@ fmt:
 
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
+	# The CLI-only build, as for macOS.
+	cargo clippy -p kiwi-nest --no-default-features -- -D warnings
 
 test:
 	cargo test --workspace
@@ -59,13 +63,25 @@ test-s3:
 test-btrfs:
 	scripts/test-btrfs.sh
 
-## release: static binaries for both musl targets, in dist/ (needs zig and cargo-zigbuild)
+## release: static binaries for both musl targets, in dist/ with SHA256SUMS (needs zig and cargo-zigbuild); a
+## directory of them is what `kiwi-nest upgrade --from DIR` takes
 release: web
 	rustup target add $(TARGETS)
 	cargo zigbuild --release --locked -p kiwi-nest $(foreach t,$(TARGETS),--target $(t))
 	mkdir -p dist
 	$(foreach t,$(TARGETS),cp target/$(t)/release/kiwi-nest dist/kiwi-nest-$(VERSION)-$(t);)
-	cd dist && sha256sum kiwi-nest-$(VERSION)-* > SHA256SUMS-$(VERSION)
+	$(MAKE) sums
+
+## release-macos: the CLI for macOS, on a Mac, into dist/
+release-macos:
+	rustup target add $(MACOS_TARGETS)
+	cargo build --release --locked -p kiwi-nest --no-default-features $(foreach t,$(MACOS_TARGETS),--target $(t))
+	mkdir -p dist
+	$(foreach t,$(MACOS_TARGETS),cp target/$(t)/release/kiwi-nest dist/kiwi-nest-$(VERSION)-$(t);)
+
+## sums: dist/SHA256SUMS, over every release file in dist/
+sums:
+	cd dist && sha256sum kiwi-nest-$(VERSION)-* > SHA256SUMS
 
 clean:
 	cargo clean

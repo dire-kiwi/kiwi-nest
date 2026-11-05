@@ -1,0 +1,75 @@
+# Publishes a release when a tag vVERSION is pushed (VERSION as in the workspace's Cargo.toml): static binaries for
+# both Linux musl targets (server, node and CLI), the CLI for macOS, and SHA256SUMS listing them all. `kiwi-nest
+# upgrade`, `node join`'s instructions and the GitHub Action fetch these files and check them against SHA256SUMS.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the tag is the workspace's version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          [ "v$version" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME, but Cargo.toml says $version"; exit 1; }
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install || rustup show
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install zig and cargo-zigbuild
+        run: pip install --user cargo-zigbuild
+      - run: make release
+      - name: Check the binaries run
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          ./dist/kiwi-nest-$version-x86_64-unknown-linux-musl version
+          file dist/kiwi-nest-$version-* | tee /dev/stderr | grep -c 'statically linked' | grep -qx 2
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/kiwi-nest-*
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install || rustup show
+      - run: make release-macos
+      - run: ./dist/kiwi-nest-${GITHUB_REF_NAME#v}-aarch64-apple-darwin version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/kiwi-nest-*
+
+  publish:
+    needs: [linux, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          chmod +x kiwi-nest-*
+          sha256sum kiwi-nest-* > SHA256SUMS
+          cat SHA256SUMS
+          [ "$(wc -l < SHA256SUMS)" -eq 4 ]
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes dist/*
