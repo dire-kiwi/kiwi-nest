@@ -110,6 +110,7 @@ x-kiwi-nest:
   nest: blog              # optional; usually worked out (see below)
   arch: arm64             # optional placement constraints
   node_labels: { disk: ssd }
+  backups: false          # optional: skip scheduled backups (previews)
 
 services:
   web:
@@ -137,7 +138,8 @@ volumes:
     and a bundle means the same thing on every node. Configuration goes in the bundle, for example in an
     `env_file`.
   - `x-kiwi-nest` needs `domain`, `service` and `port`. `idle_timeout` defaults to `0` (always on), so forgetting it
-    never stops a production app; previews set it. Unknown keys are refused, which catches typos.
+    never stops a production app; previews set it. `backups` defaults to `true`, so scheduled backups include an
+    app unless it says otherwise; previews can. Unknown keys are refused, which catches typos.
   - A shared volume is mounted into every service, or only those its `services` list names (which must exist). Its
     target can't be where the service already mounts something, or where another shared volume lands.
   - Every problem in a bundle is reported at once, each with where it is (`services.web.ports: …`).
@@ -187,7 +189,8 @@ VOLUMES/                         one btrfs filesystem per node
   apps/APP/VOL/                  subvolume: APP's named volume VOL
   shared/NAME/data/              subvolume: shared volume NAME
   shared/NAME/snaps/APP/         subvolume: APP's writable snapshot of NAME
-  backups/…                      read-only snapshots kept as parents for incremental sends
+  backups/apps/APP/STAMP/        read-only snapshot sets kept as parents for incremental sends (see Backups)
+  backups/volumes/NAME/STAMP/
 ```
 
 - **The node agent calls the btrfs ioctls directly** (create, snapshot, destroy) through `libc`, with no
@@ -425,28 +428,113 @@ VOLUMES/                         one btrfs filesystem per node
 ## Backups
 
 - **Every backup of app or volume data starts from a read-only snapshot.** The snapshot is instant, so an app pauses
-  for milliseconds, not for the length of the upload, whatever the target's format.
-- **Each target picks a format.** Targets are an S3-compatible bucket (R2, S3, …) or a directory over SSH. There can
-  be several, for example daily `send` to R2 and a weekly `tar` copy to a NAS.
-  - **`send` (the default)** uploads a `btrfs send` stream compressed with zstd. Backups are incremental against the
-    previous backup's snapshot (kept on the node), with a full backup weekly. Fast and small, and a restore keeps
-    snapshots sharing space. Restoring needs btrfs.
-  - **`tar`** uploads a full archive of the snapshot every time, compressed with zstd, keeping numeric owners, modes,
-    timestamps, symlinks, hard links and extended attributes. It restores anywhere, even without kiwi-nest
-    (`tar --zstd -xpf`), but it's larger and slower, and a restore keeps no sharing.
+  for milliseconds, not for the length of the upload, whatever the target's format. An app's backup is a **snapshot
+  set**: all of its volumes, and its own snapshots of shared volumes (as `@NAME`), taken together while its containers
+  are paused (`docker compose pause`, always undone, as for `--from`). A shared volume's is its `data`, taken under
+  the volume's lock, so no `volume load` or delete runs meanwhile.
+- **Each target picks a format.** Targets are an S3-compatible bucket (R2, S3, …), a directory over SSH, or a
+  directory on the machine (such as a mounted share). There can be several, for example daily `send` to R2 and a
+  weekly `tar` copy to a NAS. They're configured in one file given to the server (`--backup-targets`), and nodes get
+  them, credentials included, from the server (`GET /agent/backup-targets`) for each backup and restore; a
+  standalone node takes `--backup-targets` itself.
+
+  ```yaml
+  targets:
+    - name: r2
+      s3: { endpoint: "https://ACCOUNT.r2.cloudflarestorage.com", bucket: backups, access_key: …, secret_key_file: /etc/kiwi-nest/r2-secret }
+      prefix: home/            # several clusters can share a bucket
+      every: 24h               # scheduled; without it, only `kiwi-nest backup`
+      full_every: 7d           # send only: a full backup when the chain's full one is older
+      keep: { last: 3, daily: 7, weekly: 4, monthly: 6 }
+    - name: nas
+      ssh: { host: backup@nas.lan, path: /srv/kiwi-nest, identity: /etc/kiwi-nest/backup-key }
+      format: tar
+      every: 7d
+  ```
+
+  - **`send` (the default)** uploads a `btrfs send` stream compressed with zstd: one stream per volume, one after
+    another in one object, which plain `btrfs receive` also reads. Backups are incremental against the previous
+    backup's snapshot set, kept on the node, with a full backup weekly. Fast and small, and a restore keeps
+    snapshots sharing space. Restoring needs btrfs, and sending needs root (the kernel's rule).
+  - **`tar`** uploads a full archive of the snapshot set every time, compressed with zstd, one top-level directory
+    per volume, keeping numeric owners, modes (setuid and the like included), timestamps (to the nanosecond, in PAX
+    records), symlinks, hard links, device nodes, FIFOs and extended attributes (`SCHILY.xattr`); sockets are
+    skipped. It restores anywhere, even without kiwi-nest (`tar --zstd -xpf`, adding `--xattrs` for the
+    attributes), but it's larger and slower, and a restore keeps no sharing.
+- **A backup's key says what it is**, so a target's listing is the whole record: nothing about backups is kept in
+  the server's database, and a restored server, or another cluster, sees the same chains.
+
+  ```text
+  PREFIX/apps/APP/STAMP.full.send.zst           a full send backup of APP (STAMP: 20261106T030000Z, UTC)
+  PREFIX/apps/APP/STAMP.after-PARENT.send.zst   an incremental one, against the backup taken at PARENT
+  PREFIX/apps/APP/STAMP.tar.zst                 a tar backup
+  PREFIX/volumes/NAME/…                         the same for shared volumes
+  PREFIX/server/STAMP.tar.zst                   the server's own state
+  ```
+
+  A new backup's stamp is after every one of its app's or volume's in its targets, so keys never collide.
+- **Chains.** The node keeps snapshot sets in `VOLUMES/backups/apps/APP/STAMP` (and `…/volumes/NAME/STAMP`). A
+  `send` backup to a target continues a chain only from the newest set that's both still on the node and in the
+  target, with every backup its chain needs; and only if that chain's full backup is younger than the target's
+  `full_every` (and `--full` wasn't given). Otherwise it's a full backup. A volume new since the parent is sent
+  whole within an incremental backup. After each backup, the node keeps only the sets some `send` target could
+  continue from (each one's newest), so a set no target took, such as one whose upload failed, is destroyed and
+  never becomes a parent. Backups of one app or volume never overlap. Deleting an app sets its sets aside at once
+  (`VOLUMES/backups/apps/.gone-…`, destroyed by later backups and the next start), so a new app of the same name
+  starts its own chains; `--keep-data` keeps them. A forgotten node sets `VOLUMES/backups` aside with the rest.
+- **A failed upload never leaves a backup that looks complete.** Uploads are fed through a channel that ends with
+  an explicit end marker; a producer that fails (or panics, or a node that stops) never sends it. An S3 upload is a
+  single `PUT` when it fits in one part (16 MiB, growing for large ones), and otherwise a multipart upload,
+  completed only after the end marker and aborted on any failure. (Parts left by a crash stay invisible until a
+  bucket lifecycle rule aborts them; give the bucket one.) A directory or SSH upload writes `.partial-NAME` beside
+  the final name, checks its size, syncs it and renames it into place; listings never show partial files. Over SSH,
+  a failed upload is killed rather than ended, so the other side never sees a clean end of data.
 - **Restores work on any node**, and the key's suffix (`.send.zst` or `.tar.zst`) says which format it is.
   `deploy NAME ./bundle --restore KEY --node B` brings an app back on another node after its node is lost;
-  `volume create NAME --restore KEY` does the same for a shared volume. A `send` chain is received in order; a tar
-  archive is extracted into a fresh subvolume.
-- **Retention** is per target, and never deletes a backup that a newer incremental one needs. Apps can opt out of
-  scheduled backups, which suits previews.
-- **The server's own state** (its SQLite database and bundles) is backed up to the same targets, always as tar, since
-  the server's host may not have btrfs, and so there's no snapshot to start from. A tar of the live database file and
-  its WAL could capture a torn or partial database. Instead:
-  - The server first takes a consistent copy of the database with SQLite's online backup API (rusqlite's `backup`
-    feature) into a temporary file, while it keeps serving.
-  - It then tars that copy together with the bundle files the copy refers to. Bundles are written once, named by their
-    digest, and never changed, so copying them needs no lock.
+  `volume create NAME --restore KEY` does the same for a shared volume. `--target` names the target; by default it's
+  the first that has the key. The server checks that the key and its whole chain are in the target before it saves
+  anything, and a deploy token may restore another app's backup only where it may use that app as `--from`.
+  - Only an app's first deploy restores, like `--from` (which it can't be combined with); later deploys say it was
+    ignored. The restored volumes are made in the first deploy's staging directory and moved into place with the
+    rest, so a failed restore leaves nothing. Volumes the bundle declares but the backup lacks start empty; what
+    the backup holds that the bundle doesn't use is dropped, with a note. An app's snapshot of a shared volume
+    comes back as its snapshot again if the bundle mounts that volume in `snapshot` mode.
+  - A `send` chain is received in order, full backup first: each backup's subvolumes are snapshots of the
+    previous one's with its changes applied, and the previous ones are then destroyed. Receiving is kiwi-nest's
+    own (see D21): each command becomes a file operation in the new subvolume, with every path confined to it
+    (opened one component at a time without following symlinks, and acted on with `*at` calls that don't follow
+    the last one), so a damaged or hostile backup can't write outside it. Each command's CRC is checked.
+  - A tar archive is extracted into a fresh subvolume per top-level directory, by the same confined operations.
+  - Without root (tests, a development node), files' owners can't be restored to other users, so that's skipped.
+- **Retention** is per target: the newest `last`, and the newest of each of the last `daily` days, `weekly` weeks
+  (from Monday) and `monthly` months that have a backup; with none of them set, everything is kept. It never deletes
+  a backup that a kept incremental one needs (its whole chain is kept), nor the newest. It runs after each backup,
+  for that app, volume or the server. Backups of deleted apps stay until deleted by hand.
+- **The schedule.** Every minute (`--backup-check`), the server lists each target that has `every`, and backs up
+  whatever's due there (its newest backup in that target is older than `every`): every app on an online node (apps
+  whose bundle says `x-kiwi-nest.backups: false`, such as previews, are skipped; `kiwi-nest backup app` still works)
+  and shared volume, with one command per app or volume naming the due targets, and the server itself. A backup
+  that fails is tried again after a while (the smaller of `every` and 15 minutes).
+- **Commands.** `kiwi-nest backup app|volume NAME [--target T] [--full]` and `backup server` back up now, and wait;
+  `backup list [app|volume|server] [NAME]` lists what the targets hold (deploy tokens see only their apps').
+- **The server's own state** (its SQLite database and bundles) is backed up to the same targets, always as tar,
+  since the server's host may not have btrfs, and so there's no snapshot to start from. A tar of the live database
+  file and its WAL could capture a torn or partial database. Instead:
+  - Bundle deletion is held off (deletes that come up meanwhile leave their files, to be swept afterwards).
+  - The server takes a consistent copy of the database with SQLite's online backup API (rusqlite's `backup`
+    feature) into a staging directory beside the bundles, in one step: one read transaction, which in WAL mode
+    never blocks the server's writes. The copy is checked with `PRAGMA integrity_check`.
+  - It hard-links every bundle the copy refers to into the staging directory, resumes bundle deletion, and sweeps
+    what was held back. Bundles are written once, named by their digest, and never changed, so a link is a copy.
+  - It tars the staging directory (`server.sqlite` and `bundles/`) to each target; only this takes long, and
+    nothing waits on it.
+
+  A bundle deleted between the copy and the links (an app deleted, or a redeploy's cleanup) would leave the backup
+  naming a bundle it doesn't hold; holding deletion off over that window, rather than taking the lock for the whole
+  backup, closes the race without making deletes wait for an upload (see D23). `kiwi-nest server restore KEY
+  --state-dir DIR --backup-targets FILE` puts the database and bundles into an empty state directory, checking the
+  database first; the server then starts on it as usual, and nodes, whose tokens are in it, reconnect. A node that
+  applied generations beyond the restored database's moves the server's up to them (see Server and nodes).
 
 ## Failure and recovery
 
@@ -464,7 +552,9 @@ To bring a lost node's apps back on another node:
    domains, its shared volumes and so its nests, which can be placed again elsewhere. A change still being followed
    for the node ends, saying the node was forgotten, and its open commands are lost. It refuses while the node is
    online, unless given `--force` (the node then hears at once, through its open poll).
-3. **Restore each app** with `--restore --node` (step 8; until then, `deploy` it again, which starts it empty).
+3. **Restore the nest elsewhere**: each shared volume with `volume create NAME --restore KEY --node B`, then each app
+   with `deploy NAME ./bundle --restore KEY` (it joins its volumes' nest; `--node B` for one on its own), then
+   previews again `--from` their production app. `backup list` shows the keys; the newest is usually the one.
 
 **A forgotten node that comes back never runs its apps again**, so an app can't run twice, with one copy on stale
 data:
@@ -508,10 +598,10 @@ One Cargo workspace. A few crates keep the server and node apart and build in pa
 | `kiwi-nest` (bin) | | The one binary; `clap` chooses between `server`, `node` and the CLI commands. |
 | `kn-proto` | `api`, `agent`, `state` | Types shared by the CLI, server and nodes: API requests and responses, the agent link's polls, desired state, reports and commands. Versioned, so the server can talk to nodes one version behind. |
 | `kn-bundle` | `zip`, `compose`, `manifest`, `generate` | Safe ZIP reading, validation of the Compose subset and `x-kiwi-nest`, and the generated Compose file. No I/O beyond the bundle, so plain unit tests cover it. |
-| `kn-btrfs` | | btrfs ioctls (create, snapshot, destroy, read-only snapshots), subvolume checks, paths opened without following symlinks; later, send and receive as streams. |
+| `kn-btrfs` | | btrfs ioctls (create, snapshot, destroy, read-only snapshots, send), subvolume checks, paths opened without following symlinks. |
 | `kn-node` | `volumes`, `runtime`, `apps`, `gateway`, `agent` | The node: the volume layout and rules; `docker compose` through `tokio::process`; each app's lifecycle (one task per app, so its operations are serialized) and the state file; the `hyper` gateway; the link to the server (joining, the poll loop, the per-app applier, commands). |
-| `kn-server` | `api`, `agent`, `store`, `scheduler`, `bundles`, `auth`, `hub`, `ingress`, `registry`, `ui` | The server: `axum` APIs for the CLI (`api`) and for agents (`agent`), SQLite (`store`, with `nests` among its tables), placing new nests (`scheduler`), the bundle store, tokens, what's only in memory (`hub`: online nodes, waking polls, callers waiting on commands), Caddy sync, the registry, and the embedded UI. |
-| `kn-backup` | `chain`, `s3`, `ssh` | Send and tar streams through zstd to S3, R2 or SSH, chains and retention, restores. Used by nodes, and by the server for its own state. |
+| `kn-server` | `api`, `agent`, `store`, `scheduler`, `bundles`, `backups`, `auth`, `hub`, `ingress`, `registry`, `ui` | The server: `axum` APIs for the CLI (`api`) and for agents (`agent`), SQLite (`store`, with `nests` among its tables), placing new nests (`scheduler`), the bundle store, backup targets, the schedule and its own backups (`backups`), tokens, what's only in memory (`hub`: online nodes, waking polls, callers waiting on commands), Caddy sync, the registry, and the embedded UI. |
+| `kn-backup` | `key`, `target`, `store`, `s3`, `ssh`, `sendstream`, `receive`, `fsops`, `tarball` | Keys, chains, choosing a parent and retention; targets and their stores (S3, SSH, a directory), uploads and downloads through zstd that never leave a failed upload looking complete; the send stream format and receiving it as confined file operations; tar archives and extracting them. Used by nodes, and by the server for its own state. |
 | `kn-cli` | | The CLI: clusters in `~/.config/kiwi-nest`, and the commands. |
 | `web/` | | The web UI (React and Vite), built by `make` and embedded in `kn-server` with `rust-embed`. |
 
@@ -545,6 +635,9 @@ for macOS.
 | D18 | A change is saved and answered at once; the CLI follows it on a route of its own until the node reports it. | Holding the deploy's request open would tie the result to one connection: a server restart or a proxy timeout would lose it, though the change is saved. Following it can resume. |
 | D19 | Nests are known by name and exist while they have members; an app with nothing else naming its nest is in the one named after it. | Named nests let an app join another's (`nest: shop`) without inventing IDs, and a nest that dissolves when emptied can be placed afresh rather than pinning a name to a node for ever. An explicit nest object, made and deleted by hand, would be one more thing to manage for every app. |
 | D20 | `node forget` keeps the node and its token as a tombstone, and a forgotten node acts only on an exact `410 node forgotten` for its own ID. | Deleting them would make a returning node indistinguishable from a wrong token, so it couldn't be told to stand down. Acting on anything looser (a `401`, a network error, a proxy's `410`) would let an outage or a misconfiguration take a working node's apps down. |
+| D21 | kiwi-nest receives `send` streams itself, applying each command as a file operation confined to the new subvolume; sending is the kernel's ioctl. | No `btrfs-progs` on nodes (as for the other ioctls), and a backup from outside the node can't write outside its subvolume: every path is checked and opened without following symlinks. `btrfs receive` would need the binary, `chroot`s rather than checks, and marks received subvolumes for a search kiwi-nest doesn't need, since it knows the chain it's receiving. The objects stay readable by plain `btrfs receive`. |
+| D22 | A backup's key carries what it is, its time and its parent; the target's listing is the only record of backups. | A key alone is enough to restore from, chains and retention need only a listing, and nothing can disagree with the target: a restored server, a new cluster or a person with the bucket sees the same thing. A catalog in the database would go stale with every manual change to the bucket and be lost with the server. |
+| D23 | The server's own backup holds bundle deletion off from just before its database copy until the bundles it names are hard-linked, then sweeps what was held back. | The backup can't name a bundle it lacks, and deletes never wait: they're only deferred, for milliseconds. Locking deletion for the whole backup would hold it up for the upload's length; linking without the hold would still race a delete in the moment between the copy and the link. |
 
 ## Build plan
 
@@ -650,7 +743,20 @@ flowchart LR
    second state; a `tar` backup extracted with plain `tar` on a machine without btrfs matches file for file, owners
    and modes included; kill a node and recover its nest elsewhere; restore the server from its backup; back up the
    server while deploys are writing to its database, and the restored database passes `PRAGMA integrity_check` and
-   holds every deploy that finished before the backup began.
+   holds every deploy that finished before the backup began; delete an app during a server backup, and the restored
+   server has every bundle its database refers to; an interrupted upload leaves no backup that looks complete.
+   *Done:* keys, chains and retention in `crates/kn-backup/src/key.rs`; every store (a directory, SSH through a
+   stand-in `ssh`, and S3 against a real S3-compatible server with `KIWI_NEST_TEST_S3`) by one conformance test that
+   includes failed and cut-off uploads; kernel `send` streams received exactly, full and incremental, and plain
+   `btrfs receive` and `tar` reading the same objects (`crates/kn-backup/src/btrfs_tests.rs`, as root); hostile
+   streams and archives refused; backups and restores on a node with the fake backend (tar) and with btrfs (send
+   chains, kept sets, `--full`; as root) in `crates/kn-node/src/apps/tests.rs`; the server's own backup under
+   concurrent deploys, the bundle-deletion race (made certain with a hook between the copy and the links), restores
+   checked before anything is saved, and the schedule in `crates/kn-server/src/tests.rs`; and end to end with Docker
+   and btrfs, a lost node's nest restored on another from `tar` and (as root) `send` backups, in a directory and in
+   S3, and the server restored from its backup with its nodes reconnecting (`crates/kiwi-nest/tests/backup.rs`).
+   CI runs the root-only tests in a job of their own (`make test-root`), and starts versitygw for S3
+   (`scripts/test-s3.sh`).
 9. **Install, join, upgrades and the GitHub Action.** `kiwi-nest server init`; `kiwi-nest node join URL --token`,
    which checks Docker, Compose and the btrfs mount and installs the systemd unit; `kiwi-nest upgrade`, which updates
    the server, which then offers its binary to the nodes (each downloads it, checks its checksum, swaps it in and
@@ -688,3 +794,8 @@ flowchart LR
   can be added later without changing kiwi-nest.
 - **Crash-consistent snapshots.** `--from` and backups capture data like a power cut. That's fine for SQLite and
   PostgreSQL; an app that can't recover from a crash would need a dump hook (Later).
+- **Backups hold credentials on every node.** Nodes get the targets' credentials from the server, so a node can
+  read and delete every backup in its targets. Accepted, as whoever controls a node already controls its apps; a
+  bucket's own versioning or object lock is the defence against a node gone bad.
+- **`send` needs root.** The kernel only lets root send subvolumes, so a node run without root (development) can
+  only back up to `tar` targets.

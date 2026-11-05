@@ -18,6 +18,11 @@
 #   kiwi-nest node list
 #   kiwi-nest deploy blog ./path/to/bundle
 #
+# The server has one backup target, `local`: tar archives in .dev-cluster/backups (backup-targets.yaml says so):
+#
+#   kiwi-nest backup app blog && kiwi-nest backup list
+#   kiwi-nest deploy blog-copy ./path/to/bundle --restore apps/blog/STAMP.tar.zst --node b
+#
 # To skip the loop mounts (and sudo), set KIWI_NEST_DEV_BTRFS to a directory on a btrfs filesystem you own; each
 # node then keeps its volumes in a directory there. Logs are in .dev-cluster/*.log; KIWI_NEST_LOG sets the level.
 set -euo pipefail
@@ -87,7 +92,14 @@ up() {
   mkdir -p "$dir"
   if ! running server; then
     : >"$dir/server.log"
-    "$bin" server --listen "$server" --state-dir "$dir/server" >>"$dir/server.log" 2>&1 &
+    # One backup target, a directory, as tar (the nodes run without root, and `send` needs it); edit it to try others.
+    if [ ! -f "$dir/backup-targets.yaml" ]; then
+      mkdir -p "$dir/backups"
+      printf 'targets:\n  - name: local\n    dir: { path: %s }\n    format: tar\n    keep: { last: 5 }\n' \
+        "$dir/backups" >"$dir/backup-targets.yaml"
+    fi
+    "$bin" server --listen "$server" --state-dir "$dir/server" --backup-targets "$dir/backup-targets.yaml" \
+      >>"$dir/server.log" 2>&1 &
     echo $! >"$dir/server.pid"
     wait_for "$dir/server.log" "^listening on" "the server"
     # Only the first start prints an admin token.
