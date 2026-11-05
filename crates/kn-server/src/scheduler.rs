@@ -163,12 +163,13 @@ pub struct NoNode {
 }
 
 impl NoNode {
-    pub fn describe(&self) -> String {
+    /// Says why no node can take new nest `nest`.
+    pub fn describe(&self, nest: &str) -> String {
         if self.unfit.is_empty() {
             return "no node has joined the cluster yet: make a join token with `kiwi-nest token create join`".into();
         }
         format!(
-            "no node can take a new nest: {}",
+            "no node can take new nest `{nest}`: {}",
             self.unfit
                 .iter()
                 .map(|(n, why)| format!("{n} ({why})"))
@@ -583,8 +584,8 @@ mod tests {
         assert_eq!(place(&[amd.clone(), arm.clone()], &arm64, &s).unwrap().name, "pi");
         let e = place(std::slice::from_ref(&amd), &arm64, &s).unwrap_err();
         assert_eq!(
-            e.describe(),
-            "no node can take a new nest: big (arch `amd64`, not `arm64`)"
+            e.describe("x"),
+            "no node can take new nest `x`: big (arch `amd64`, not `arm64`)"
         );
         assert!(!e.all_offline());
         let ssd = Needs {
@@ -598,7 +599,7 @@ mod tests {
         assert!(
             place(&[], &Needs::default(), &s)
                 .unwrap_err()
-                .describe()
+                .describe("x")
                 .contains("no node has joined")
         );
     }

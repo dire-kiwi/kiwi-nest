@@ -1147,7 +1147,7 @@ async fn a_cordoned_node_gets_no_new_nests_but_keeps_its_own() {
     let (status, msg) = error(env.put("none", &app_yaml("none.test", "", "1m"), "").await).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(
-        msg.contains("no node can take a new nest: a (cordoned), b (cordoned)"),
+        msg.contains("no node can take new nest `none`: a (cordoned), b (cordoned)"),
         "{msg}"
     );
     let n: NodeInfo = env.post("/nodes/b/uncordon").await.json().await.unwrap();

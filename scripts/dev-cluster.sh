@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # A development cluster on this machine: a kiwi-nest server and two nodes, `a` and `b`, sharing the Docker Engine.
 #
-#   scripts/dev-cluster.sh up       build, then start the server and the nodes in the background (the default)
-#   scripts/dev-cluster.sh status   show what's running, and the nodes as the server sees them
-#   scripts/dev-cluster.sh down     stop them, remove the nodes' Compose projects and unmount their filesystems
-#   scripts/dev-cluster.sh clean    down, then remove the cluster's state (the server's database, the nodes' data)
+#   scripts/dev-cluster.sh up           build, then start the server and the nodes in the background (the default)
+#   scripts/dev-cluster.sh status       show what's running, and the nodes as the server sees them
+#   scripts/dev-cluster.sh stop NODE    stop one node's agent (its apps keep running, as when a machine is cut off)
+#   scripts/dev-cluster.sh start NODE   start one node's agent again
+#   scripts/dev-cluster.sh rejoin NODE  start a node the server forgot (`node forget`) with a fresh join token
+#   scripts/dev-cluster.sh down         stop them, remove the nodes' Compose projects and unmount their filesystems
+#   scripts/dev-cluster.sh clean        down, then remove the cluster's state (the server's database, the nodes' data)
 #
 # Each node gets its own state directory, gateway port, loop-mounted btrfs file (mounted with sudo, with
 # user_subvol_rm_allowed, and owned by you) and Compose project prefix (kn-dev-a-, kn-dev-b-). The server listens on
@@ -41,6 +44,14 @@ volumes_dir() {
 }
 
 running() { [ -f "$dir/$1.pid" ] && kill -0 "$(cat "$dir/$1.pid")" 2>/dev/null; }
+
+known_node() {
+  for n in "${nodes[@]}"; do [ "$n" = "$1" ] && return 0; done
+  echo "there's no node \`$1\`; the nodes are ${nodes[*]}" >&2
+  exit 2
+}
+
+forgotten() { grep -q '"forgotten"' "$dir/$1/state/agent.json" 2>/dev/null; }
 
 # Waits for a line matching a pattern in a log, or gives up.
 wait_for() {
@@ -95,21 +106,70 @@ up() {
   fi
   for n in "${nodes[@]}"; do
     running "$n" && continue
-    mount_node "$n"
-    local join=()
-    if [ ! -f "$dir/$n/state/agent.json" ]; then
-      join=(--join-token "$("$bin" token create join --name "dev node $n" 2>/dev/null)")
+    if forgotten "$n"; then
+      echo "node $n was forgotten by the server, so it won't start; \`$0 rejoin $n\` joins it as a new node" >&2
+      continue
     fi
-    : >"$dir/$n.log"
-    "$bin" node --server "http://$server" "${join[@]}" --name "$n" \
-      --state-dir "$dir/$n/state" --volumes-dir "$(volumes_dir "$n")/volumes" \
-      --gateway-listen "127.0.0.1:$(gateway_port "$n")" --ports "$(app_ports "$n")" \
-      --project-prefix "kn-dev-$n-" >>"$dir/$n.log" 2>&1 &
-    echo $! >"$dir/$n.pid"
-    wait_for "$dir/$n.log" "^node $n polling" "node $n"
+    start_node "$n"
   done
   echo "server on http://$server; nodes a (gateway 127.0.0.1:7481) and b (gateway 127.0.0.1:7482)"
   echo "use it with: export KIWI_NEST_CONFIG_DIR=$dir/config"
+}
+
+# Starts a node's agent: with a join token the first time, or with a fresh one if asked (`rejoin`).
+start_node() {
+  local n=$1 fresh=${2:-}
+  mount_node "$n"
+  local join=()
+  if [ ! -f "$dir/$n/state/agent.json" ] || [ -n "$fresh" ]; then
+    join=(--join-token "$(KIWI_NEST_CONFIG_DIR=$dir/config "$bin" token create join --name "dev node $n" 2>/dev/null)")
+  fi
+  : >"$dir/$n.log"
+  "$bin" node --server "http://$server" "${join[@]}" --name "$n" \
+    --state-dir "$dir/$n/state" --volumes-dir "$(volumes_dir "$n")/volumes" \
+    --gateway-listen "127.0.0.1:$(gateway_port "$n")" --ports "$(app_ports "$n")" \
+    --project-prefix "kn-dev-$n-" >>"$dir/$n.log" 2>&1 &
+  echo $! >"$dir/$n.pid"
+  wait_for "$dir/$n.log" "^node $n polling" "node $n"
+}
+
+stop_node() {
+  known_node "$1"
+  if running "$1"; then
+    kill "$(cat "$dir/$1.pid")"
+    echo "stopped node $1; its apps keep running"
+  else
+    echo "node $1 isn't running"
+  fi
+  rm -f "$dir/$1.pid"
+}
+
+start_one() {
+  known_node "$1"
+  running server || { echo "the server isn't running; try \`$0 up\`" >&2; exit 1; }
+  if running "$1"; then
+    echo "node $1 is running already"
+    return
+  fi
+  if forgotten "$1"; then
+    # It refuses, and says why.
+    "$bin" node --server "http://$server" --name "$1" --state-dir "$dir/$1/state" \
+      --volumes-dir "$(volumes_dir "$1")/volumes" --project-prefix "kn-dev-$1-" || true
+    return 1
+  fi
+  start_node "$1"
+  echo "started node $1"
+}
+
+rejoin() {
+  known_node "$1"
+  running server || { echo "the server isn't running; try \`$0 up\`" >&2; exit 1; }
+  if running "$1"; then
+    echo "node $1 is running; stop it first" >&2
+    exit 1
+  fi
+  start_node "$1" fresh
+  echo "node $1 joined again, as a new node"
 }
 
 status() {
@@ -157,10 +217,15 @@ clean() {
   echo "removed $dir"
 }
 
+usage() { echo "usage: $0 [up|status|stop NODE|start NODE|rejoin NODE|down|clean]" >&2; exit 2; }
+
 case ${1:-up} in
   up) up ;;
   status) status ;;
+  stop) [ $# -eq 2 ] || usage; stop_node "$2" ;;
+  start) [ $# -eq 2 ] || usage; start_one "$2" ;;
+  rejoin) [ $# -eq 2 ] || usage; rejoin "$2" ;;
   down) down ;;
   clean) clean ;;
-  *) echo "usage: $0 [up|status|down|clean]" >&2; exit 2 ;;
+  *) usage ;;
 esac

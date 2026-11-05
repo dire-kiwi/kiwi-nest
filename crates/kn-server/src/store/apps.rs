@@ -288,8 +288,7 @@ fn place_nest(
         Err(e) if e.all_offline() => Err(Error::Offline(format!(
             "no node is online to take new nest `{nest}`; pass --node and --queue to place it on an offline one"
         ))),
-        Err(e) if e.unfit.is_empty() => Err(Error::Conflict(e.describe())),
-        Err(e) => Err(Error::Conflict(format!("{} (for nest `{nest}`)", e.describe()))),
+        Err(e) => Err(Error::Conflict(e.describe(nest))),
     }
 }
 
