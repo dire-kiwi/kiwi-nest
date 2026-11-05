@@ -214,6 +214,8 @@ impl Drop for Node {
         if std::env::var("KIWI_NEST_INTEGRATION").as_deref() == Ok("1") {
             remove_projects(&self.prefix);
         }
+        // Read-only snapshots (kept for backups) aren't removed with the directory.
+        let _ = kn_btrfs::remove_tree(self.volumes.path());
     }
 }
 
@@ -261,6 +263,8 @@ pub struct Server {
     addr: String,
     pub admin: String,
     pub dir: tempfile::TempDir,
+    /// More `kiwi-nest server` flags, kept for restarts.
+    extra: Vec<String>,
     /// The CLI's configuration directory, empty, so the tests never use the user's clusters.
     pub config: tempfile::TempDir,
 }
@@ -287,7 +291,7 @@ fn first_lines(child: &mut Child, n: usize, what: &str) -> Vec<String> {
     out
 }
 
-fn spawn_server(dir: &Path, listen: &str) -> (Child, String, Option<String>) {
+fn spawn_server(dir: &Path, listen: &str, extra: &[String]) -> (Child, String, Option<String>) {
     let mut child = Command::new(BIN)
         .args([
             "server",
@@ -300,6 +304,7 @@ fn spawn_server(dir: &Path, listen: &str) -> (Child, String, Option<String>) {
         ])
         .arg("--state-dir")
         .arg(dir)
+        .args(extra)
         .env(
             "KIWI_NEST_LOG",
             std::env::var("KIWI_NEST_LOG").unwrap_or_else(|_| "warn".into()),
@@ -326,16 +331,46 @@ fn spawn_server(dir: &Path, listen: &str) -> (Child, String, Option<String>) {
 
 impl Server {
     pub fn start() -> Server {
+        Server::start_with(&[])
+    }
+
+    /// A server with more `kiwi-nest server` flags.
+    pub fn start_with(extra: &[&str]) -> Server {
         let dir = tempfile::tempdir().unwrap();
-        let (child, url, admin) = spawn_server(&dir.path().join("server"), "127.0.0.1:0");
+        let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        let (child, url, admin) = spawn_server(&dir.path().join("server"), "127.0.0.1:0", &extra);
         Server {
             child,
             addr: url.trim_start_matches("http://").to_string(),
             url,
             admin: admin.unwrap(),
             dir,
+            extra,
             config: tempfile::tempdir().unwrap(),
         }
+    }
+
+    /// A server on state restored into `dir/server`, listening on `listen`, whose admin token is `admin` (the
+    /// restored database's).
+    pub fn start_restored(dir: tempfile::TempDir, admin: &str, listen: &str, extra: &[&str]) -> Server {
+        let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        let (child, url, first) = spawn_server(&dir.path().join("server"), listen, &extra);
+        assert!(first.is_none(), "a restored server has its admin tokens");
+        Server {
+            child,
+            addr: url.trim_start_matches("http://").to_string(),
+            url,
+            admin: admin.into(),
+            dir,
+            extra,
+            config: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    /// Kills the server (SIGKILL).
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     /// Kills the server and starts it again on the same state and address.
@@ -348,7 +383,7 @@ impl Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
         std::thread::sleep(outage);
-        let (child, url, admin) = spawn_server(&self.dir.path().join("server"), &self.addr);
+        let (child, url, admin) = spawn_server(&self.dir.path().join("server"), &self.addr, &self.extra);
         assert!(admin.is_none(), "a restart makes no new admin token");
         assert_eq!(url, self.url);
         self.child = child;
@@ -560,5 +595,7 @@ impl Drop for ClusterNode {
         if std::env::var("KIWI_NEST_INTEGRATION").as_deref() == Ok("1") {
             remove_projects(&self.prefix);
         }
+        // Read-only snapshots (kept for backups) aren't removed with the directory.
+        let _ = kn_btrfs::remove_tree(self.volumes.path());
     }
 }
