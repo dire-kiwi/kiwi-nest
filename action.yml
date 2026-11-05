@@ -10,7 +10,7 @@
 #       runs-on: ubuntu-latest
 #       steps:
 #         - uses: actions/checkout@v4
-#         - uses: dire-kiwi/kiwi-nest@v0
+#         - uses: dire-kiwi/kiwi-nest@v0.2.0   # a release's tag
 #           with:
 #             server: https://kn.example.com
 #             token: ${{ secrets.KIWI_NEST_PREVIEW_TOKEN }}

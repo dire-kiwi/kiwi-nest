@@ -15,3 +15,10 @@ shared volumes, `kiwi-nest token …`, `kiwi-nest cluster …`) goes through the
 (`kiwi-nest node --standalone`). The server also serves a web UI (`kiwi-nest user add NAME`, then log in at the
 server's address) showing the nodes, nests, apps, volumes and backups, with suspend, resume, logs, back up now and
 cordon. `scripts/dev-cluster.sh` runs a server and two nodes on one machine.
+
+**Installing a cluster:** [docs/install.md](docs/install.md). In short, from a release's binary (checked against
+its `SHA256SUMS`): `sudo kiwi-nest server init --api-domain kn.example.com --ingress acme --acme-email …` on the
+server's host, `sudo kiwi-nest node join https://kn.example.com --token JOIN` on each node, and later
+`sudo kiwi-nest upgrade` on the server's host, which then upgrades the nodes one at a time while their apps keep
+running. The repository's GitHub Action (`action.yml`) deploys pull requests' previews `--from` production and
+deletes them when they close.

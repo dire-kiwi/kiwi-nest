@@ -29,7 +29,14 @@ kiwi-nest is written from scratch; don't copy from or refer to other deployment 
   `kn_btrfs::remove_tree`. The tests against S3 need `KIWI_NEST_TEST_S3` (`ENDPOINT BUCKET ACCESS SECRET`):
   `make test-s3` (`scripts/test-s3.sh`) starts versitygw in Docker with a bucket and prints it.
 - `make release` builds static binaries for `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` into
-  `dist/`, with `cargo zigbuild` (needs `zig` and `cargo-zigbuild`).
+  `dist/` with `SHA256SUMS`, with `cargo zigbuild` (needs `zig` and `cargo-zigbuild`); `make release-macos` builds
+  the CLI alone on a Mac. Pushing a tag `vVERSION` publishes a release (`.github/workflows/release.yml`).
+- The binary's `cluster` feature (default) holds the server, the node and the installers; `cargo build -p kiwi-nest
+  --no-default-features` is the CLI alone, as for macOS, and `make clippy` lints it too (CI builds it on macOS).
+- `scripts/test-action.sh` tests the GitHub Action's script (`action.yml`, `scripts/action.sh`) against a fake
+  release.
+- Installing (`server init`, `node join`, `upgrade`, `rollback`) needs root and systemd, so it's tried on real machines
+  (see `docs/install.md`), not in tests; its pieces in `kn-install` have unit tests.
 - `cargo run -- version` prints the version (from the workspace `Cargo.toml`) and the git commit.
 
 To try it by hand, standalone (one node, its loopback API, no server):
@@ -110,6 +117,13 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
   checks on requests with its session cookie) and `registry` (the `registry:3` container, the credential check
   Caddy asks for every request, garbage collection in `gc.rs` with table tests, image references in `refs.rs`; its
   `tests.rs` uses a fake registry).
+- `crates/kn-install`: installing on a machine: `layout` (releases side by side, `current`), `checksums`
+  (`SHA256SUMS`), `release` (fetching releases from GitHub or a directory), `systemd` (units and each host's drop-in),
+  `checks` (Docker, Compose, btrfs, the private address), `caddy` (the pinned Caddy). The commands are in the
+  binary's `install.rs`; `cluster.rs` runs the server and the node.
+- `crates/kn-server/src/upgrades.rs`: the server's release offered to older nodes, one at a time. Nodes take
+  `Action::Upgrade` in `kn-node`'s `agent` and restart into the release (`agent::Stopped::Restart`, which the binary
+  executes in its place).
 - `crates/kn-cli`: the CLI commands (`push` runs `docker login`, `tag` and `push`), and `config` (clusters in
   `~/.config/kiwi-nest/clusters.json`).
 - `web/`: the web UI (React, TypeScript, Vite; no other dependencies). `src/api.ts` mirrors `kn-proto`'s types;

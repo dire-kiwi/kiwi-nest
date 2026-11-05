@@ -305,7 +305,9 @@ VOLUMES/                         one btrfs filesystem per node
   the answer) may join again under its name with a new join token, and gets a new ingress token too. A node that
   joined before the server gave out ingress tokens asks for its own (`GET /agent/ingress-token`) when it starts
   with `--ingress-listen`. The server's URL is normally its API domain through the ingress, over HTTPS;
-  `--ca-cert FILE` adds a root to trust, such as the ingress's internal CA.
+  `--ca-cert FILE` adds a root to trust, such as the ingress's internal CA. `kiwi-nest node join URL --token` does
+  the join itself before it installs the node's service (see [Install and upgrades](#install-and-upgrades)), so a
+  bad token fails there, and the service starts already joined.
 - **Desired state for what's deployed.** For each node, the server keeps the list of apps and shared volumes it
   should have, each with a bundle digest and a generation number. Every change to a node's desired state bumps the
   node's sequence number, and the entry records the number it changed at. A poll carries the number of the last
@@ -725,6 +727,88 @@ command with what it acts on and who asked), on a thread of its own, in WAL
   way, so another site can't log a browser in as someone else either. A request with a token in `Authorization`
   is judged by its token alone; browsers never add one by themselves.
 
+## Install and upgrades
+
+The how-to is [install.md](install.md). Every command here runs as root on the machine it sets up.
+
+- **Releases** are published on GitHub for a tag `vVERSION` (`.github/workflows/release.yml`): static binaries for
+  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` (server, node and CLI), the CLI alone for macOS
+  (`aarch64-apple-darwin`, `x86_64-apple-darwin`; the binary without its `cluster` feature), each named
+  `kiwi-nest-VERSION-TARGET`, and `SHA256SUMS` listing them. `make release` writes the same files into `dist/`, which
+  `kiwi-nest upgrade --from DIR` takes in GitHub's place.
+- **Installed releases sit side by side** (`kn-install`'s `layout`, D28):
+
+  ```text
+  /usr/local/lib/kiwi-nest/releases/VERSION/kiwi-nest   each release's binary; old ones are kept for rollbacks
+  /usr/local/lib/kiwi-nest/releases/VERSION/dist/       on the server's host: the release's Linux files and SHA256SUMS
+  /usr/local/lib/kiwi-nest/current -> releases/VERSION  the one in use, swapped by one rename
+  /usr/local/bin/kiwi-nest -> /usr/local/lib/kiwi-nest/current/kiwi-nest
+  ```
+
+  A release is written beside its place, checked, synced and renamed in; before it's made current, it's run
+  (`kiwi-nest version`) and must say it's that version, which catches a file for another architecture or a damaged
+  one. A process knows it runs from an installed release by its own path (`/proc/self/exe`).
+- **systemd units, and each host's drop-in** (D29). `kiwi-nest-server.service` (as the unprivileged `kiwi-nest`
+  user, D9), `kiwi-nest-caddy.service` (as `kiwi-nest-caddy`, with only `CAP_NET_BIND_SERVICE`) and
+  `kiwi-nest-node.service` (as root, after Docker) are the same on every host and run
+  `/usr/local/bin/kiwi-nest ROLE $KIWI_NEST_ARGS`. A host's own flags are in `UNIT.d/host.conf`, which sets
+  `KIWI_NEST_ARGS` (and for a node `RequiresMountsFor=` its volumes, so it starts after their mount). `server init`
+  and `node join` write the drop-in; upgrades write the units again from the new release (`kiwi-nest units`, run
+  with the new binary) and never touch a drop-in.
+- **`kiwi-nest server init`** checks the machine (ports 80 and 443, Docker for the registry) and the server's flags
+  (as the server parses and checks them), installs itself, makes the two users and the state directory, installs
+  Caddy (a pinned release, checked against the SHA-512 recorded in `kn-install`'s `caddy`, not only against the
+  checksums file beside it; a distribution's package would start a Caddy of its own on port 80), whose boot
+  configuration is its admin API on loopback alone, writes the units and the drop-in, makes the first admin token
+  itself (`kn_server::first_admin_token`, so it's printed to whoever ran the command rather than to the journal),
+  and starts everything. With `--ingress internal` it waits for the CA's root and says how to trust it.
+- **`kiwi-nest node join URL --token JOIN`** checks, reporting every problem at once: Docker and the Compose plugin;
+  the volumes directory, on btrfs, reached without symlinks, and (a warning) mounted from `/etc/fstab`; the private
+  address (`--address`, by default the source address of the route to the server), which must be this machine's,
+  private (RFC 1918, shared address space as Tailscale uses, IPv6 unique local) unless `--allow-public-address`,
+  and free to listen on; and that the server answers, at a version no older than the node's. It installs itself,
+  joins (`kn_node::agent::join`: the node's tokens go in `agent.json` and its registry credential in its Docker
+  configuration, as on a first start), copies `--ca-cert` for the node and, with a registry, for Docker
+  (`/etc/docker/certs.d/HOST/ca.crt`), writes the unit and its drop-in, starts it, and says how to firewall the
+  gateway's port to the server's host.
+- **`kiwi-nest upgrade`** on the server's host fetches the release (GitHub's latest, `--version`, or `--from DIR`)
+  for every Linux target into its `dist/`, each file checked against `SHA256SUMS` before it's put in place, installs
+  this machine's, copies the database with SQLite's backup API (to `STATE/upgrades/`, in case the new release's
+  migrations need undoing), makes it current, writes the units, restarts the server, waits for it to answer with
+  the new version, and keeps the newest three releases (`--keep`). On a node's host, it restarts the node instead.
+- **The server upgrades the nodes, one at a time** (`kn-server`'s `upgrades`, D30). It offers its release for each
+  architecture it has: the files in its release's `dist/`, checked against their `SHA256SUMS` when it starts, then
+  its own binary for its own architecture. Whenever no node is being upgraded, the first node by name that's online,
+  older than the server, speaks version 4 of the agent link or later and runs from an installed release
+  (`NodeFacts::self_upgrade`) gets `Upgrade { version, sha256, size }`. The node downloads its architecture's file
+  (`GET /agent/releases/{version}/{arch}`) into its own releases, checks its size and SHA-256 and that it runs, and
+  answers; then it waits for the changes and commands it's applying (taking the lock forgetting takes), starts
+  nothing more, makes the release current, stops its gateways and executes the new binary in its own place, with
+  the same arguments (D28). Its apps keep running, and the new agent adopts them, as after any restart: only the
+  gateway is down, for that moment. Once it polls again reporting the server's version, the next node's turn comes.
+  A node that refuses the release, or doesn't come back running it within three minutes
+  (`upgrade_restart_timeout`), fails, and that **halts the rollout**, so a bad release stops at one node.
+  `GET /upgrade` (`kiwi-nest upgrade status`) shows each node's state (`current`, `pending`, `upgrading`, `failed`,
+  or `manual` with why: from before upgrades, not installed, or no release for its architecture), and `POST
+  /upgrade` (`kiwi-nest upgrade nodes`) carries on after a failure; so does a server restart. The server only ever
+  upgrades: a node newer than it keeps its release.
+- **Versions.** The server keeps serving nodes one agent-link version behind it (and older, to
+  `OLDEST_PROTOCOL`), so a cluster mid-rollout works as usual. Upgrades came with version 4: an older node gets no
+  `Upgrade` command and is upgraded by hand. **The CLI must be at least as new as the server**: it sends its version
+  in its `User-Agent` (`kiwi-nest/VERSION`), and the server answers an older one `426 Upgrade Required`, saying which
+  version to install, on every route but `/version` (D31). Other clients (browsers, curl, Docker) aren't checked.
+- **`kiwi-nest rollback [VERSION]`** makes an older installed release current again (the previous one by default),
+  writes its units, and restarts what the machine runs. A server whose database a newer release migrated refuses
+  it; the copy `upgrade` made is the way back, by hand.
+- **The GitHub Action** (`action.yml`, running `scripts/action.sh`) installs the CLI of the server's version (asked
+  at `/version`, so it's never older; or `version:`), checked against the release's `SHA256SUMS`, then on a pull
+  request deploys `APP-prNUMBER` `--from` production, so it's in production's nest and starts from a snapshot of
+  its data, with `--domain` (the input, with `{name}` and `{number}`), `--idle-timeout 10m` and `--no-backups`; when
+  the pull request closes it deletes the preview, and one that was never deployed isn't an error. Its token is a
+  deploy token for the previews' pattern with production as `--from`, so it can't change production. The deploy
+  flags rewrite the bundle's `x-kiwi-nest` as the CLI packs it (`kn-bundle`'s `overrides`, D32), so the server and
+  the node check an ordinary bundle.
+
 ## Failure and recovery
 
 Nothing fails over. A node that goes away takes its nests down: the server shows it offline, and its apps as
@@ -784,12 +868,13 @@ One Cargo workspace. A few crates keep the server and node apart and build in pa
 
 | Crate | Modules | What it does |
 | --- | --- | --- |
-| `kiwi-nest` (bin) | | The one binary; `clap` chooses between `server`, `node` and the CLI commands. |
+| `kiwi-nest` (bin) | `cluster`, `install` | The one binary; `clap` chooses between `server`, `node`, `upgrade`, `rollback` and the CLI commands. `cluster` runs the server and the node; `install` is `server init`, `node join`, `upgrade` and `rollback`. Both are behind the `cluster` feature (on by default); without it the binary is the CLI alone, as built for macOS. |
+| `kn-install` | `layout`, `checksums`, `release`, `systemd`, `checks`, `caddy` | Installing on a machine: releases side by side and the current one, `SHA256SUMS`, fetching releases (GitHub, or a directory), the systemd units and drop-ins, the checks a machine must pass, and the pinned Caddy. |
 | `kn-proto` | `api`, `agent`, `state` | Types shared by the CLI, server and nodes: API requests and responses, the agent link's polls, desired state, reports and commands. Versioned, so the server can talk to nodes one version behind. |
-| `kn-bundle` | `zip`, `compose`, `manifest`, `generate` | Safe ZIP reading, validation of the Compose subset and `x-kiwi-nest`, and the generated Compose file. No I/O beyond the bundle, so plain unit tests cover it. |
+| `kn-bundle` | `zip`, `compose`, `manifest`, `generate`, `overrides` | Safe ZIP reading, validation of the Compose subset and `x-kiwi-nest`, and the generated Compose file. No I/O beyond the bundle, so plain unit tests cover it. |
 | `kn-btrfs` | | btrfs ioctls (create, snapshot, destroy, read-only snapshots, send), subvolume checks, paths opened without following symlinks, and measuring a subvolume's space (`usage`, from its files' extents). |
 | `kn-node` | `volumes`, `runtime`, `apps`, `gateway`, `agent` | The node: the volume layout and rules; `docker compose` through `tokio::process`; each app's lifecycle (one task per app, so its operations are serialized), the state file, and measuring the volumes' space (`apps/usage`); the `hyper` gateway; the link to the server (joining, the poll loop, the per-app applier, commands). |
-| `kn-server` | `api`, `agent`, `store`, `scheduler`, `bundles`, `backups`, `auth`, `hub`, `ingress`, `registry`, `ui` | The server: `axum` APIs for the CLI (`api`) and for agents (`agent`), SQLite (`store`, with `nests` among its tables), placing new nests (`scheduler`), the bundle store, backup targets, the schedule and its own backups (`backups`), tokens, what's only in memory (`hub`: online nodes, waking polls, callers waiting on commands), Caddy sync, the registry, and the embedded UI with its users' logins and sessions (`ui`, and `store`'s `users`). |
+| `kn-server` | `api`, `agent`, `store`, `scheduler`, `bundles`, `backups`, `auth`, `hub`, `ingress`, `registry`, `ui`, `upgrades` | The server: `axum` APIs for the CLI (`api`) and for agents (`agent`), SQLite (`store`, with `nests` among its tables), placing new nests (`scheduler`), the bundle store, backup targets, the schedule and its own backups (`backups`), tokens, what's only in memory (`hub`: online nodes, waking polls, callers waiting on commands), Caddy sync, the registry, and the embedded UI with its users' logins and sessions (`ui`, and `store`'s `users`). |
 | `kn-backup` | `key`, `target`, `store`, `s3`, `ssh`, `sendstream`, `receive`, `fsops`, `tarball` | Keys, chains, choosing a parent and retention; targets and their stores (S3, SSH, a directory), uploads and downloads through zstd that never leave a failed upload looking complete; the send stream format and receiving it as confined file operations; tar archives and extracting them. Used by nodes, and by the server for its own state. |
 | `kn-cli` | | The CLI: clusters in `~/.config/kiwi-nest`, and the commands. |
 | `web/` | | The web UI (React, TypeScript and Vite), built by `make web` into `web/dist` and embedded in `kn-server` with `rust-embed`. |
@@ -831,6 +916,11 @@ for macOS.
 | D25 | The server's own backup holds bundle deletion off from just before its database copy until the bundles it names are hard-linked, then sweeps what was held back. | The backup can't name a bundle it lacks, and deletes never wait: they're only deferred, for milliseconds. Locking deletion for the whole backup would hold it up for the upload's length; linking without the hold would still race a delete in the moment between the copy and the link. |
 | D26 | The web UI's users log in with a password, and a session cookie stands for an admin on the CLI's own API, but only on requests from the server's own pages (`Sec-Fetch-Site` and `Origin`), and only JSON for changes. | The UI needs no API of its own, and a browser never holds a token a script could read. `SameSite` alone isn't enough, since apps on sibling domains count as the same site, and a preview runs whoever's pull request it is. Tokens pasted into the UI would sit in the page's storage, readable by any script that got in; a separate UI API would double what has to be kept right. |
 | D27 | Nodes measure their subvolumes' space from their files' extents (`FIEMAP`), now and then, counting extents shared within each group of subvolumes that can share data once. | No quota groups, which slow btrfs down, must be enabled per filesystem, and have had their own bugs; the extents say both what a subvolume holds and what it shares, as `btrfs filesystem du` shows. Grouping by what can share (an app, its previews, its shared volumes and their snapshots) gives each nest's disk use without listing every extent to the server. Measuring on each request would read every file's metadata far too often. |
+| D28 | Releases are installed side by side, the current one is a link swapped by one rename, and a node upgrades by executing the new release in its own place. | Old releases stay for a rollback, and the link is always one whole release or the other. Executing in place needs nothing from systemd (it works in the dev cluster too) and keeps the process, so the unit never sees a stop; apps keep running either way, since the agent adopts them. Replacing the binary file itself would leave nothing to go back to; exiting for systemd to restart the unit would tie upgrades to `Restart=` and its rate limits. |
+| D29 | Units are the same on every host and run `kiwi-nest ROLE $KIWI_NEST_ARGS`; a host's flags are in a drop-in that upgrades never touch. | Upgrades can then write the units from the new release without losing anything a host set, and a person can see and change a host's flags in one file. Environment variables for each flag would need every flag to have one; a configuration file of kiwi-nest's own would be a second way to say what the flags say. |
+| D30 | The server rolls its release out one node at a time, waits for each to come back running it, and halts at the first failure. | A release that breaks on a node breaks one node, not the cluster, and each node's gateway restart is on its own. Upgrading every node at once would be faster but would take every app's gateway down together and spread a bad release everywhere; an admin pushing to each node would need SSH to every node. |
+| D31 | The CLI sends its version in its `User-Agent`, and the server refuses an older one with `426`; `/version` answers anyone. | An older CLI might misread answers or send what the server now reads differently; refusing it with which version to install is clearer than a confusing failure. Nothing new needs adding to old CLIs, which already sent `kiwi-nest/VERSION`, and `/version` lets the Action install the server's own version. |
+| D32 | A preview's domain, idle timeout and backups are set at deploy time by the CLI rewriting the bundle's `x-kiwi-nest` (`deploy --domain`), not by the server. | One bundle serves production and every preview, the server and nodes check an ordinary bundle, and nothing new crosses the agent link. Overrides kept by the server would have to reach the node's generated Compose file and be recorded with every generation; templating the bundle would bring back the interpolation D12 refuses. |
 
 ## Build plan
 
@@ -971,6 +1061,15 @@ flowchart LR
    *Verify:* set up the first cluster, a server and two nodes on fresh Proxmox VMs on the LAN, from scratch; upgrade
    it while apps are serving, and they stay up apart from each gateway's restart; the Action creates and removes a
    preview in production's nest.
+   *Done:* see [Install and upgrades](#install-and-upgrades) and [install.md](install.md). `kn-install`'s unit
+   tests (the layout's installs, swaps and pruning, `SHA256SUMS`, fetching and refusing damaged files, the units and
+   drop-ins, the checks, unpacking Caddy); the rollout through the server with nodes played by the test
+   (`crates/kn-server/src/tests.rs`: one node at a time, halting on a refusal and on a node that doesn't come back,
+   carrying on, the nodes that can't be upgraded) and older CLIs refused; a node upgrading itself against a real
+   server (`crates/kn-node/src/agent/tests.rs`: a damaged release refused, a deploy in flight finished first, the
+   restart into the release and the app adopted after it); the preview overrides (`kn-bundle`'s `overrides`); and
+   the Action's script against a fake release (`scripts/test-action.sh`, in CI). CI also builds and tests the CLI on
+   macOS, and `make check` lints the CLI-only build.
 10. **Web UI.** React and Vite, embedded, with password login. Nodes (capacity, labels, online, version), nests, apps
     by node and their state, volumes and snapshots with their space, backups. Actions: suspend, resume, logs, back
     up now, cordon.
