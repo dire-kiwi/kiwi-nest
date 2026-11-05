@@ -707,9 +707,20 @@ impl App<'_> {
                 ));
             }
         }
-        // The first deploy is the one that makes the app's volume directory.
+        // The first deploy is the one that makes the app's volume directory. An app with recorded volumes has had
+        // its first deploy, even if the directory has gone (removed, or the filesystem not mounted): then its volumes
+        // are refused as missing, never made again empty or from `--from`. Only this app's task changes its record,
+        // so it can be read before the reservation.
+        let recorded = self
+            .inner
+            .state
+            .lock()
+            .await
+            .apps
+            .get(self.name)
+            .is_some_and(|p| !p.volume_ids.is_empty());
         let dir = self.inner.volumes.app_dir(self.name);
-        let first = !blocking(move || Volumes::exists(&dir)).await??;
+        let first = !recorded && !blocking(move || Volumes::exists(&dir)).await??;
         // Reserve the generation and port, and record the deploy before touching anything.
         let (record, previous) = {
             let mut state = self.inner.state.lock().await;
@@ -991,6 +1002,17 @@ impl App<'_> {
             }
             made?
         } else {
+            let dir = vols.app_dir(&app);
+            if !blocking(move || Volumes::exists(&dir)).await?? {
+                return Err(refuse_start(
+                    &app,
+                    &[format!(
+                        "its volumes directory `{}` is missing, though it had volumes; put it back, or delete the app \
+                         to start again without its data",
+                        vols.app_dir(&app).display()
+                    )],
+                ));
+            }
             let volumes = r.volumes.clone();
             let recorded = r.volume_ids.clone();
             let (ids, created, kept) = blocking(move || -> Result<_> {

@@ -213,8 +213,10 @@ VOLUMES/                         one btrfs filesystem per node
   - The whole set is made in a staging directory and moved into place together, so a failure part way (one volume
     snapshotted, the next not) leaves nothing, and the next try starts again.
   - The preview's snapshots share disk space with production's data until either side writes.
-  - Only the first deploy snapshots: the one that makes `VOLUMES/apps/blog-pr12`. Later deploys keep the preview's data
-    and say that `--from` was ignored, so CI can pass it on every push.
+  - Only the first deploy snapshots: the one that makes `VOLUMES/apps/blog-pr12`, for an app with no recorded volumes.
+    Later deploys keep the preview's data and say that `--from` was ignored, so CI can pass it on every push. If an
+    app with recorded volumes finds its directory gone (removed, or the filesystem not mounted), the deploy is refused
+    and the running generation stays; nothing is made again, empty or from `--from`. Deleting the app starts over.
 - **Shared volumes**: `kiwi-nest volume create corpus`, then fill it, for example with
   `kiwi-nest volume load corpus ./dir`, or from an app that mounts it read-write. An app mounts a shared volume
   `ro` (read-only), `rw` (read-write; every app mounting it sees the writes) or `snapshot` (its own writable copy,

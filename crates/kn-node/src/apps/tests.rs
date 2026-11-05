@@ -687,3 +687,35 @@ async fn from_an_app_in_its_own_first_deploy_is_refused() {
         .to_string();
     assert!(!e.contains("first time") && e.contains("`prod`'s volume `data`"), "{e}");
 }
+
+#[tokio::test]
+async fn a_missing_volumes_directory_is_refused_not_made_again() {
+    let env = Env::new().await;
+    env.deploy("source", &["data"], None).await.unwrap();
+    env.deploy("prod", &["data"], None).await.unwrap();
+    std::fs::write(env.volume("prod", "data").join("f"), "x").unwrap();
+    let id = env.record("prod").await.volume_ids["data"];
+    // The whole directory goes, as if removed or its filesystem weren't mounted.
+    env.vols().remove(&env.vols().app_dir("prod")).unwrap();
+    env.calls();
+    for from in [None, Some("source")] {
+        let e = env.deploy("prod", &["data"], from).await.unwrap_err().to_string();
+        assert!(
+            e.contains("refusing to start `prod`") && e.contains("volumes directory") && e.contains("is missing"),
+            "{e}"
+        );
+        assert!(!env.vols().app_dir("prod").exists(), "nothing is made in its place");
+        let calls = env.calls();
+        assert!(
+            !calls.iter().any(|c| c.contains("down") || c.contains("up")),
+            "{calls:?}"
+        );
+        let info = env.apps.inspect("prod").await.unwrap();
+        assert_eq!((info.generation, info.status), (1, AppStatus::Running));
+        assert_eq!(env.record("prod").await.volume_ids["data"], id);
+    }
+    assert!(env.fake.snapshots.lock().unwrap().is_empty());
+    // Deleting the app is the way to start again.
+    env.apps.delete("prod", false).await.unwrap();
+    env.deploy("prod", &["data"], None).await.unwrap();
+}
