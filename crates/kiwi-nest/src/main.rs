@@ -22,17 +22,57 @@ struct Cli {
 enum Cmd {
     /// Print the version and the git commit it was built from.
     Version,
-    /// Run a node.
+    /// Run the server: the cluster's inventory, its API, and the link its nodes poll.
+    Server(ServerArgs),
+    /// Run a node, joined to a server (--server) or standalone; or `node list` the cluster's nodes.
     Node(Box<NodeArgs>),
     #[command(flatten)]
     Client(kn_cli::Command),
 }
 
 #[derive(clap::Args)]
+struct ServerArgs {
+    /// The address to listen on, for the CLI and the nodes.
+    #[arg(long, default_value = "127.0.0.1:7400")]
+    listen: SocketAddr,
+    /// Where the server keeps its database and bundles.
+    #[arg(long, env = "KIWI_NEST_SERVER_STATE_DIR", default_value = "/var/lib/kiwi-nest-server")]
+    state_dir: PathBuf,
+    /// The longest a node's poll is held open, such as 25s.
+    #[arg(long, default_value = "25s")]
+    poll_timeout: String,
+    /// A node that hasn't polled for this long is offline.
+    #[arg(long, default_value = "15s")]
+    offline_after: String,
+}
+
+#[derive(clap::Subcommand)]
+enum NodeCmd {
+    /// List the cluster's nodes: online or not, what they reported, and what's placed on them.
+    List {
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(clap::Args)]
+#[command(args_conflicts_with_subcommands = true)]
 struct NodeArgs {
+    #[command(subcommand)]
+    cmd: Option<NodeCmd>,
     /// Run on its own, with a local API on loopback (rather than joined to a server).
     #[arg(long)]
     standalone: bool,
+    /// The one-time token that lets this node join the server (--server), the first time it starts.
+    #[arg(long, env = "KIWI_NEST_JOIN_TOKEN", hide_env_values = true)]
+    join_token: Option<String>,
+    /// The node's name in the cluster [default: the host name].
+    #[arg(long)]
+    name: Option<String>,
+    /// A label for placement, as KEY=VALUE (repeatable).
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    labels: Vec<String>,
     /// The address of the standalone API; it must be loopback.
     #[arg(long, default_value = "127.0.0.1:7380")]
     listen: SocketAddr,
@@ -90,10 +130,44 @@ fn absolute(p: PathBuf) -> anyhow::Result<PathBuf> {
     Ok(std::path::absolute(&p)?)
 }
 
-async fn node(args: NodeArgs) -> anyhow::Result<()> {
-    if !args.standalone {
-        bail!("joining a server isn't supported yet: run `kiwi-nest node --standalone`");
+/// The machine's name, as a node name: lowercase letters, digits and `-`.
+fn host_name() -> String {
+    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    let name: String = raw
+        .trim()
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let name = name.trim_matches('-').to_string();
+    if name.is_empty() { "node".into() } else { name }
+}
+
+async fn server(args: ServerArgs) -> anyhow::Result<()> {
+    let mut cfg = kn_server::ServerConfig::new(absolute(args.state_dir)?);
+    cfg.poll_timeout = duration("--poll-timeout", &args.poll_timeout)?;
+    cfg.offline_after = duration("--offline-after", &args.offline_after)?;
+    if cfg.poll_timeout.is_zero() || cfg.poll_timeout.as_secs() > kn_proto::agent::MAX_POLL_SECS {
+        bail!("--poll-timeout must be between 1s and {}s", kn_proto::agent::MAX_POLL_SECS);
     }
+    kn_server::run(cfg, args.listen).await
+}
+
+async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result<()> {
+    if let Some(NodeCmd::List { json }) = args.cmd {
+        return kn_cli::node_list(global, json).await;
+    }
+    let server = match (&global.server, args.standalone) {
+        (Some(_), true) => bail!("a node is either --standalone or joined to a --server, not both"),
+        (None, false) => bail!(
+            "run `kiwi-nest node --server URL --join-token TOKEN` to join a server, or `kiwi-nest node \
+             --standalone`"
+        ),
+        (s, _) => s.clone(),
+    };
     let state_dir = absolute(args.state_dir)?;
     let mut cfg = kn_node::NodeConfig::new(state_dir);
     if let Some(v) = args.volumes_dir {
@@ -110,12 +184,21 @@ async fn node(args: NodeArgs) -> anyhow::Result<()> {
     cfg.up_timeout = duration("--up-timeout", &args.up_timeout)?;
     cfg.start_timeout = duration("--start-timeout", &args.start_timeout)?;
     cfg.start_cooldown = duration("--start-cooldown", &args.start_cooldown)?;
-    kn_node::run_standalone(cfg, args.listen, args.gateway_listen).await
+    let Some(server) = server else {
+        return kn_node::run_standalone(cfg, args.listen, args.gateway_listen).await;
+    };
+    let mut agent = kn_node::agent::AgentConfig::new(server, args.name.unwrap_or_else(host_name));
+    agent.join_token = args.join_token;
+    for l in &args.labels {
+        let (k, v) = l.split_once('=').with_context(|| format!("a label is KEY=VALUE, not {l}"))?;
+        agent.labels.insert(k.trim().to_string(), v.trim().to_string());
+    }
+    kn_node::run_agent(cfg, agent, args.gateway_listen).await
 }
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
-    let default_level = if matches!(cli.command, Cmd::Node(_)) {
+    let default_level = if matches!(&cli.command, Cmd::Node(n) if n.cmd.is_none()) || matches!(cli.command, Cmd::Server(_)) {
         "info"
     } else {
         "warn"
@@ -138,7 +221,8 @@ fn main() -> std::process::ExitCode {
                 println!("kiwi-nest {}", kn_proto::LONG_VERSION);
                 Ok(())
             }
-            Cmd::Node(args) => node(*args).await,
+            Cmd::Server(args) => server(args).await,
+            Cmd::Node(args) => node(&cli.global, *args).await,
             Cmd::Client(cmd) => kn_cli::run(&cli.global, cmd).await,
         }
     });

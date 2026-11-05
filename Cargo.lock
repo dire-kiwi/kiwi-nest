@@ -828,6 +828,7 @@ dependencies = [
  "kn-cli",
  "kn-node",
  "kn-proto",
+ "kn-server",
  "serde_json",
  "tempfile",
  "tokio",
@@ -868,7 +869,10 @@ dependencies = [
  "kn-bundle",
  "kn-proto",
  "reqwest",
+ "rustls",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
