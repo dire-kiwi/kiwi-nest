@@ -230,14 +230,14 @@ fn host_name() -> String {
     if name.is_empty() { "node".into() } else { name }
 }
 
+/// Reads a targets file, with the files its targets name (S3 secret keys, SSH keys and known hosts) read in, so the
+/// nodes the server hands them to needn't have those files.
 fn read_targets(path: &std::path::Path) -> anyhow::Result<Vec<kn_proto::backup::TargetConfig>> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let file: kn_proto::backup::TargetsFile =
-        serde_yaml_ng::from_str(&text).with_context(|| format!("reading the backup targets in {}", path.display()))?;
+    let targets = kn_backup::target::read(path)?;
     // Checked now, so a mistake stops the start rather than the first backup.
-    kn_backup::target::open_all(file.targets.clone())
+    kn_backup::target::open_all(targets.clone())
         .with_context(|| format!("the backup targets in {}", path.display()))?;
-    Ok(file.targets)
+    Ok(targets)
 }
 
 async fn server(args: ServerArgs) -> anyhow::Result<()> {

@@ -897,6 +897,46 @@ async fn a_failed_backup_leaves_nothing() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("no backup target `nope`"), "{e}");
+    // A target the node can't use (here, one whose key file only the server had) fails on its own.
+    struct Mixed(Arc<Targets>);
+    impl TargetSource for Mixed {
+        fn targets(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<Arc<Targets>>> {
+            Box::pin(async move { Ok(self.0.clone()) })
+        }
+    }
+    let mut broken = kn_proto::backup::TargetConfig {
+        name: "r2".into(),
+        ..dir_target(&good, "x", Format::Tar, 5).config().clone()
+    };
+    broken.dir = None;
+    broken.s3 = Some(kn_proto::backup::S3Config {
+        endpoint: "https://r2.example.com".into(),
+        bucket: "b".into(),
+        region: "auto".into(),
+        access_key: "a".into(),
+        secret_key: None,
+        secret_key_file: Some("/only/on/the/server".into()),
+        virtual_host: false,
+    });
+    let good_cfg = dir_target(&good, "good", Format::Tar, 5).config().clone();
+    env.apps
+        .set_targets(Arc::new(Mixed(Arc::new(Targets::open(vec![broken, good_cfg])))));
+    let r = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap();
+    assert_eq!(r.made.len(), 1, "{r:?}");
+    assert_eq!(r.failed.len(), 1);
+    assert!(
+        r.failed[0].target == "r2" && r.failed[0].error.contains("/only/on/the/server"),
+        "{r:?}"
+    );
+    let r = env.apps.backup(Kind::App, "blog", &["r2".into()], false).await.unwrap();
+    assert!(r.made.is_empty() && r.failed.len() == 1, "{r:?}");
+    let e = env
+        .apps
+        .resolve_restore(Kind::App, "apps/blog/20261106T030000Z.tar.zst", Some("r2"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("backup target `r2` can't be used"), "{e}");
     // Without targets at all.
     env.use_targets(vec![]);
     let e = env.apps.backup(Kind::App, "blog", &[], false).await.unwrap_err();

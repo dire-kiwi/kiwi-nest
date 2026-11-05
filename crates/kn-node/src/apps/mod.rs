@@ -51,7 +51,7 @@ use crate::gateway::gate::{Gate, Phase};
 use crate::runtime::{Docker, LogsOptions, Project, Runtime, RuntimeError};
 use crate::volumes::{Backend, Btrfs, VolumeError, Volumes};
 
-pub use backup::{StaticTargets, TargetSource};
+pub use backup::{StaticTargets, TargetSource, Targets};
 pub use shared::LoadSource;
 
 /// Version 2 added subvolume IDs and shared volumes.

@@ -23,12 +23,58 @@ use super::*;
 
 /// Where a node gets its backup targets: a file of its own (standalone), or the server.
 pub trait TargetSource: Send + Sync {
-    fn targets(&self) -> BoxFuture<'_, anyhow::Result<Arc<Vec<Target>>>>;
+    fn targets(&self) -> BoxFuture<'_, anyhow::Result<Arc<Targets>>>;
+}
+
+/// The targets a node can use, and those it couldn't open, with why: one that's broken (a bad configuration, or
+/// one the node can't reach the way it's configured) fails on its own, without keeping the others from working.
+#[derive(Default)]
+pub struct Targets {
+    pub targets: Vec<Target>,
+    pub broken: Vec<TargetError>,
+}
+
+impl std::ops::Deref for Targets {
+    type Target = Vec<Target>;
+
+    fn deref(&self) -> &Vec<Target> {
+        &self.targets
+    }
+}
+
+impl Targets {
+    /// Opens each of `cfgs` on its own.
+    pub fn open(cfgs: Vec<kn_proto::backup::TargetConfig>) -> Targets {
+        let (targets, broken) = kn_backup::target::open_each(cfgs);
+        for (target, error) in &broken {
+            tracing::warn!(target, error, "a backup target can't be used");
+        }
+        Targets {
+            targets,
+            broken: broken
+                .into_iter()
+                .map(|(target, error)| TargetError { target, error })
+                .collect(),
+        }
+    }
+
+    /// Why the target named `name` can't be used, if it's one of the broken ones.
+    fn why_broken(&self, name: &str) -> Option<&str> {
+        self.broken.iter().find(|b| b.target == name).map(|b| b.error.as_str())
+    }
+
+    /// The error for a target named `name` that isn't there to use.
+    fn missing(&self, name: &str) -> AppsError {
+        match self.why_broken(name) {
+            Some(why) => AppsError::Unsupported(format!("backup target `{name}` can't be used: {why}")),
+            None => AppsError::NotFoundOther(format!("there's no backup target `{name}`")),
+        }
+    }
 }
 
 /// Targets known up front.
 pub struct StaticTargets {
-    targets: Arc<Vec<Target>>,
+    targets: Arc<Targets>,
     /// Where they'd be configured, for the error when there are none.
     hint: &'static str,
 }
@@ -36,14 +82,17 @@ pub struct StaticTargets {
 impl StaticTargets {
     pub fn new(targets: Vec<Target>, hint: &'static str) -> StaticTargets {
         StaticTargets {
-            targets: Arc::new(targets),
+            targets: Arc::new(Targets {
+                targets,
+                broken: Vec::new(),
+            }),
             hint,
         }
     }
 }
 
 impl TargetSource for StaticTargets {
-    fn targets(&self) -> BoxFuture<'_, anyhow::Result<Arc<Vec<Target>>>> {
+    fn targets(&self) -> BoxFuture<'_, anyhow::Result<Arc<Targets>>> {
         Box::pin(async move {
             if self.targets.is_empty() {
                 anyhow::bail!("no backup targets are configured ({})", self.hint);
@@ -82,7 +131,7 @@ impl Apps {
         *self.inner.targets.write().expect("targets") = targets;
     }
 
-    async fn targets(&self) -> Result<Arc<Vec<Target>>> {
+    async fn targets(&self) -> Result<Arc<Targets>> {
         let source = self.inner.targets.read().expect("targets").clone();
         source
             .targets()
@@ -113,15 +162,20 @@ impl Apps {
         }
         let all = self.targets().await?;
         let mut chosen: Vec<&Target> = Vec::new();
+        // Targets that can't be used fail on their own, as if their upload had.
+        let mut unusable: Vec<TargetError> = Vec::new();
         for t in only {
-            chosen.push(
-                all.iter()
-                    .find(|x| x.name() == t)
-                    .ok_or_else(|| AppsError::NotFoundOther(format!("there's no backup target `{t}`")))?,
-            );
+            match all.iter().find(|x| x.name() == t) {
+                Some(x) => chosen.push(x),
+                None if all.why_broken(t).is_some() => {
+                    unusable.extend(all.broken.iter().filter(|b| &b.target == t).cloned())
+                }
+                None => return Err(all.missing(t)),
+            }
         }
         if only.is_empty() {
             chosen = all.iter().collect();
+            unusable = all.broken.clone();
         }
         if chosen.iter().any(|t| t.format() == Format::Send) && !kn_btrfs::can_send() {
             return Err(AppsError::Unsupported(
@@ -147,7 +201,10 @@ impl Apps {
         };
         let lock = self.backup_lock(kind, name);
         let _held = lock.lock().await;
-        let mut result = BackupResult::default();
+        let mut result = BackupResult {
+            failed: unusable,
+            ..BackupResult::default()
+        };
 
         // What each target has, and what the node keeps.
         let mut listings: Vec<(&Target, Vec<Listed>)> = Vec::new();
@@ -355,9 +412,18 @@ impl Apps {
     pub async fn resolve_restore(&self, kind: Kind, key: &str, target: Option<&str>) -> Result<Restore> {
         let k = kn_backup::parse_restore_key(key, kind).map_err(|e| AppsError::Unsupported(format!("{e:#}")))?;
         let all = self.targets().await?;
-        let t = kn_backup::find(&all, target, &k)
-            .await
-            .map_err(|e| AppsError::NotFoundOther(format!("{e:#}")))?;
+        if let Some(t) = target
+            && all.why_broken(t).is_some()
+        {
+            return Err(all.missing(t));
+        }
+        let t = kn_backup::find(&all, target, &k).await.map_err(|e| {
+            let mut msg = format!("{e:#}");
+            for b in &all.broken {
+                msg.push_str(&format!("; target `{}` can't be used: {}", b.target, b.error));
+            }
+            AppsError::NotFoundOther(msg)
+        })?;
         Ok(Restore {
             target: t.name().to_string(),
             key: k.to_string(),
@@ -367,6 +433,11 @@ impl Apps {
     /// The backups in every target (or the one named), of everything or what the query names.
     pub async fn backup_list(&self, q: &ListQuery) -> Result<Vec<BackupInfo>> {
         let all = self.targets().await?;
+        if let Some(t) = &q.target
+            && all.why_broken(t).is_some()
+        {
+            return Err(all.missing(t));
+        }
         list_backups(&all, q).await.map_err(internal)
     }
 
@@ -384,7 +455,7 @@ impl Apps {
         let target = all
             .iter()
             .find(|t| t.name() == restore.target)
-            .ok_or_else(|| AppsError::NotFoundOther(format!("there's no backup target `{}`", restore.target)))?;
+            .ok_or_else(|| all.missing(&restore.target))?;
         let dest = staging.join(".restore");
         let vols = self.inner.volumes.clone();
         let d = dest.clone();

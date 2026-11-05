@@ -289,12 +289,68 @@ impl Target {
     }
 }
 
-/// Reads a targets file (YAML or JSON) and checks every target in it.
+/// Reads a targets file (YAML or JSON), with the files it names read in ([`inline_files`]), and checks every
+/// target in it.
 pub fn load(path: &Path) -> anyhow::Result<Vec<Target>> {
+    open_all(read(path)?).with_context(|| format!("the backup targets in {}", path.display()))
+}
+
+/// Reads a targets file, with the files it names read in ([`inline_files`]), without opening the targets.
+pub fn read(path: &Path) -> anyhow::Result<Vec<TargetConfig>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file: TargetsFile =
         serde_yaml_ng::from_str(&text).with_context(|| format!("reading the backup targets in {}", path.display()))?;
-    open_all(file.targets).with_context(|| format!("the backup targets in {}", path.display()))
+    file.targets
+        .into_iter()
+        .map(inline_files)
+        .collect::<anyhow::Result<_>>()
+        .with_context(|| format!("the backup targets in {}", path.display()))
+}
+
+/// Replaces the files a target names with what they hold: an S3 `secret_key_file` with `secret_key`, an SSH
+/// `identity` and `known_hosts` with their contents. The server does this when it reads its targets, so the nodes
+/// it hands them to needn't have the files.
+pub fn inline_files(mut cfg: TargetConfig) -> anyhow::Result<TargetConfig> {
+    let name = cfg.name.clone();
+    let read = |what: &str, path: &str| {
+        std::fs::read_to_string(path).with_context(|| format!("target `{name}`: reading its {what} from {path}"))
+    };
+    if let Some(s3) = &mut cfg.s3
+        && let Some(f) = s3.secret_key_file.take()
+    {
+        if s3.secret_key.is_some() {
+            bail!("target `{name}` has both `secret_key` and `secret_key_file`");
+        }
+        s3.secret_key = Some(read("S3 secret key", &f)?.trim().to_string());
+    }
+    if let Some(ssh) = &mut cfg.ssh {
+        if let Some(f) = ssh.identity.take() {
+            ssh.identity_data = Some(read("SSH key", &f)?);
+        }
+        if let Some(f) = ssh.known_hosts.take() {
+            ssh.known_hosts_data = Some(read("known hosts", &f)?);
+        }
+    }
+    Ok(cfg)
+}
+
+/// Opens each target on its own, so one that can't be opened doesn't keep the others from working: returns those
+/// that opened, and (by name) why each other one didn't.
+pub fn open_each(cfgs: Vec<TargetConfig>) -> (Vec<Target>, Vec<(String, String)>) {
+    let mut seen = BTreeSet::new();
+    let (mut ok, mut broken) = (Vec::new(), Vec::new());
+    for c in cfgs {
+        let name = c.name.clone();
+        if !seen.insert(name.clone()) {
+            broken.push((name.clone(), format!("there are two backup targets named `{name}`")));
+            continue;
+        }
+        match Target::open(c) {
+            Ok(t) => ok.push(t),
+            Err(e) => broken.push((name, format!("{e:#}"))),
+        }
+    }
+    (ok, broken)
 }
 
 /// Opens targets, refusing two of one name.
@@ -507,6 +563,79 @@ pub(crate) mod tests {
         assert_eq!(gone.len(), 2);
         assert_eq!(t.list(Some((Kind::App, "blog"))).await.unwrap().len(), 2);
         assert_eq!(t.list(Some((Kind::Volume, "corpus"))).await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_files_a_target_names_are_read_in_and_bad_targets_dont_stop_the_rest() {
+        use kn_proto::backup::{S3Config, SshConfig};
+        let d = tempfile::tempdir().unwrap();
+        let file = |n: &str, c: &str| {
+            let p = d.path().join(n);
+            std::fs::write(&p, c).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let base = TargetConfig {
+            name: "r2".into(),
+            s3: None,
+            ssh: None,
+            dir: None,
+            prefix: String::new(),
+            format: Format::Send,
+            every: None,
+            full_every: None,
+            keep: Keep::default(),
+        };
+        let s3 = TargetConfig {
+            s3: Some(S3Config {
+                endpoint: "https://s3.example.com".into(),
+                bucket: "b".into(),
+                region: "auto".into(),
+                access_key: "a".into(),
+                secret_key: None,
+                secret_key_file: Some(file("secret", "s3cret\n")),
+                virtual_host: false,
+            }),
+            ..base.clone()
+        };
+        let got = inline_files(s3.clone()).unwrap().s3.unwrap();
+        assert_eq!((got.secret_key.as_deref(), got.secret_key_file), (Some("s3cret"), None));
+        let ssh = TargetConfig {
+            name: "nas".into(),
+            ssh: Some(SshConfig {
+                host: "nas".into(),
+                port: None,
+                path: "/srv".into(),
+                identity: Some(file("key", "KEY")),
+                known_hosts: Some(file("kh", "nas ssh-ed25519 X")),
+                identity_data: None,
+                known_hosts_data: None,
+            }),
+            ..base.clone()
+        };
+        let got = inline_files(ssh).unwrap().ssh.unwrap();
+        assert_eq!(got.identity_data.as_deref(), Some("KEY"));
+        assert_eq!(got.known_hosts_data.as_deref(), Some("nas ssh-ed25519 X"));
+        assert!(got.identity.is_none() && got.known_hosts.is_none());
+        // A file that isn't there is an error naming the target.
+        let mut missing = s3.clone();
+        missing.s3.as_mut().unwrap().secret_key_file = Some("/nonexistent/secret".into());
+        let e = inline_files(missing.clone()).unwrap_err().to_string();
+        assert!(e.contains("target `r2`"), "{e}");
+
+        // One target that can't be opened (as a node would see a file only the server has) leaves the others.
+        let dir = TargetConfig {
+            name: "local".into(),
+            dir: Some(kn_proto::backup::DirConfig { path: "/srv/b".into() }),
+            ..base.clone()
+        };
+        let (ok, broken) = open_each(vec![missing, dir.clone(), dir]);
+        assert_eq!(ok.iter().map(Target::name).collect::<Vec<_>>(), ["local"]);
+        assert_eq!(broken.len(), 2);
+        assert!(
+            broken[0].0 == "r2" && broken[0].1.contains("/nonexistent"),
+            "{broken:?}"
+        );
+        assert!(broken[1].1.contains("two backup targets"), "{broken:?}");
     }
 
     #[test]

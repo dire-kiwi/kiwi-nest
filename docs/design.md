@@ -484,7 +484,11 @@ VOLUMES/                         one btrfs filesystem per node
   directory on the machine (such as a mounted share). There can be several, for example daily `send` to R2 and a
   weekly `tar` copy to a NAS. They're configured in one file given to the server (`--backup-targets`), and nodes get
   them, credentials included, from the server (`GET /agent/backup-targets`) for each backup and restore; a
-  standalone node takes `--backup-targets` itself.
+  standalone node takes `--backup-targets` itself. The files a target names (an S3 `secret_key_file`, an SSH
+  `identity` and `known_hosts`) are read on the server when it starts, and nodes get what they hold, so the files
+  need be only on the server; a node writes an SSH key it's given to a private temporary file for `ssh`. A node
+  opens each target on its own: one it can't use fails on its own (in `backup`'s answer, and in the schedule's
+  retries), and the others still work.
 
   ```yaml
   targets:

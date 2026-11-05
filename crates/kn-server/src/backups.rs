@@ -40,7 +40,7 @@ pub const DATABASE: &str = "server.sqlite";
 
 /// The targets, and what the schedule keeps in memory.
 pub struct Backups {
-    /// As configured: what nodes are given.
+    /// As configured, with the files they name read in: what nodes are given.
     pub configs: Vec<TargetConfig>,
     pub targets: Vec<Target>,
     /// Held while the server backs itself up, so two never overlap.
@@ -55,7 +55,13 @@ pub struct Backups {
 }
 
 impl Backups {
+    /// Opens the targets, with the files they name read in first: nodes get the configurations with what those
+    /// files hold, so the files need be only on the server.
     pub fn new(configs: Vec<TargetConfig>) -> anyhow::Result<Backups> {
+        let configs: Vec<TargetConfig> = configs
+            .into_iter()
+            .map(kn_backup::target::inline_files)
+            .collect::<anyhow::Result<_>>()?;
         let targets = kn_backup::target::open_all(configs.clone())?;
         Ok(Backups {
             configs,

@@ -385,21 +385,20 @@ impl Root {
         self.wrap(&at, "setting the times of", r)
     }
 
-    fn xattr_path(&self, path: &[u8]) -> io::Result<(Option<At>, CString)> {
-        if path.is_empty() {
-            return Ok((None, cstr(format!("/proc/self/fd/{}", self.fd.as_raw_fd()).as_bytes())?));
-        }
-        let at = self.at(path)?;
-        let p = at.proc_path()?;
-        Ok((Some(at), p))
-    }
-
     pub fn set_xattr(&self, path: &[u8], name: &[u8], value: &[u8]) -> io::Result<()> {
-        let (_at, p) = self.xattr_path(path)?;
         let n = cstr(name)?;
-        // SAFETY: valid C strings and a buffer of `value.len()` bytes. `lsetxattr` doesn't follow the last
-        // component, and the `/proc` link before it is the directory already opened safely.
-        let r = check(unsafe { libc::lsetxattr(p.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0) });
+        let r = if path.is_empty() {
+            // The root itself, through its descriptor: `/proc/self/fd/N` with `lsetxattr` would act on the magic
+            // link, not the directory.
+            // SAFETY: a valid descriptor, C string and buffer of `value.len()` bytes.
+            check(unsafe { libc::fsetxattr(self.fd.as_raw_fd(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0) })
+        } else {
+            let at = self.at(path)?;
+            let p = at.proc_path()?;
+            // SAFETY: valid C strings and a buffer of `value.len()` bytes. `lsetxattr` doesn't follow the last
+            // component, and the `/proc` link before it is the directory already opened safely.
+            check(unsafe { libc::lsetxattr(p.as_ptr(), n.as_ptr(), value.as_ptr().cast(), value.len(), 0) })
+        };
         let privileged = name.starts_with(b"trusted.") || name.starts_with(b"security.");
         let r = if privileged {
             unless_unprivileged(self.root, r)
@@ -410,10 +409,16 @@ impl Root {
     }
 
     pub fn remove_xattr(&self, path: &[u8], name: &[u8]) -> io::Result<()> {
-        let (_at, p) = self.xattr_path(path)?;
         let n = cstr(name)?;
-        // SAFETY: valid C strings.
-        let r = check(unsafe { libc::lremovexattr(p.as_ptr(), n.as_ptr()) });
+        let r = if path.is_empty() {
+            // SAFETY: a valid descriptor and C string.
+            check(unsafe { libc::fremovexattr(self.fd.as_raw_fd(), n.as_ptr()) })
+        } else {
+            let at = self.at(path)?;
+            let p = at.proc_path()?;
+            // SAFETY: valid C strings.
+            check(unsafe { libc::lremovexattr(p.as_ptr(), n.as_ptr()) })
+        };
         unless_unprivileged(self.root, r).map_err(|e| self.err(path, "removing an extended attribute of", e))
     }
 }
@@ -528,6 +533,16 @@ mod tests {
         }
         r.mknod(b"fifo", libc::S_IFIFO | 0o600, 0).unwrap();
         r.chmod(b"", 0o750).unwrap();
+        // Attributes of the root itself, through its descriptor (not the `/proc` link).
+        match r.set_xattr(b"", b"user.root", b"r") {
+            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {}
+            other => {
+                other.unwrap();
+                r.set_xattr(b"", b"user.other", b"o").unwrap();
+                r.remove_xattr(b"", b"user.other").unwrap();
+                assert_eq!(xattrs(&tree).unwrap(), [(b"user.root".to_vec(), b"r".to_vec())]);
+            }
+        }
         r.unlink(b"d/f").unwrap();
         r.rmdir(b"d").unwrap();
     }

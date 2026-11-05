@@ -960,7 +960,7 @@ struct ServerTargets {
 }
 
 impl crate::apps::TargetSource for ServerTargets {
-    fn targets(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<Arc<Vec<kn_backup::Target>>>> {
+    fn targets(&self) -> futures_util::future::BoxFuture<'_, anyhow::Result<Arc<crate::apps::Targets>>> {
         Box::pin(async move {
             let cfgs = self
                 .link
@@ -970,7 +970,8 @@ impl crate::apps::TargetSource for ServerTargets {
             if cfgs.is_empty() {
                 anyhow::bail!("the server has no backup targets (`kiwi-nest server --backup-targets`)");
             }
-            Ok(Arc::new(kn_backup::target::open_all(cfgs)?))
+            // Each on its own: one this node can't use fails alone.
+            Ok(Arc::new(crate::apps::Targets::open(cfgs)))
         })
     }
 }

@@ -342,6 +342,10 @@ mod tests {
     /// A tree with the kinds of things a volume holds.
     pub(crate) fn sample(root: &Path) {
         std::fs::create_dir_all(root.join("sub/deep")).unwrap();
+        // An attribute on the top directory itself, where the filesystem takes them.
+        let c = std::ffi::CString::new(root.as_os_str().as_bytes()).unwrap();
+        // SAFETY: valid C strings and a one-byte buffer. (Not supported everywhere, which is fine.)
+        let _ = unsafe { libc::lsetxattr(c.as_ptr(), c"user.top".as_ptr(), b"t".as_ptr().cast(), 1, 0) };
         std::fs::write(root.join("sub/file"), "contents").unwrap();
         std::fs::set_permissions(root.join("sub/file"), std::fs::Permissions::from_mode(0o4751)).unwrap();
         std::fs::hard_link(root.join("sub/file"), root.join("hard")).unwrap();
@@ -402,6 +406,12 @@ mod tests {
         let got = extract(&mut &bytes[..], &dest, &Dirs, &|n| n == "data").unwrap();
         assert_eq!(got.keys().collect::<Vec<_>>(), ["data"]);
         assert_eq!(walk(&src), walk(&got["data"]));
+        // The volume's top directory keeps its attributes.
+        let top = crate::fsops::xattrs(&src).unwrap();
+        assert_eq!(crate::fsops::xattrs(&got["data"]).unwrap(), top);
+        if crate::receive::tests::xattrs_supported(&base) {
+            assert_eq!(top, [(b"user.top".to_vec(), b"t".to_vec())]);
+        }
         let m = std::fs::metadata(got["data"].join("hard")).unwrap();
         assert_eq!(m.nlink(), 2);
         // And with plain tar, where there is one.

@@ -97,7 +97,8 @@ pub struct S3Config {
     #[serde(default = "default_region")]
     pub region: String,
     pub access_key: String,
-    /// The secret key, or `secret_key_file` naming a file that holds it.
+    /// The secret key, or `secret_key_file` naming a file that holds it (read on the server, which hands nodes the
+    /// key itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,8 +112,9 @@ fn default_region() -> String {
     "auto".into()
 }
 
-/// A directory on another machine, reached with `ssh` (OpenSSH) as the user running kiwi-nest. Each node (and the
-/// server) needs the key and the host in its known hosts.
+/// A directory on another machine, reached with `ssh` (OpenSSH) as the user running kiwi-nest. The key and the
+/// known-hosts file are read on the server, which hands their contents to nodes, so they need be only there; without
+/// `known_hosts`, each machine checks the host against its own user's known hosts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshConfig {
@@ -128,6 +130,12 @@ pub struct SshConfig {
     /// A known-hosts file to check the host against, instead of the user's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub known_hosts: Option<String>,
+    /// The contents of `identity`, which the server sends nodes in its place (not for a targets file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_data: Option<String>,
+    /// The contents of `known_hosts`, likewise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_hosts_data: Option<String>,
 }
 
 /// A directory on the machine itself, such as a mounted NAS share. Each node writes to its own.

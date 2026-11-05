@@ -20,6 +20,29 @@ pub struct SshStore {
     /// The `ssh` program.
     program: String,
     cfg: SshConfig,
+    /// The key and known hosts, when they came as contents (from the server), written to private files here; `ssh`
+    /// is given those.
+    _files: Option<tempfile::TempDir>,
+    identity: Option<String>,
+    known_hosts: Option<String>,
+}
+
+/// Writes `contents` to `dir/name`, readable only by this user (as `ssh` insists for a key).
+fn private_file(dir: &std::path::Path, name: &str, contents: &str) -> anyhow::Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join(name);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    f.write_all(contents.as_bytes())?;
+    if !contents.ends_with('\n') {
+        f.write_all(b"\n")?;
+    }
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Quotes a string for a POSIX shell.
@@ -46,9 +69,29 @@ impl SshStore {
         if !host_ok {
             bail!("an ssh target's host must be HOST or USER@HOST, not {:?}", cfg.host);
         }
+        let (mut identity, mut known_hosts) = (cfg.identity.clone(), cfg.known_hosts.clone());
+        let files = if cfg.identity_data.is_some() || cfg.known_hosts_data.is_some() {
+            // A private directory (mode 0700), removed with the store.
+            let dir = tempfile::Builder::new()
+                .prefix("kiwi-nest-ssh-")
+                .tempdir()
+                .context("making a directory for the ssh key")?;
+            if let Some(k) = &cfg.identity_data {
+                identity = Some(private_file(dir.path(), "identity", k)?);
+            }
+            if let Some(k) = &cfg.known_hosts_data {
+                known_hosts = Some(private_file(dir.path(), "known_hosts", k)?);
+            }
+            Some(dir)
+        } else {
+            None
+        };
         Ok(SshStore {
             program: program.into(),
             cfg,
+            _files: files,
+            identity,
+            known_hosts,
         })
     }
 
@@ -58,10 +101,10 @@ impl SshStore {
         if let Some(p) = self.cfg.port {
             c.args(["-p", &p.to_string()]);
         }
-        if let Some(i) = &self.cfg.identity {
+        if let Some(i) = &self.identity {
             c.args(["-i", i, "-o", "IdentitiesOnly=yes"]);
         }
-        if let Some(k) = &self.cfg.known_hosts {
+        if let Some(k) = &self.known_hosts {
             c.args(["-o", &format!("UserKnownHostsFile={k}")]);
         }
         c.arg("--").arg(&self.cfg.host).arg(remote);
@@ -233,9 +276,42 @@ mod tests {
                 path: "/x".into(),
                 identity: None,
                 known_hosts: None,
+                identity_data: None,
+                known_hosts_data: None,
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_key_sent_as_contents_is_given_to_ssh_as_a_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let cfg = SshConfig {
+            host: "backup@nas".into(),
+            port: None,
+            path: "/srv/kn".into(),
+            identity: None,
+            known_hosts: None,
+            identity_data: Some("-----BEGIN OPENSSH PRIVATE KEY-----\nkey".into()),
+            known_hosts_data: Some("nas ssh-ed25519 AAAA\n".into()),
+        };
+        let store = SshStore::new(cfg).unwrap();
+        let (id, kh) = (store.identity.clone().unwrap(), store.known_hosts.clone().unwrap());
+        assert!(std::fs::read_to_string(&id).unwrap().ends_with("key\n"));
+        assert_eq!(std::fs::read_to_string(&kh).unwrap(), "nas ssh-ed25519 AAAA\n");
+        for f in [&id, &kh] {
+            assert_eq!(std::fs::metadata(f).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let args: Vec<String> = store
+            .command("true")
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|w| w[0] == "-i" && w[1] == id), "{args:?}");
+        assert!(args.contains(&format!("UserKnownHostsFile={kh}")), "{args:?}");
+        drop(store);
+        assert!(!std::path::Path::new(&id).exists());
     }
 
     #[test]
@@ -272,6 +348,8 @@ mod tests {
                 path: root.to_string_lossy().into_owned(),
                 identity: Some("/etc/key".into()),
                 known_hosts: None,
+                identity_data: None,
+                known_hosts_data: None,
             },
         )
         .unwrap();

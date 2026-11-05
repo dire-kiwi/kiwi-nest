@@ -1751,6 +1751,68 @@ async fn restores_are_checked_before_anything_is_saved() {
 }
 
 #[tokio::test]
+async fn nodes_get_the_contents_of_the_files_targets_name() {
+    let files = tempfile::tempdir().unwrap();
+    let key = files.path().join("backup-key");
+    std::fs::write(&key, "-----BEGIN OPENSSH PRIVATE KEY-----\nk\n").unwrap();
+    let kh = files.path().join("known_hosts");
+    std::fs::write(&kh, "nas ssh-ed25519 AAAA\n").unwrap();
+    let secret = files.path().join("r2-secret");
+    std::fs::write(&secret, "s3cret\n").unwrap();
+    let ssh = kn_proto::backup::TargetConfig {
+        name: "nas".into(),
+        dir: None,
+        ssh: Some(kn_proto::backup::SshConfig {
+            host: "backup@nas".into(),
+            port: None,
+            path: "/srv/kn".into(),
+            identity: Some(key.to_string_lossy().into_owned()),
+            known_hosts: Some(kh.to_string_lossy().into_owned()),
+            identity_data: None,
+            known_hosts_data: None,
+        }),
+        ..dir_target(files.path(), None)
+    };
+    let s3 = kn_proto::backup::TargetConfig {
+        name: "r2".into(),
+        dir: None,
+        s3: Some(kn_proto::backup::S3Config {
+            endpoint: "https://r2.example.com".into(),
+            bucket: "b".into(),
+            region: "auto".into(),
+            access_key: "a".into(),
+            secret_key: None,
+            secret_key_file: Some(secret.to_string_lossy().into_owned()),
+            virtual_host: false,
+        }),
+        ..dir_target(files.path(), None)
+    };
+    let env = Env::with_targets(vec![ssh, s3]).await;
+    let mut a = env.join("a", 8 << 30).await;
+    env.poll(&mut a).await;
+    let r = env
+        .req(reqwest::Method::GET, "/agent/backup-targets", &a.token)
+        .send()
+        .await
+        .unwrap();
+    let cfgs: Vec<kn_proto::backup::TargetConfig> = r.json().await.unwrap();
+    let ssh = cfgs[0].ssh.as_ref().unwrap();
+    assert_eq!((ssh.identity.as_deref(), ssh.known_hosts.as_deref()), (None, None));
+    assert!(ssh.identity_data.as_deref().unwrap().contains("PRIVATE KEY"));
+    assert_eq!(ssh.known_hosts_data.as_deref(), Some("nas ssh-ed25519 AAAA\n"));
+    let s3 = cfgs[1].s3.as_ref().unwrap();
+    assert_eq!(
+        (s3.secret_key.as_deref(), s3.secret_key_file.as_deref()),
+        (Some("s3cret"), None)
+    );
+    // So a node opens them without any of the files.
+    drop(files);
+    let (ok, broken) = kn_backup::target::open_each(cfgs);
+    assert!(broken.is_empty(), "{broken:?}");
+    assert_eq!(ok.len(), 2);
+}
+
+#[tokio::test]
 async fn scheduled_backups_go_to_nodes_and_skip_apps_that_opt_out() {
     let store = tempfile::tempdir().unwrap();
     let env = Env::with_targets(vec![dir_target(store.path(), Some("1h"))]).await;

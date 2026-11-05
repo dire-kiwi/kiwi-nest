@@ -976,7 +976,6 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde_json",
- "serde_yaml_ng",
  "tempfile",
  "tokio",
  "tracing",

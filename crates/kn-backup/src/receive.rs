@@ -325,11 +325,26 @@ pub(crate) mod tests {
     use super::*;
     use crate::sendstream::Writer;
 
+    /// Whether the filesystem holding `dir` takes `user.` attributes.
+    pub(crate) fn xattrs_supported(dir: &Path) -> bool {
+        let probe = dir.join(".xattr-probe");
+        std::fs::write(&probe, "").unwrap();
+        let r = crate::fsops::Root::open(dir)
+            .unwrap()
+            .set_xattr(b".xattr-probe", b"user.probe", b"1");
+        std::fs::remove_file(&probe).unwrap();
+        r.is_ok()
+    }
+
     /// Plain directories as subvolumes; a snapshot is a copy.
     pub(crate) struct Dirs;
 
     pub(crate) fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
         std::fs::create_dir(to)?;
+        let root = crate::fsops::Root::open(to)?;
+        for (n, v) in crate::fsops::xattrs(from)? {
+            root.set_xattr(b"", &n, &v)?;
+        }
         for e in std::fs::read_dir(from)? {
             let e = e?;
             let (s, d) = (e.path(), to.join(e.file_name()));
@@ -416,6 +431,14 @@ pub(crate) mod tests {
             ],
         )
         .unwrap();
+        // The subvolume's root, which the kernel names "".
+        for name in [&b"user.root"[..], b"user.gone"] {
+            w.command(
+                cmd::SET_XATTR,
+                &[(attr::PATH, b""), (attr::XATTR_NAME, name), (attr::XATTR_DATA, b"v")],
+            )
+            .unwrap();
+        }
         w.command(cmd::END, &[]).unwrap();
         w.into_inner()
     }
@@ -455,6 +478,11 @@ pub(crate) mod tests {
             ],
         )
         .unwrap();
+        w.command(
+            cmd::REMOVE_XATTR,
+            &[(attr::PATH, b""), (attr::XATTR_NAME, b"user.gone")],
+        )
+        .unwrap();
         w.command(cmd::END, &[]).unwrap();
         w.into_inner()
     }
@@ -480,6 +508,12 @@ pub(crate) mod tests {
         // the incremental step's writes don't reach it), and the symlink is gone.
         assert_eq!(std::fs::read(data.join("hard")).unwrap(), b"helloello");
         assert!(std::fs::symlink_metadata(data.join("link")).is_err());
+        if xattrs_supported(&dest) {
+            assert_eq!(
+                crate::fsops::xattrs(data).unwrap(),
+                [(b"user.root".to_vec(), b"v".to_vec())]
+            );
+        }
         let m = std::fs::metadata(data.join("dir/file")).unwrap();
         assert_eq!((m.mode() & 0o777, m.mtime()), (0o640, 3_000));
         // Only the result is left.
