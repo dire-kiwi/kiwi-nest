@@ -23,6 +23,8 @@ struct Cli {
     command: Cmd,
 }
 
+// Parsed once, so the size of its largest variant doesn't matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Print the version and the git commit it was built from.
