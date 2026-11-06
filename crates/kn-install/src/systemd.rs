@@ -146,9 +146,12 @@ pub struct DropIn {
 
 impl DropIn {
     pub fn render(&self, by: &str) -> anyhow::Result<String> {
+        // `kiwi-nest server init` or `kiwi-nest node join`: the flags are the role's.
+        let role = by.split_whitespace().nth(1).unwrap_or("server");
         let mut out = format!(
             "# Written by `{by}`. This host's own settings: upgrades leave this file alone. The flags in {ARGS_VAR}\n\
-             # are those of `kiwi-nest --help`; after a change, run `systemctl daemon-reload` and restart the unit.\n"
+             # are those of `kiwi-nest {role} --help`; after a change, run `systemctl daemon-reload` and restart the\n\
+             # unit.\n"
         );
         for (k, v) in self.unit.iter().chain(&self.service) {
             check_value(k, v)?;

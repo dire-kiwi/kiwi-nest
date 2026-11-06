@@ -484,10 +484,11 @@ pub async fn node_join(global: &kn_cli::GlobalArgs, a: JoinArgs) -> anyhow::Resu
         },
     };
     let ingress_listen = address.map(|ip| SocketAddr::new(ip, a.port));
-    if let Some(addr) = ingress_listen
-        && let Err(e) = checks::ingress_address(addr, a.allow_public_address)
-    {
-        problems.push(e.to_string());
+    if let Some(addr) = ingress_listen {
+        match checks::ingress_address(addr, a.allow_public_address) {
+            Ok(()) => notes.push(format!("the gateway listens for the ingress on {addr}")),
+            Err(e) => problems.push(e.to_string()),
+        }
     }
     let http = kn_install::http(ca.as_deref())?;
     match http.get(format!("{url}/v1/version")).send().await {
@@ -528,12 +529,6 @@ pub async fn node_join(global: &kn_cli::GlobalArgs, a: JoinArgs) -> anyhow::Resu
     let ingress_listen = ingress_listen.expect("checked");
 
     let layout = Layout::system();
-    install_self(&layout)?;
-    println!(
-        "installed kiwi-nest {} in {}",
-        kn_proto::VERSION,
-        layout.root().display()
-    );
     mkdir(&state_dir, 0o700)?;
 
     // The flags, as the unit will run the node with them.
@@ -588,6 +583,12 @@ pub async fn node_join(global: &kn_cli::GlobalArgs, a: JoinArgs) -> anyhow::Resu
     }
     let joined = kn_node::agent::join(&node_cfg, &agent).await?;
     println!("joined {url} as node {} (node {})", joined.name, joined.node_id);
+    install_self(&layout)?;
+    println!(
+        "installed kiwi-nest {} in {}",
+        kn_proto::VERSION,
+        layout.root().display()
+    );
     if let (Some(pem), Some(registry)) = (&ca, &joined.registry)
         && !registry.starts_with("localhost")
     {
