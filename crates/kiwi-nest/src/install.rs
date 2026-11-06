@@ -724,7 +724,16 @@ pub async fn upgrade(global: &kn_cli::GlobalArgs, a: crate::UpgradeArgs) -> anyh
         targets.join(", "),
         source.describe()
     );
-    let files = release::fetch(&source, &http, &version, &targets, &dist).await?;
+    let files = release::fetch(&source, &http, &version, &targets, &[own], &dist).await?;
+    for t in &targets {
+        if !files.iter().any(|f| f.target == *t) {
+            eprintln!(
+                "warning: release {version} has no {t} file, so the server can't offer it to {} nodes: they keep \
+                 their release",
+                release::linux_arch(t).unwrap_or(t)
+            );
+        }
+    }
     let mine = files
         .iter()
         .find(|f| f.target == own)

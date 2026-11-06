@@ -178,12 +178,14 @@ pub struct File {
 }
 
 /// Fetches a release's files for `targets` into `dir`, with its `SHA256SUMS`, checking each file against it. A file
-/// is written beside its place and renamed only once it matches, so `dir` never holds a file that doesn't.
+/// is written beside its place and renamed only once it matches, so `dir` never holds a file that doesn't. A target
+/// in `required` must be listed; the others are skipped if they aren't (a build of one's own, for one architecture).
 pub async fn fetch(
     source: &Source,
     http: &reqwest::Client,
     version: &str,
     targets: &[&str],
+    required: &[&str],
     dir: &Path,
 ) -> anyhow::Result<Vec<File>> {
     tokio::fs::create_dir_all(dir)
@@ -197,7 +199,10 @@ pub async fn fetch(
     for target in targets {
         let name = asset(version, target);
         let Some(want) = sums.get(&name) else {
-            bail!("release {version}'s {SUMS} doesn't list {name}");
+            if required.contains(target) {
+                bail!("release {version}'s {SUMS} doesn't list {name}");
+            }
+            continue;
         };
         let tmp = dir.join(format!(".{name}.partial"));
         source.fetch(http, version, &name, &tmp).await?;
@@ -300,7 +305,9 @@ mod tests {
         let http = crate::http(None).unwrap();
         assert_eq!(source.latest(&http).await.unwrap(), "0.2.0-rc.1");
         let out = tmp.path().join("out");
-        let files = fetch(&source, &http, "0.2.0-rc.1", &LINUX_TARGETS, &out).await.unwrap();
+        let files = fetch(&source, &http, "0.2.0-rc.1", &LINUX_TARGETS, &[], &out)
+            .await
+            .unwrap();
         assert_eq!(files.len(), 2);
         assert_eq!(std::fs::read(&files[1].path).unwrap(), b"arm");
         let (dist, problems) = read_dist(&out, "0.2.0-rc.1").unwrap();
@@ -313,17 +320,24 @@ mod tests {
         // A damaged file is refused, and never put in place.
         std::fs::write(src.join(asset("0.2.0-rc.1", "x86_64-unknown-linux-musl")), b"evil").unwrap();
         let out2 = tmp.path().join("out2");
-        let err = fetch(&source, &http, "0.2.0-rc.1", &LINUX_TARGETS, &out2)
+        let err = fetch(&source, &http, "0.2.0-rc.1", &LINUX_TARGETS, &[], &out2)
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("doesn't match its checksum"), "{err:#}");
         assert!(!out2.join(asset("0.2.0-rc.1", "x86_64-unknown-linux-musl")).exists());
-        // A file a release doesn't list is refused.
+        // A required file a release doesn't list is refused; one that isn't required is skipped.
+        let riscv = ["riscv64gc-unknown-linux-musl"];
         assert!(
-            fetch(&source, &http, "0.2.0-rc.1", &["riscv64gc-unknown-linux-musl"], &out2)
+            fetch(&source, &http, "0.2.0-rc.1", &riscv, &riscv, &out2)
                 .await
                 .is_err()
         );
+        let out3 = tmp.path().join("out3");
+        let some = fetch(&source, &http, "0.2.0-rc.1", &[riscv[0], LINUX_TARGETS[1]], &[], &out3)
+            .await
+            .unwrap();
+        assert_eq!(some.len(), 1);
+        assert_eq!(some[0].target, LINUX_TARGETS[1]);
 
         // A file changed after it was fetched is left out of what's offered.
         std::fs::write(&files[0].path, b"changed").unwrap();
