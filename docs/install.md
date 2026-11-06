@@ -188,7 +188,8 @@ sudo kiwi-nest upgrade                 # the latest release; --version 0.3.0 for
 sudo kiwi-nest upgrade --from ./dist   # or a directory of release files with their SHA256SUMS
 ```
 
-It downloads the release for every Linux target and checks each against `SHA256SUMS`, checks this machine's runs,
+It downloads the release for every Linux target (a release of your own may have only some: the server then
+can't offer the others to nodes, and says so) and checks each against `SHA256SUMS`, checks this machine's runs,
 copies the server's database (to `/var/lib/kiwi-nest-server/upgrades/`), makes the release current, rewrites the
 units (never the drop-ins) and restarts the server. The new server then **upgrades the nodes itself, one at a
 time**: each downloads its architecture's release from the server, checks its size and checksum and that it runs,
@@ -196,7 +197,7 @@ finishes what it's applying, swaps the release in and restarts into it. Apps kee
 down for the moment its agent restarts. Once a node polls again running the new release, the next one's turn comes.
 
 With an admin token in reach (a cluster added for root, or `--server` and `--token`), `upgrade` follows the
-rollout; otherwise `kiwi-nest upgrade status` from your workstation shows it. A node that refuses the release, or
+rollout; otherwise `kiwi-nest upgrade status` from your workstation shows it (`--wait` follows it). A node that refuses the release, or
 doesn't come back running it within three minutes, **halts the rollout**, so a bad release stops at one node:
 `upgrade status` says why, and `kiwi-nest upgrade nodes` carries on (trying that node again). The server keeps
 serving nodes one agent-link version behind it, so a cluster mid-rollout works as usual. Nodes from before upgrades

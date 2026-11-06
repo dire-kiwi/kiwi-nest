@@ -766,16 +766,19 @@ The how-to is [install.md](install.md). Every command here runs as root on the m
   the volumes directory, on btrfs, reached without symlinks, and (a warning) mounted from `/etc/fstab`; the private
   address (`--address`, by default the source address of the route to the server), which must be this machine's,
   private (RFC 1918, shared address space as Tailscale uses, IPv6 unique local) unless `--allow-public-address`,
-  and free to listen on; and that the server answers, at a version no older than the node's. It installs itself,
-  joins (`kn_node::agent::join`: the node's tokens go in `agent.json` and its registry credential in its Docker
-  configuration, as on a first start), copies `--ca-cert` for the node and, with a registry, for Docker
+  and free to listen on; and that the server answers, at a version no older than the node's. It joins
+  (`kn_node::agent::join`: the node's tokens go in `agent.json` and its registry credential in its Docker
+  configuration, as on a first start), so a bad token fails before anything is installed, installs itself, copies `--ca-cert` for the node and, with a registry, for Docker
   (`/etc/docker/certs.d/HOST/ca.crt`), writes the unit and its drop-in, starts it, and says how to firewall the
   gateway's port to the server's host.
 - **`kiwi-nest upgrade`** on the server's host fetches the release (GitHub's latest, `--version`, or `--from DIR`)
-  for every Linux target into its `dist/`, each file checked against `SHA256SUMS` before it's put in place, installs
-  this machine's, copies the database with SQLite's backup API (to `STATE/upgrades/`, in case the new release's
+  for every Linux target the release has into its `dist/` (this machine's must be there; a missing one only means
+  the server can't offer it to nodes of that architecture, and it says so), each file checked against `SHA256SUMS`
+  before it's put in place, installs this machine's, copies the database with SQLite's backup API (to `STATE/upgrades/`, in case the new release's
   migrations need undoing), makes it current, writes the units, restarts the server, waits for it to answer with
-  the new version, and keeps the newest three releases (`--keep`). On a node's host, it restarts the node instead.
+  the new version, and keeps the newest three releases (`--keep`). With an admin token it then follows the rollout,
+  running the new release's `upgrade status --wait`, since the upgraded server refuses the older CLI it was started
+  as. On a node's host, it restarts the node instead.
 - **The server upgrades the nodes, one at a time** (`kn-server`'s `upgrades`, D30). It offers its release for each
   architecture it has: the files in its release's `dist/`, checked against their `SHA256SUMS` when it starts, then
   its own binary for its own architecture. Whenever no node is being upgraded, the first node by name that's online,
@@ -1070,6 +1073,21 @@ flowchart LR
    restart into the release and the app adopted after it); the preview overrides (`kn-bundle`'s `overrides`); and
    the Action's script against a fake release (`scripts/test-action.sh`, in CI). CI also builds and tests the CLI on
    macOS, and `make check` lints the CLI-only build.
+   On a real machine (one Proxmox VM, Ubuntu 24.04 with a btrfs root, server and node on the same host as the user
+   asked for one VM, `--ingress internal` with LAN-only names in `/etc/hosts`, and the registry), from a `make
+   release` build: `server init`, then `node join` (a bad token refused before anything was installed, then
+   joined); an app with its image pushed to the registry served through the ingress; the Action's script run by
+   hand as a runner would, with a local release directory, deploying `blog-pr1` into `blog`'s nest from a snapshot
+   of its data with the pull request's bundle, the deploy token refused for anything but `blog-pr*`, a second push
+   keeping the preview's data, and closing deleting it (twice, the second a no-op); upgrading to a 0.1.1 build, a
+   rollback to 0.1.0 and upgrading again, while a probe fetched the app through the ingress ten times a second
+   (4573 requests, all answered; the app's container never restarted, and the node exec'd into the new release in
+   place and adopted it); an older CLI refused by the upgraded server; and a reboot, after which the units came
+   back, the node after its volumes' mount, and started the app. That run found and fixed: `node join` installing
+   before joining, `upgrade --from` requiring every architecture, and `upgrade` following the rollout as the older
+   CLI. Not run: two separate nodes, so a rollout's turn passing from one node to the next is covered by the
+   server's tests only; and the Action from GitHub itself, which needs a published release and a runner that
+   reaches the cluster.
 10. **Web UI.** React and Vite, embedded, with password login. Nodes (capacity, labels, online, version), nests, apps
     by node and their state, volumes and snapshots with their space, backups. Actions: suspend, resume, logs, back
     up now, cordon.
