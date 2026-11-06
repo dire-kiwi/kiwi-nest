@@ -213,6 +213,9 @@ pub enum UpgradeCommand {
         /// Print JSON.
         #[arg(long)]
         json: bool,
+        /// Follow the rollout until every node that can be upgraded has been, or one fails.
+        #[arg(long, conflicts_with = "json")]
+        wait: bool,
     },
     /// Carry on with the rollout after a node's upgrade failed (which halts it), trying that node again.
     Nodes {
@@ -2141,7 +2144,10 @@ pub async fn upgrade(global: &GlobalArgs, cmd: UpgradeCommand) -> anyhow::Result
     let client = Client::new(&Target::resolve(global)?)?;
     server_only(&client, "the rollout")?;
     match cmd {
-        UpgradeCommand::Status { json } => {
+        UpgradeCommand::Status { wait: true, .. } => {
+            follow_rollout(&client, Duration::from_secs(20), Duration::from_secs(3600)).await?;
+        }
+        UpgradeCommand::Status { json, .. } => {
             let st = client.upgrade_status().await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&st)?);

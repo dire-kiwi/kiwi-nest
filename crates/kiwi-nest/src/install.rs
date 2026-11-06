@@ -782,15 +782,44 @@ pub async fn upgrade(global: &kn_cli::GlobalArgs, a: crate::UpgradeArgs) -> anyh
     }
     if server && !a.no_wait {
         match kn_cli::Target::resolve(global) {
-            Ok(t @ kn_cli::Target::Server { .. }) => {
-                let client = kn_cli::Client::new(&t)?;
-                kn_cli::follow_rollout(&client, Duration::from_secs(20), Duration::from_secs(3600)).await?;
-            }
+            // The new release follows it: the server it now runs refuses this older CLI.
+            Ok(kn_cli::Target::Server { .. }) => follow_with(&bin, global)?,
             _ => println!(
                 "`kiwi-nest upgrade status`, with an admin token (a cluster added, or --server and --token), shows \
                  how it goes"
             ),
         }
+    }
+    Ok(())
+}
+
+/// Follows the rollout with `binary upgrade status --wait`, given this command's cluster settings.
+fn follow_with(binary: &Path, global: &kn_cli::GlobalArgs) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(["upgrade", "status", "--wait"]);
+    let path = |p: &Option<PathBuf>| p.as_ref().map(|p| absolute(p.clone())).transpose();
+    for (var, value) in [
+        ("KIWI_NEST_CLUSTER", global.cluster.clone()),
+        ("KIWI_NEST_SERVER", global.server.clone()),
+        ("KIWI_NEST_TOKEN", global.token.clone()),
+        (
+            "KIWI_NEST_CONFIG_DIR",
+            path(&global.config_dir)?.map(|p| p.display().to_string()),
+        ),
+        (
+            "KIWI_NEST_CA_CERT",
+            path(&global.ca_cert)?.map(|p| p.display().to_string()),
+        ),
+    ] {
+        if let Some(v) = value {
+            cmd.env(var, v);
+        }
+    }
+    let st = cmd
+        .status()
+        .with_context(|| format!("running {} upgrade status --wait", binary.display()))?;
+    if !st.success() {
+        bail!("the rollout to the nodes didn't finish: `kiwi-nest upgrade status` says why");
     }
     Ok(())
 }
