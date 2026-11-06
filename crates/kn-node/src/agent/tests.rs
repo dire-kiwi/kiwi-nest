@@ -23,6 +23,7 @@ struct Cluster {
     url: String,
     admin: String,
     http: reqwest::Client,
+    server: kn_server::Server,
 }
 
 /// The registry's container, for a server whose registry isn't really there.
@@ -47,9 +48,15 @@ impl Cluster {
 
     /// A server, with a registry at `registry.test` (served by an ingress that isn't there) if `registry`.
     async fn start_with(registry: bool) -> Cluster {
+        Cluster::start_full(registry, |_| Vec::new()).await
+    }
+
+    /// A server offering the releases `releases` makes in its directory.
+    async fn start_full(registry: bool, releases: impl FnOnce(&Path) -> Vec<kn_server::upgrades::Offer>) -> Cluster {
         install_tls();
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = kn_server::ServerConfig::new(dir.path().join("server"));
+        cfg.releases = releases(dir.path());
         cfg.poll_timeout = Duration::from_secs(1);
         cfg.offline_after = Duration::from_millis(1500);
         cfg.command_timeout = Duration::from_secs(20);
@@ -68,12 +75,13 @@ impl Cluster {
         let (server, admin) = kn_server::Server::open_with(cfg, container).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(kn_server::serve(listener, server, std::future::pending()));
+        tokio::spawn(kn_server::serve(listener, server.clone(), std::future::pending()));
         Cluster {
             dir,
             url,
             admin: admin.unwrap(),
             http: reqwest::Client::new(),
+            server,
         }
     }
 
@@ -106,6 +114,7 @@ impl Cluster {
             fake: Fake::new(),
             volumes: Arc::new(crate::volumes::fake::Fake::default()),
             ingress: String::new(),
+            installed: None,
             rt: None,
             exited: Arc::new(std::sync::Mutex::new(None)),
         }
@@ -220,6 +229,8 @@ struct Node {
     volumes: Arc<crate::volumes::fake::Fake>,
     /// The ingress address it reports.
     ingress: String,
+    /// The releases it runs from, as if installed.
+    installed: Option<kn_install::Layout>,
     rt: Option<tokio::runtime::Runtime>,
     /// Why the agent stopped, once it has (it was forgotten).
     exited: Arc<std::sync::Mutex<Option<String>>>,
@@ -280,6 +291,7 @@ impl Node {
         let mut acfg = AgentConfig::new(self.server.clone(), self.name.clone());
         acfg.join_token = join_token;
         acfg.ingress = self.ingress.clone();
+        acfg.installed = self.installed.clone();
         acfg.poll_wait = Duration::from_secs(1);
         acfg.max_backoff = Duration::from_millis(200);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -296,7 +308,8 @@ impl Node {
                 Ok(agent) => {
                     let _ = tx.send(Ok(()));
                     let why = match agent.run(CancellationToken::new()).await {
-                        Ok(()) => "stopped".to_string(),
+                        Ok(Stopped::Asked) => "stopped".to_string(),
+                        Ok(Stopped::Restart(p)) => format!("restart into {}", p.display()),
                         Err(e) => format!("{e:#}"),
                     };
                     *exited.lock().unwrap() = Some(why);
@@ -993,4 +1006,116 @@ async fn a_node_writes_its_registry_credential_into_its_own_docker_config_and_re
     let mut b = plain.node("b", 41600..=41699);
     b.start(Some(plain.join_token().await)).await;
     assert!(b.docker_logins().is_empty());
+}
+
+/// A stand-in for a release's binary: a script that says it's kiwi-nest `version`.
+fn fake_release(path: &Path, version: &str) -> kn_server::upgrades::Offer {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, format!("#!/bin/sh\necho 'kiwi-nest {version} (commit fake)'\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (sha256, size) = kn_install::checksums::sha256_file(path).unwrap();
+    kn_server::upgrades::Offer {
+        arch: kn_bundle::manifest::Arch::current().unwrap().as_str().into(),
+        path: path.into(),
+        sha256,
+        size,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_installed_node_upgrades_itself_once_its_changes_are_done_and_restarts_into_the_release() {
+    let c = Cluster::start_full(false, |dir| vec![fake_release(&dir.join("release"), kn_proto::VERSION)]).await;
+    let offer = c
+        .server
+        .upgrades
+        .offer(kn_bundle::manifest::Arch::current().unwrap().as_str())
+        .unwrap()
+        .clone();
+    let upgrade = |sha256: String| Action::Upgrade {
+        version: kn_proto::VERSION.into(),
+        sha256,
+        size: offer.size,
+    };
+
+    // A node that wasn't installed refuses.
+    let mut plain = c.node("plain", 42000..=42099);
+    plain.start(Some(c.join_token().await)).await;
+    c.online("plain", true).await;
+    let id = c.nodes().await[0].id;
+    let r = c
+        .server
+        .command(id, "plain", upgrade(offer.sha256.clone()), "test")
+        .await;
+    let err = kn_server::api::result::<kn_proto::agent::UpgradeAnswer>(r.unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("doesn't run from an installed release"), "{err}");
+
+    let mut a = c.node("a", 42100..=42199);
+    let layout = kn_install::Layout::new(a.dir.join("lib"));
+    a.installed = Some(layout.clone());
+    a.start(Some(c.join_token().await)).await;
+    c.online("a", true).await;
+    let nodes = c.nodes().await;
+    let n = nodes.iter().find(|n| n.name == "a").unwrap();
+    assert!(n.facts.as_ref().unwrap().self_upgrade);
+
+    // A release that doesn't match its checksum is refused, and nothing is put in place.
+    let r = c
+        .server
+        .command(n.id, "a", upgrade("0".repeat(64)), "test")
+        .await
+        .unwrap();
+    let err = kn_server::api::result::<kn_proto::agent::UpgradeAnswer>(r)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("doesn't match its checksum"), "{err}");
+    assert!(layout.installed().unwrap().is_empty());
+    assert_eq!(layout.current(), None);
+    assert!(a.exited.lock().unwrap().is_none());
+
+    // A long deploy in flight is finished before the node restarts.
+    a.fake.set_behaviour(Behaviour {
+        up_delay: Duration::from_secs(2),
+        ..Default::default()
+    });
+    c.deployed("blog", &yaml("blog.test", &["data"]), "node=a").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r = c
+        .server
+        .command(n.id, "a", upgrade(offer.sha256.clone()), "test")
+        .await
+        .unwrap();
+    let answer: kn_proto::agent::UpgradeAnswer = kn_server::api::result(r).unwrap();
+    assert_eq!(answer.version, kn_proto::VERSION);
+    assert!(answer.restarting);
+    let why = a.exits().await;
+    assert_eq!(
+        why,
+        format!("restart into {}", layout.binary(kn_proto::VERSION).display())
+    );
+    assert_eq!(layout.current().as_deref(), Some(kn_proto::VERSION));
+    assert_eq!(
+        std::fs::read(layout.binary(kn_proto::VERSION)).unwrap(),
+        std::fs::read(&offer.path).unwrap()
+    );
+    assert_eq!(a.fake.calls("up", &a.project("blog")), 1);
+    assert!(
+        a.agent_file().applied.apps["blog"].ok,
+        "the deploy finished, and was recorded"
+    );
+
+    // Started again (as the new release would be), it adopts its app and runs nothing again.
+    a.start(None).await;
+    c.online("a", true).await;
+    assert!(c.wait("blog", 1).await.ok);
+    assert_eq!(a.fake.calls("up", &a.project("blog")), 1);
+    // Asked again, it already runs that release: nothing to do.
+    let r = c
+        .server
+        .command(n.id, "a", upgrade(offer.sha256.clone()), "test")
+        .await
+        .unwrap();
+    let answer: kn_proto::agent::UpgradeAnswer = kn_server::api::result(r).unwrap();
+    assert!(!answer.restarting);
 }

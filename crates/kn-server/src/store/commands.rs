@@ -20,7 +20,7 @@ fn target(action: &Action) -> (&'static str, &str) {
         Action::Backup { what: Kind::App, .. } => "app",
         Action::Backup { .. } | Action::VolumeInfo { .. } | Action::DeleteSnapshot { .. } => "volume",
         // The node's own, not an app's or a volume's.
-        Action::PruneImages { .. } => "node",
+        Action::PruneImages { .. } | Action::Upgrade { .. } => "node",
     };
     (kind, action.target())
 }
@@ -133,6 +133,7 @@ fn describe(action: &Action) -> (String, String) {
             "prune images".into(),
             grace_secs.map_or_else(String::new, |g| format!("grace {g}s")),
         ),
+        Action::Upgrade { version, .. } => ("upgrade".into(), format!("to {version}")),
         Action::Backup { targets, full, .. } => {
             let mut d = Vec::new();
             if targets.is_empty() {

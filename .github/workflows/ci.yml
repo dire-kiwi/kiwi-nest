@@ -56,6 +56,25 @@ jobs:
         run: scripts/test-s3.sh
       - run: make integration
 
+  # The CLI alone, as it's released for macOS.
+  macos-cli:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the toolchain from rust-toolchain.toml
+        run: rustup toolchain install || rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked -p kiwi-nest --no-default-features
+      - run: cargo test --locked -p kn-cli -p kn-bundle -p kn-proto
+      - run: target/debug/kiwi-nest version
+
+  # The Action's script, against a fake CLI.
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/test-action.sh
+
   # btrfs send needs root: the tests of the `send` format run as root, through sudo.
   root:
     runs-on: ubuntu-latest

@@ -168,9 +168,31 @@ impl Link {
 
     /// Downloads a bundle into `dest`, refusing more than `limit` bytes.
     pub async fn bundle(&self, digest: &str, dest: &Path, limit: u64) -> Result<(), LinkError> {
+        self.download(
+            &format!("/agent/bundles/{digest}"),
+            dest,
+            limit,
+            &format!("bundle {digest}"),
+        )
+        .await
+    }
+
+    /// Downloads the server's release of kiwi-nest for an architecture into `dest`, refusing more than `limit`
+    /// bytes.
+    pub async fn release(&self, version: &str, arch: &str, dest: &Path, limit: u64) -> Result<(), LinkError> {
+        self.download(
+            &format!("/agent/releases/{version}/{arch}"),
+            dest,
+            limit,
+            &format!("release {version}"),
+        )
+        .await
+    }
+
+    async fn download(&self, path: &str, dest: &Path, limit: u64, what: &str) -> Result<(), LinkError> {
         let resp = self
             .http
-            .get(format!("{}/agent/bundles/{digest}", self.base))
+            .get(format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .send()
             .await?;
@@ -184,9 +206,7 @@ impl Link {
             let chunk = chunk?;
             n += chunk.len() as u64;
             if n > limit {
-                return Err(LinkError::Other(format!(
-                    "bundle {digest} is larger than {limit} bytes"
-                )));
+                return Err(LinkError::Other(format!("{what} is larger than {limit} bytes")));
             }
             file.write_all(&chunk)
                 .await

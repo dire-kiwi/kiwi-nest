@@ -1019,6 +1019,7 @@ dependencies = [
  "kn-btrfs",
  "kn-bundle",
  "kn-cli",
+ "kn-install",
  "kn-node",
  "kn-proto",
  "kn-server",
@@ -1101,6 +1102,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kn-install"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "futures-util",
+ "hex",
+ "kn-btrfs",
+ "kn-proto",
+ "libc",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "kn-node"
 version = "0.1.0"
 dependencies = [
@@ -1116,6 +1138,7 @@ dependencies = [
  "kn-backup",
  "kn-btrfs",
  "kn-bundle",
+ "kn-install",
  "kn-proto",
  "kn-server",
  "reqwest",

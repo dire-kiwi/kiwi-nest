@@ -64,6 +64,8 @@ pub fn router() -> Router<Server> {
         .route(&format!("{p}/users"), get(user_list).post(user_create))
         .route(&format!("{p}/users/{{name}}"), delete(user_delete))
         .route(&format!("{p}/users/{{name}}/password"), put(user_password))
+        // `kiwi-nest user …` uses these too.
+        .route_layer(axum::middleware::from_fn(crate::api::refuse_older_clis))
 }
 
 /// Failed logins, by user name, and the limit on passwords checked at once.

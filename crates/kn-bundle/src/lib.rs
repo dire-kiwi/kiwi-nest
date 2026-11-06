@@ -7,6 +7,7 @@
 //! - [`compose`] checks the Compose file against the subset kiwi-nest accepts, and [`manifest`] its
 //!   `x-kiwi-nest` block.
 //! - [`generate`] writes the Compose file that a node actually runs.
+//! - [`overrides`] changes `x-kiwi-nest` as the CLI deploys a bundle (`deploy --domain`, for previews).
 //!
 //! Nothing here touches anything but the bundle itself, so plain unit tests cover it.
 
@@ -15,6 +16,7 @@ pub mod dir;
 mod files;
 pub mod generate;
 pub mod manifest;
+pub mod overrides;
 pub mod zip;
 
 use std::io::Read;
@@ -100,6 +102,9 @@ pub enum BundleError {
     MissingCompose,
     #[error("`compose.yaml` isn't valid UTF-8")]
     ComposeNotUtf8,
+    /// `x-kiwi-nest` couldn't be changed as asked (see [`overrides`]).
+    #[error("{0}")]
+    Overrides(String),
 }
 
 impl BundleError {

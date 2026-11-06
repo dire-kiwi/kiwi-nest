@@ -9,15 +9,23 @@ publish.workspace = true
 name = "kiwi-nest"
 path = "src/main.rs"
 
+[features]
+default = ["cluster"]
+# The server, the node, and installing and upgrading them, which need Linux. Without it the binary is only the CLI,
+# as it's built for macOS.
+cluster = ["dep:kn-backup", "dep:kn-install", "dep:kn-node", "dep:kn-server", "dep:reqwest"]
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-kn-backup.workspace = true
+kn-backup = { workspace = true, optional = true }
 kn-bundle.workspace = true
 kn-cli.workspace = true
-kn-node.workspace = true
+kn-install = { workspace = true, optional = true }
+kn-node = { workspace = true, optional = true }
 kn-proto.workspace = true
-kn-server.workspace = true
+kn-server = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

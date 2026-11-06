@@ -53,6 +53,11 @@
 //! | `POST /users` | [`CreateUser`] | [`UserInfo`] |
 //! | `PUT /users/{name}/password` | [`SetPassword`] | `204 No Content` |
 //! | `DELETE /users/{name}` | | `204 No Content` |
+//! | `GET /upgrade` | | [`UpgradeStatus`] (admin): the server's release rolling out to the nodes |
+//! | `POST /upgrade` | | [`UpgradeStatus`] (admin): try the nodes again, after a failure halted the rollout |
+//!
+//! The server refuses a CLI older than itself with `426 Upgrade Required`: the CLI sends its version in its
+//! `User-Agent` (see [`crate::version`]).
 //!
 //! **The web UI's users** log in with a password (`POST /session`), and the session cookie then stands for an admin
 //! token on every route but the agent link's. A request with the cookie must come from the server's own origin
@@ -712,4 +717,56 @@ pub struct ErrorBody {
     /// Each problem found in a refused bundle.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub problems: Vec<String>,
+}
+
+/// `GET /upgrade`: how the server's release is rolling out to the nodes, one at a time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradeStatus {
+    /// The server's version, which nodes are upgraded to.
+    pub version: String,
+    /// The architectures the server has its release for, and so can upgrade nodes of.
+    pub arches: Vec<String>,
+    /// A node's upgrade failed, so no other is started until `POST /upgrade` (or a server restart).
+    pub halted: bool,
+    pub nodes: Vec<NodeUpgrade>,
+}
+
+/// One node, in [`UpgradeStatus`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeUpgrade {
+    pub node: String,
+    /// The version it last reported.
+    pub version: String,
+    pub online: bool,
+    pub state: UpgradeState,
+    /// Why it can't be upgraded, or how its upgrade failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeState {
+    /// It runs the server's version, or a newer one.
+    Current,
+    /// It's older, and waits its turn (or for coming online).
+    Pending,
+    /// It's being upgraded: downloading, or restarting into the new release.
+    Upgrading,
+    /// Its upgrade failed (see `detail`), which halts the rollout.
+    Failed,
+    /// It can't be upgraded by the server (see `detail`): upgrade it by hand.
+    Manual,
+}
+
+impl UpgradeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UpgradeState::Current => "current",
+            UpgradeState::Pending => "pending",
+            UpgradeState::Upgrading => "upgrading",
+            UpgradeState::Failed => "failed",
+            UpgradeState::Manual => "manual",
+        }
+    }
 }
