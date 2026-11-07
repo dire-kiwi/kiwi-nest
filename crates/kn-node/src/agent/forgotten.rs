@@ -14,6 +14,9 @@
 //!
 //!    (If the state directory is on another filesystem, `STATE/apps` goes to `STATE/forgotten/TIMESTAMP/apps`
 //!    instead, and `state.json`, a few kilobytes, is copied and then removed.)
+//!
+//!    Only the Compose projects recorded in `state.json` are taken down: others that start with the node's prefix
+//!    may be another node's (see [`set_aside`]).
 //! 4. It records that all that is done, and the agent stops. It refuses to start again until it's given a fresh
 //!    join token, which makes it a new node with an empty desired state.
 //!
@@ -109,6 +112,24 @@ fn rename(from: &Path, to: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
+/// Moves a file: by a rename, or across filesystems by a copy and then removing it. Can be run again after either
+/// step: when `to` already holds what `from` does (the copy was made, and removing `from` failed), it removes `from`.
+fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    if let (Ok(a), Ok(b)) = (std::fs::read(from), std::fs::read(to))
+        && a == b
+    {
+        return std::fs::remove_file(from);
+    }
+    match rename(from, to) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            write_atomic(to, &std::fs::read(from)?)?;
+            std::fs::remove_file(from)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn sync_dir(dir: &Path) {
     if let Ok(f) = std::fs::File::open(dir) {
         let _ = f.sync_all();
@@ -154,6 +175,26 @@ pub async fn set_aside(cfg: &NodeConfig, runtime: &dyn Runtime, mut rec: Forgott
         );
     }
 
+    // Only the projects recorded in `state.json` are taken down. A node records each app's project before its first
+    // `up` and keeps the record until `down` succeeds, so a project it isn't recorded in wasn't started by this
+    // node; and a name can't tell: with a shared Docker Engine, the prefix `kn-` matches node `kn-dev-a-`'s apps
+    // too (`kn-dev-a-blog` is `kn-` and `dev-a-blog`). So the others are left as they are, and named for a person.
+    if let Ok(projects) = runtime.projects(&cfg.project_prefix).await {
+        let recorded: Vec<&str> = state.apps.values().map(|a| a.project.as_str()).collect();
+        let others: Vec<String> = projects
+            .into_iter()
+            .map(|p| p.name)
+            .filter(|n| !recorded.contains(&n.as_str()))
+            .collect();
+        if !others.is_empty() {
+            tracing::warn!(
+                projects = others.join(", "),
+                "left Compose projects that start with this node's prefix but aren't its apps (another node's, \
+                 sharing this Docker Engine, or made by hand); if any were this node's, take them down by hand"
+            );
+        }
+    }
+
     let aside = rec.aside.clone();
     let state_dir = cfg.state_dir.clone();
     let volumes_dir = cfg.volumes_dir.clone();
@@ -177,15 +218,8 @@ pub async fn set_aside(cfg: &NodeConfig, runtime: &dyn Runtime, mut rec: Forgott
             Err(e) => return Err(e).with_context(|| format!("moving {} aside", bundles.display())),
         }
         let state_file = state_dir.join("state.json");
-        let moved = aside.join("state.json");
-        match rename(&state_file, &moved) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-                write_atomic(&moved, &std::fs::read(&state_file)?)?;
-                std::fs::remove_file(&state_file)?;
-            }
-            Err(e) => return Err(e).with_context(|| format!("moving {} aside", state_file.display())),
-        }
+        move_file(&state_file, &aside.join("state.json"))
+            .with_context(|| format!("moving {} aside", state_file.display()))?;
         let done = Forgotten { done: true, ..record };
         write_atomic(&aside.join("forgotten.json"), &serde_json::to_vec_pretty(&done)?)?;
         sync_dir(&aside);
@@ -197,4 +231,58 @@ pub async fn set_aside(cfg: &NodeConfig, runtime: &dyn Runtime, mut rec: Forgott
     rec.done = true;
     tracing::warn!(aside = %rec.aside.display(), "set the node's data aside: the server forgot this node");
     Ok(rec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::Fake;
+
+    /// Cut off after `state.json` was copied across filesystems and before the original was removed: the next try
+    /// finds the copy in place and removes the original, rather than failing on it for ever.
+    #[tokio::test]
+    async fn a_set_aside_cut_off_after_copying_the_state_file_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = NodeConfig::new(tmp.path().join("state"));
+        std::fs::create_dir_all(cfg.volumes_dir.join("apps/blog/data")).unwrap();
+        let state = br#"{"apps":{"blog":{"project":"kn-blog","generation":1}}}"#;
+        std::fs::write(cfg.state_dir.join("state.json"), state).unwrap();
+        let rec = Forgotten::new(&cfg, "http://server", 1, "a", 1, 2);
+        std::fs::create_dir_all(&rec.aside).unwrap();
+        std::fs::write(rec.aside.join("state.json"), state).unwrap();
+        let fake = Fake::new();
+        fake.add_project("kn-blog", 0, &[("web", "exited", 0)]);
+        // Another node's app on the same engine, whose prefix (`kn-dev-a-`) starts with this one's.
+        fake.add_project("kn-dev-a-blog", 0, &[("web", "exited", 0)]);
+
+        let rec = set_aside(&cfg, &*fake, rec).await.unwrap();
+        assert!(rec.done);
+        assert!(!cfg.state_dir.join("state.json").exists());
+        assert_eq!(std::fs::read(rec.aside.join("state.json")).unwrap(), state);
+        assert!(rec.aside.join("apps/blog/data").is_dir());
+        assert_eq!(fake.state("kn-blog", "web"), None, "its app is taken down");
+        assert_eq!(
+            fake.state("kn-dev-a-blog", "web").as_deref(),
+            Some("exited"),
+            "a project it didn't record is left"
+        );
+        // And again, with everything done already.
+        set_aside(&cfg, &*fake, rec).await.unwrap();
+    }
+
+    #[test]
+    fn moving_a_file_never_replaces_a_different_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("from"), tmp.path().join("to"));
+        std::fs::write(&from, "new").unwrap();
+        std::fs::write(&to, "old").unwrap();
+        let err = move_file(&from, &to).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&from).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "old");
+        std::fs::remove_file(&to).unwrap();
+        move_file(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "new");
+    }
 }

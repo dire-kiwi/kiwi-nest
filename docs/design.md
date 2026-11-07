@@ -280,7 +280,8 @@ VOLUMES/                         one btrfs filesystem per node
 
   `--node NAME` chooses the node outright, though the filter still applies: `--node` can't put a new nest on a
   cordoned node or one of another architecture. Being online is the one part `--queue` waives, so a nest can be
-  queued for an offline node. If no node qualifies, the deploy says why each one doesn't. `inspect` shows the
+  queued for an offline node. A new nest that no node has the memory headroom for still goes to the best node (or
+  the one `--node` names), and the deploy warns, saying which of the two it was. If no node qualifies, the deploy says why each one doesn't. `inspect` shows the
   node, the nest, how the app came to be in it (`through --from blog`), and why the nest's node was chosen, as
   recorded when the nest was placed (`the most memory headroom: 3.1 GiB (others: b 1.2 GiB); not eligible: c
   (cordoned)`).
@@ -856,6 +857,11 @@ data:
   `agent.json` that it was forgotten, and drops its token. It then closes its apps (every new operation is refused,
   starts for requests included, and its routes are removed), and runs `docker compose down` for every app, so no
   container is left for Docker to restart.
+- Only the apps recorded in `STATE/state.json` are taken down. A node records an app's Compose project there before
+  its first `up` and keeps the record until a `down` succeeds, so a project that isn't recorded wasn't started by
+  the node, and its name can't say whose it is: on a shared Docker Engine, prefix `kn-` matches node `kn-dev-a-`'s
+  apps too (`kn-dev-a-blog` is `kn-` and app `dev-a-blog`). Such projects are left running, and named in a warning
+  in the node's log.
 - It then moves its data aside by renames within the filesystem, so nothing is copied or deleted:
 
   ```text
@@ -867,16 +873,20 @@ data:
   ```
 
   If the state directory is on another filesystem, `STATE/apps` goes to `STATE/forgotten/TIMESTAMP/apps` instead,
-  and `state.json` (a few kilobytes) is copied and then removed.
+  and `state.json` (a few kilobytes) is copied and then removed (a copy found already in place, the same as the
+  original, means only the removing is left to do).
 - It records that all that is done, and the node exits with why. It refuses to start again until it's given a
   fresh join token (`--join-token`), which makes it a new node with a new identity and an empty desired state; it
   may take its old name. The server never re-attaches a forgotten node's old records.
 - Every step can be run again. A node cut off part way finishes the job when it next starts, before it opens its
-  apps, so it never adopts (and starts) an app it should have taken down.
+  apps, so it never adopts (and starts) an app it should have taken down. `node --standalone` does the same with
+  a forgotten node's state directory, and then refuses it.
 - The data set aside is deleted only by hand.
 
 The one gap left is the time a forgotten node spends running while it can't reach the server, which is why step 1
-comes first.
+comes first. That includes a reboot before the node has heard: Docker's restart policies start its always-on apps'
+containers again as the machine comes up, and the node adopts them as it starts, so they run for a moment (at least
+until its first poll is answered) before it hears it was forgotten and takes them down.
 
 ## Code layout
 
