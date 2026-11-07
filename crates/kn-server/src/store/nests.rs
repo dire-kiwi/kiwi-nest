@@ -144,9 +144,9 @@ pub fn backfill(c: &Connection) -> anyhow::Result<()> {
     let mut left = Vec::new();
     for (name, node, from, shared) in apps {
         let shared: Vec<String> = serde_json::from_str(&shared).unwrap_or_default();
-        match shared.iter().find_map(|v| volume_nest.get(v)) {
-            Some(nest) if pinned.get(nest) == Some(&node) => {
-                app_nest.insert(name, (nest.clone(), format!("through shared volume `{}`", shared[0])));
+        match shared.iter().find_map(|v| Some((v, volume_nest.get(v)?))) {
+            Some((v, nest)) if pinned.get(nest) == Some(&node) => {
+                app_nest.insert(name, (nest.clone(), format!("through shared volume `{v}`")));
             }
             _ => left.push((name, node, from)),
         }
@@ -230,6 +230,8 @@ mod tests {
         let apps = [
             // (name, node, from, shared, state)
             ("wiki", 1, None, r#"["corpus"]"#, "active"),
+            // Its first shared volume is gone: its nest comes through the second.
+            ("notes", 1, None, r#"["scratch","corpus"]"#, "active"),
             ("blog", 2, None, "[]", "active"),
             ("blog-pr1", 2, Some("blog"), "[]", "active"),
             ("blog-pr1-x", 2, Some("blog-pr1"), "[]", "active"),
@@ -257,6 +259,10 @@ mod tests {
         };
         assert_eq!(
             nest_of("wiki"),
+            (Some("corpus".into()), "through shared volume `corpus`".into())
+        );
+        assert_eq!(
+            nest_of("notes"),
             (Some("corpus".into()), "through shared volume `corpus`".into())
         );
         assert_eq!(nest_of("blog").0.as_deref(), Some("blog"));
