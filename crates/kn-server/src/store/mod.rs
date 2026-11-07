@@ -77,6 +77,11 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: MIGRATION_6,
         then: Some(commands::backfill),
     },
+    // 7: commands record their action's kind, so each app's history leaves inspects out by its index.
+    Migration {
+        sql: MIGRATION_7,
+        then: None,
+    },
 ];
 
 const MIGRATION_1: &str = r#"
@@ -264,6 +269,17 @@ const MIGRATION_6: &str = r#"
     ALTER TABLE commands ADD COLUMN target TEXT;
     ALTER TABLE commands ADD COLUMN caller TEXT NOT NULL DEFAULT '';
     CREATE INDEX commands_by_target ON commands (target_kind, target, id);
+    "#;
+
+// 7: each command's action kind, and each app's history indexed without inspects.
+const MIGRATION_7: &str = r#"
+    -- The action's `kind` (`inspect`, `logs`, `suspend`, …). NULL for an action that isn't JSON.
+    ALTER TABLE commands ADD COLUMN action_kind TEXT;
+    UPDATE commands SET action_kind = json_extract(action, '$.kind') WHERE json_valid(action);
+    -- Inspects are most of the commands (the web UI inspects an open app now and then) and in no history, so
+    -- they're left out of the index the history reads.
+    DROP INDEX commands_by_target;
+    CREATE INDEX commands_history ON commands (target_kind, target, id) WHERE action_kind IS NOT 'inspect';
     "#;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;

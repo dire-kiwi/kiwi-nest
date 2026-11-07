@@ -5,9 +5,10 @@ import { usePoll } from '../hooks'
 import { BackupResultView, IdleTimeout, LastActivity } from './shared'
 
 export function AppDetail({ name, logsOpen }: { name: string; logsOpen: boolean }) {
-  // The list is cheap (the server's own view); inspecting asks the node, so it's refreshed less often.
+  // The list is cheap (the server's own view); inspecting asks the node (and is a command, kept a day), so it's
+  // refreshed less often. Every poll pauses while the tab is hidden.
   const summary = usePoll(async () => (await api.apps()).find((a) => a.name === name), 5000, [name])
-  const info = usePoll(() => api.inspect(name), 15000, [name])
+  const info = usePoll(() => api.inspect(name), 30000, [name])
   const commands = usePoll(() => api.commands(name, 20), 10000, [name])
   const [targets, setTargets] = useState<string[]>([])
   const [target, setTarget] = useState('')
