@@ -192,6 +192,7 @@ impl Server {
                 if lost > 0 {
                     tracing::info!(lost, "commands open when the server stopped won't be answered");
                 }
+                prune_commands(c, now)?;
                 store::apps::sweep(c, &b)?;
                 store::apps::backfill(c, &b, &limits)?;
                 if store::tokens::admin_count(c)? > 0 {
@@ -358,11 +359,36 @@ pub async fn serve(
         tokio::spawn(async move { registry.run(server, stop).await });
     }
     tokio::spawn(upgrades::run(server.clone(), stop.clone()));
+    tokio::spawn(prune_commands_now_and_then(server.clone(), stop.clone()));
     let router = server.router();
     let graceful = axum::serve(listener, router).with_graceful_shutdown(stop.clone().cancelled_owned());
     tokio::select! {
         r = graceful => r,
         _ = async { stop.cancelled().await; tokio::time::sleep(Duration::from_secs(5)).await } => Ok(()),
+    }
+}
+
+/// How often old commands are pruned, besides when the server starts.
+const PRUNE_EVERY: Duration = Duration::from_secs(3600);
+
+fn prune_commands(c: &rusqlite::Connection, now: u64) -> Result<()> {
+    let pruned = store::commands::prune(c, now)?;
+    if pruned > 0 {
+        tracing::info!(pruned, "pruned finished commands");
+    }
+    Ok(())
+}
+
+/// Prunes old commands every [`PRUNE_EVERY`] until `stop`.
+async fn prune_commands_now_and_then(server: Server, stop: CancellationToken) {
+    loop {
+        tokio::select! {
+            _ = stop.cancelled() => return,
+            _ = tokio::time::sleep(PRUNE_EVERY) => {}
+        }
+        if let Err(e) = server.store.call(|c| prune_commands(c, store::now())).await {
+            tracing::warn!(error = %e, "pruning old commands failed");
+        }
     }
 }
 

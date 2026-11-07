@@ -337,6 +337,13 @@ VOLUMES/                         one btrfs filesystem per node
   node restarted) has failed, and the caller is told; a command whose caller gave up before it was handed out is
   cancelled, so it never runs late; a caller stops waiting as soon as the node goes offline. Only the newest of a
   node's polls hands anything out.
+- **Commands are kept for 30 days** once finished (done, cancelled or lost), as each app's history, and pruned when
+  the server starts and every hour. A month answers "what happened to this app lately" and covers the gap between a
+  problem and someone looking into it, while the table stays small (a scheduled backup a day for each of a few dozen
+  apps is about a thousand rows); what must last longer is elsewhere (deploys are generations, backups are in their
+  targets). Inspects are the exception: the CLI and the web UI run them all the time, they change nothing and no
+  history shows them, so a finished one is kept for a day. Each command records its action's kind, and the index each
+  app's history reads leaves inspects out, so however many there are, the history never steps over them.
 - **Online** means the node has a poll open, or polled within `--offline-after` (15 seconds).
 - **`deploy` waits until the node reports the new generation**, then prints the result. The server saves the deploy
   and answers at once; the CLI then follows the change (`…/changes/GENERATION`, a long poll of its own) until the node
@@ -704,19 +711,25 @@ command with what it acts on and who asked), on a thread of its own, in WAL
   node: status, containers, domain, nest, idle timeout and last activity, and each app's details: its containers,
   placement, volumes with their space, and its recent commands (`GET /apps/{name}/commands`: what was run, by whom,
   and how it ended; inspecting isn't listed). Shared volumes with their snapshots and the space each takes, and
-  every app's volumes. Backups by target. The lists refresh every few seconds; the backups only when asked, since
-  listing reads the targets.
+  every app's volumes. Backups by target. The lists refresh every few seconds; an app's details from its node every
+  30 seconds, since each is a command; the backups only when asked, since listing reads the targets. Nothing
+  refreshes while the tab is hidden, and everything does when it's shown again.
 - **Actions:** suspend, resume (which wakes a suspended or idle app and returns once it's up), logs (followed as
   they come), back up now, cordon and uncordon. Deploying and deleting stay with the CLI and CI.
 - **Users and logins.** The UI's users are made with an admin token (`kiwi-nest user add NAME`, which asks for the
-  password; `user list|passwd|delete`), and each may do what an admin token may. Passwords (at least 10
-  characters) are kept as Argon2id hashes. Logging in (`POST /session`) gives a session: a random token in a cookie
-  (`__Host-kn-session`) that's `HttpOnly`, `Secure`, `SameSite=Strict` and, through the `__Host-` prefix,
-  host-only, so no script can read it and no app on a sibling domain can set one. The server keeps the token's hash.
-  A session ends after 12 hours unused, after 7 days in any case, on logging out, and when the user's password
-  changes or the user is deleted. After five failed logins for a name, the next is refused for a second, doubling
-  with each failure up to 15 minutes; a name that doesn't exist takes as long to refuse. At most four passwords are
-  checked at once, since each check takes memory on purpose.
+  password; `user list|passwd|delete`), and each may do what an admin token may. Passwords (at least 10 characters)
+  are kept as Argon2id hashes. Logging in (`POST /session`) gives a session: a random token in a cookie
+  (`__Host-kn-session`) that's `HttpOnly`, `Secure`, `SameSite=Strict` and, through the `__Host-` prefix, host-only,
+  so no script can read it and no app on a sibling domain can set one. The server keeps the token's hash. A session
+  ends after 12 hours unused, after 7 days in any case, on logging out, and when the user's password changes or the
+  user is deleted. After five failed logins for a name, the next is refused for a second, doubling with each failure
+  up to 15 minutes; a name that doesn't exist takes as long to refuse. At most four passwords are checked at once,
+  since each check takes memory on purpose. The lockout is by name alone, on purpose: a limit by client (its address,
+  from the ingress's `X-Forwarded-For`) would let anyone with many addresses keep guessing at a password. The price is
+  that whoever can reach the login and knows a user's name can keep that user locked out of the UI, 15 minutes at a
+  time. Tokens aren't affected, so the CLI still works, and the clusters
+  this is for put few people at the login page; a client limit in front of it belongs to the ingress if it's ever
+  needed.
 - **Cross-site requests are refused.** The apps' domains are siblings of the server's (`blog.example.com`,
   `kn.example.com`), which browsers count as the same *site*, so `SameSite=Strict` alone would still let an app's
   page (a pull request's preview, say) send requests with the cookie. So a request carrying it is refused unless
