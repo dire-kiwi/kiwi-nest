@@ -307,8 +307,8 @@ fn place_nest(
     }
 }
 
-/// A warning if the node has no memory headroom left once `memory` more is placed on it. `joining` names the nest
-/// the app joins, if the nest was already on the node.
+/// A warning if the node has no memory headroom left once `memory` more is placed on it. `why` says why the app
+/// goes there anyway.
 fn memory_warning(
     tx: &Transaction,
     settings: &Settings,
@@ -316,7 +316,7 @@ fn memory_warning(
     except: &str,
     memory: u64,
     idles: bool,
-    joining: Option<&str>,
+    why: &str,
 ) -> Result<Option<String>> {
     let load = scheduler::loads(tx, Some(except))?
         .get(&node.id)
@@ -339,10 +339,7 @@ fn memory_warning(
         b(load.always_on),
         settings.idle_factor,
         b(load.idle),
-        match joining {
-            None => "it was still the best node".to_string(),
-            Some(nest) => format!("it goes there anyway, as nest `{nest}` does"),
-        }
+        why
     )))
 }
 
@@ -451,17 +448,14 @@ pub fn deploy(
     }
     let up = check_online(&node, online, d.queue, "deploy")?;
     let idles = d.bundle.idle_timeout_secs > 0;
-    let warnings: Vec<String> = memory_warning(
-        &tx,
-        settings,
-        &node,
-        &d.name,
-        d.bundle.memory_bytes,
-        idles,
-        placed.new.is_none().then_some(nest.as_str()),
-    )?
-    .into_iter()
-    .collect();
+    let why = match (&placed.new, &d.node) {
+        (None, _) => format!("it goes there anyway, as nest `{nest}` does"),
+        (Some(_), Some(_)) => "--node chose it".into(),
+        (Some(_), None) => "it was still the best node".into(),
+    };
+    let warnings: Vec<String> = memory_warning(&tx, settings, &node, &d.name, d.bundle.memory_bytes, idles, &why)?
+        .into_iter()
+        .collect();
     let taken: Option<(String, Option<String>)> = tx
         .query_row(
             "SELECT a.name, n.name FROM apps a LEFT JOIN nodes n ON n.id = a.node_id

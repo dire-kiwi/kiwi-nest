@@ -1185,6 +1185,17 @@ async fn new_nests_spread_by_memory_and_a_full_nest_warns() {
         "{}",
         acc.warnings[0]
     );
+    // A new nest too big for any node goes to the best one, or the one --node chose, and the deploy says which.
+    for (name, query, why) in [
+        ("huge", "", "it was still the best node"),
+        ("huge-a", "node=a", "--node chose it"),
+    ] {
+        let acc = env
+            .placed(name, &app_yaml(&format!("{name}.test"), "", "8g"), query)
+            .await;
+        assert_eq!(acc.warnings.len(), 1, "{:?}", acc.warnings);
+        assert!(acc.warnings[0].ends_with(why), "{}", acc.warnings[0]);
+    }
 }
 
 #[tokio::test]

@@ -146,6 +146,10 @@ pub fn check_loopback(addr: &SocketAddr) -> anyhow::Result<()> {
 pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen: SocketAddr) -> anyhow::Result<()> {
     check_loopback(&listen)?;
     check_loopback(&gateway_listen)?;
+    // A state directory of a node the server forgot is refused, once its apps are taken down if that was cut off,
+    // so they are never adopted (and started) here either.
+    cfg.validate()?;
+    agent::prepare(&cfg, &runtime::Docker::for_node(&cfg), false).await?;
     let usage_interval = cfg.usage_interval;
     let apps = apps::Apps::open(cfg).await?;
     let listener = tokio::net::TcpListener::bind(listen)
@@ -299,6 +303,26 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A standalone node won't use a forgotten node's state directory, whose apps it would otherwise adopt.
+    #[tokio::test]
+    async fn a_standalone_node_refuses_a_forgotten_nodes_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = NodeConfig::new(tmp.path().join("state"));
+        std::fs::create_dir_all(&cfg.state_dir).unwrap();
+        let rec = agent::Forgotten {
+            done: true,
+            ..agent::Forgotten::new(&cfg, "http://server", 1, "a", 1, 2)
+        };
+        let file = serde_json::json!({
+            "version": 2, "server": "http://server", "node_id": 1, "name": "a", "token": "", "forgotten": rec,
+        });
+        std::fs::write(cfg.state_dir.join("agent.json"), file.to_string()).unwrap();
+        let any = "127.0.0.1:0".parse().unwrap();
+        let err = run_standalone(cfg.clone(), any, any).await.unwrap_err().to_string();
+        assert!(err.contains("forgot this node"), "{err}");
+        assert!(!cfg.state_dir.join("apps").exists(), "its apps weren't opened");
+    }
 
     #[test]
     fn validates_the_config() {
