@@ -193,7 +193,9 @@ Read `references/from-site-deploy.md`: what changes in the bundle, the scripts a
 ## Don't
 
 - Don't deploy real apps to `home`, or try out a kiwi-nest release on `dire`: releases go to `home` first.
-- Don't run `server init` again on VM 201: it puts Caddy's admin port back to 2019, which site-deploy's Caddy holds,
-  and breaks the ingress (KN-21). Upgrades (`sudo kiwi-nest upgrade`) are fine.
+- Don't run `server init` again on VM 201 with 0.1.1 (what it runs now): that release puts Caddy's admin port back
+  to 2019, which site-deploy's Caddy holds, and breaks the ingress. Releases after 0.1.1 keep the drop-in's
+  `--caddy-admin http://127.0.0.1:2029` (or take `--caddy-admin`) (KN-21). Upgrades (`sudo kiwi-nest upgrade`) are
+  fine.
 - Don't print or commit tokens, and don't make admin tokens for CI: use deploy tokens.
 - Don't change Caddy's configuration by hand: the server replaces it.
