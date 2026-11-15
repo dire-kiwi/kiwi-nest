@@ -90,7 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # build the bundle into ./bundle here, unless the repository is the bundle
-      - uses: dire-kiwi/kiwi-nest@v0.2.0      # a release's tag
+      - uses: dire-kiwi/kiwi-nest@v0.2.1      # a release's tag
         with:
           server: https://kn.dire.nz
           token: ${{ secrets.KIWI_NEST_PREVIEW_TOKEN }}   # --pattern 'code-pr*' --from code
@@ -105,6 +105,7 @@ the pull request's); `bundle` (default `.`); `name` (default `APP-prNUMBER`); `i
 keeps the bundle's); `backups` (default `false`); `access` (`lan` or `public`, from 0.2.0; empty keeps the
 bundle's); `ca-cert`; `version` (default the server's); `command` (`deploy`
 or `delete`, default from the event); `repository`. Outputs: `name`, `url`.
+Use v0.2.1 or later: v0.2.0's `action.yml` doesn't parse, so every run using it fails before it starts.
 
 The preview's bundle is usually production's, built from the pull request's code. If it carries
 `node_labels`, they must match production's node (a preview always goes to production's nest), and keep previews

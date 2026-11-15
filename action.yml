@@ -10,7 +10,7 @@
 #       runs-on: ubuntu-latest
 #       steps:
 #         - uses: actions/checkout@v4
-#         - uses: dire-kiwi/kiwi-nest@v0.2.0   # a release's tag
+#         - uses: dire-kiwi/kiwi-nest@v0.2.1   # a release's tag
 #           with:
 #             server: https://kn.example.com
 #             token: ${{ secrets.KIWI_NEST_PREVIEW_TOKEN }}
@@ -46,7 +46,7 @@ inputs:
     required: false
     default: "."
   name:
-    description: The preview's name [default: APP-prNUMBER].
+    description: "The preview's name [default: APP-prNUMBER]."
     required: false
     default: ""
   idle-timeout:
@@ -68,7 +68,7 @@ inputs:
     required: false
     default: ""
   version:
-    description: The kiwi-nest CLI to install [default: the server's version, which the CLI must be at least].
+    description: "The kiwi-nest CLI to install [default: the server's version, which the CLI must be at least]."
     required: false
     default: ""
   command:
