@@ -82,6 +82,12 @@ pub const MIGRATIONS: &[Migration] = &[
         sql: MIGRATION_7,
         then: None,
     },
+    // 8: who the ingress serves each app to (`x-kiwi-nest.access`). Bundles from before couldn't say, so they're
+    // public.
+    Migration {
+        sql: MIGRATION_8,
+        then: None,
+    },
 ];
 
 const MIGRATION_1: &str = r#"
@@ -280,6 +286,10 @@ const MIGRATION_7: &str = r#"
     -- they're left out of the index the history reads.
     DROP INDEX commands_by_target;
     CREATE INDEX commands_history ON commands (target_kind, target, id) WHERE action_kind IS NOT 'inspect';
+    "#;
+
+const MIGRATION_8: &str = r#"
+    ALTER TABLE apps ADD COLUMN access TEXT NOT NULL DEFAULT 'public';
     "#;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;

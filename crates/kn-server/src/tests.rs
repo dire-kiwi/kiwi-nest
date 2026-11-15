@@ -660,6 +660,7 @@ async fn commands_are_delivered_once_and_lost_ones_fail() {
         container_port: 80,
         port: 30000,
         idle_timeout_secs: 0,
+        access: Default::default(),
         project: "kn-blog".into(),
         bundle_digest: String::new(),
         volumes: vec![],
@@ -2050,6 +2051,68 @@ async fn the_ingress_routes_apps_to_their_nodes_and_the_api_never_shows_hashes()
             !c.contains("docs.test") && !c.contains(&b.ingress_token)
         })
         .await;
+}
+
+#[tokio::test]
+async fn lan_only_apps_need_the_lans_ranges_and_are_refused_off_the_lan() {
+    let lan_bundle = || bundle_with("docs.test", ", access: lan");
+    // Without an ingress, or one without --lan-cidr, nothing could tell the LAN apart: the deploy is refused.
+    for ingress in [
+        None,
+        Some(ingress::IngressConfig::new("http://127.0.0.1:1", ingress::Tls::Http)),
+    ] {
+        let env = Env::with_ingress(ingress).await;
+        let mut a = env.join("a", 4 << 30).await;
+        env.poll(&mut a).await;
+        let r = env
+            .req(reqwest::Method::PUT, "/apps/docs", &env.admin)
+            .header("content-type", "application/zip")
+            .body(lan_bundle())
+            .send()
+            .await
+            .unwrap();
+        let (status, msg) = error(r).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("--lan-cidr"), "{msg}");
+    }
+
+    let (caddy, url) = ingress::tests::FakeCaddy::start().await;
+    let mut cfg = ingress::IngressConfig::new(url, ingress::Tls::Http);
+    cfg.lan_ranges = vec!["192.168.50.0/24".into()];
+    cfg.sync_interval = Duration::from_millis(200);
+    let env = Env::with_ingress(Some(cfg)).await;
+    let mut a = env.join("a", 4 << 30).await;
+    a.facts.ingress = "10.0.0.5:7382".into();
+    env.poll(&mut a).await;
+    let r = env
+        .req(reqwest::Method::PUT, "/apps/docs", &env.admin)
+        .header("content-type", "application/zip")
+        .body(lan_bundle())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::ACCEPTED, "{}", r.text().await.unwrap());
+    caddy
+        .until("docs is refused off the LAN", |c| {
+            c.to_string()
+                .contains(r#""not":[{"remote_ip":{"ranges":["192.168.50.0/24"]}}]"#)
+        })
+        .await;
+    let docs = env.apps().await.into_iter().find(|a| a.name == "docs").unwrap();
+    assert_eq!(docs.access, kn_proto::state::Access::Lan);
+    let info = env.inspect("docs").await;
+    assert_eq!(info.access, kn_proto::state::Access::Lan);
+
+    // Deployed again as public, it's served to anyone.
+    let r = env.deploy(&env.admin, "docs", "docs.test", "").await;
+    assert_eq!(r.status(), StatusCode::ACCEPTED);
+    caddy
+        .until("docs is public", |c| {
+            let c = c.to_string();
+            c.contains("docs.test") && !c.contains("remote_ip")
+        })
+        .await;
+    assert_eq!(env.inspect("docs").await.access, kn_proto::state::Access::Public);
 }
 
 #[tokio::test]

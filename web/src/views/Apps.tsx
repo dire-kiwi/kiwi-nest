@@ -89,7 +89,10 @@ export function Apps() {
                             )}
                           </td>
                           <td className="small">{a.containers}</td>
-                          <td className="small">{a.domain}</td>
+                          <td className="small">
+                            {a.domain}
+                            {a.access === 'lan' && <div className="muted">LAN only</div>}
+                          </td>
                           <td>{a.nest ?? '—'}</td>
                           <td className="small">
                             <IdleTimeout secs={a.idle_timeout_secs} />

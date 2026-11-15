@@ -75,6 +75,15 @@ pub struct ServerArgs {
     /// A proxy in front of the ingress whose X-Forwarded-For is believed, as an address or CIDR range (repeatable).
     #[arg(long = "trusted-proxy", value_name = "CIDR")]
     pub trusted_proxies: Vec<String>,
+    /// The LAN's addresses, as an address or CIDR range (repeatable): LAN-only apps (`x-kiwi-nest.access: lan`) are
+    /// served only to connections from them. Leave out every proxy and tunnel connector, loopback included when
+    /// one runs on the ingress's host: its requests come from its own address.
+    #[arg(long = "lan-cidr", value_name = "CIDR")]
+    pub lan_cidrs: Vec<String>,
+    /// Who the API's domain (with the web UI) and the registry's are served to: public, or lan (only to
+    /// --lan-cidr's addresses; nodes and the CLI must then reach them from there).
+    #[arg(long, default_value = "public", value_name = "ACCESS", value_parser = ["public", "lan"])]
+    pub infra_access: String,
     /// How often the ingress's configuration is checked, so a restarted Caddy gets it back.
     #[arg(long, default_value = "10s")]
     pub ingress_sync: String,
@@ -327,6 +336,8 @@ pub fn config(args: ServerArgs) -> anyhow::Result<(kn_server::ServerConfig, Sock
         i.http_port = args.http_port;
         i.https_port = args.https_port;
         i.trusted_proxies = args.trusted_proxies;
+        i.lan_ranges = args.lan_cidrs;
+        i.infra_access = kn_proto::state::Access::parse(&args.infra_access).context("--infra-access")?;
         i.sync_interval = duration("--ingress-sync", &args.ingress_sync)?;
         if i.sync_interval.is_zero() {
             bail!("--ingress-sync must be at least 1s");
@@ -335,6 +346,8 @@ pub fn config(args: ServerArgs) -> anyhow::Result<(kn_server::ServerConfig, Sock
         cfg.ingress = Some(i);
     } else if args.api_domain.is_some() {
         bail!("--api-domain needs an --ingress");
+    } else if !args.lan_cidrs.is_empty() || args.infra_access != "public" {
+        bail!("--lan-cidr and --infra-access need an --ingress, which checks them");
     }
     if let Some(domain) = args.registry_domain {
         if cfg.ingress.is_none() {

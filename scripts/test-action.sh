@@ -41,6 +41,10 @@ expect "deploy blog-pr7 ./site --from blog --domain blog-pr7.example.com --idle-
 expect "server=https://kn.example.com token=knd_secret" "$work/calls"
 expect "url=https://blog-pr7.example.com" "$work/out"
 expect "name=blog-pr7" "$work/out"
+run env KN_COMMAND=deploy KN_IDLE_TIMEOUT= KN_BACKUPS=true KN_ACCESS=lan
+expect "deploy blog-pr7 ./site --from blog --domain blog-pr7.example.com --access lan" "$work/calls"
+if run env KN_COMMAND=deploy KN_ACCESS=private 2>"$work/err"; then echo "FAIL: deployed with a bad access"; exit 1; fi
+expect "access must be public or lan" "$work/err"
 
 # A closed pull request deletes the preview; one that was never deployed is fine too.
 mkdir -p "$work/event"

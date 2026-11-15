@@ -55,6 +55,44 @@ impl SharedMode {
     }
 }
 
+/// Who the cluster's ingress serves an app to (`x-kiwi-nest.access`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Access {
+    /// Anyone.
+    #[default]
+    Public,
+    /// Only clients connecting to the ingress from the cluster's LAN ranges (the server's `--lan-cidr`).
+    Lan,
+}
+
+impl Access {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Access::Public => "public",
+            Access::Lan => "lan",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Access> {
+        match s {
+            "public" => Some(Access::Public),
+            "lan" => Some(Access::Lan),
+            _ => None,
+        }
+    }
+
+    pub fn is_public(&self) -> bool {
+        *self == Access::Public
+    }
+}
+
+impl std::fmt::Display for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::fmt::Display for SharedMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())

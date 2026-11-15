@@ -103,6 +103,11 @@ case ${KN_BACKUPS:-false} in
   true) ;;
   *) die "backups must be true or false, not $KN_BACKUPS" ;;
 esac
+case ${KN_ACCESS:-} in
+  '') ;;
+  public | lan) args+=(--access "$KN_ACCESS") ;;
+  *) die "access must be public or lan, not $KN_ACCESS" ;;
+esac
 log "deploying $name at $domain, from $KN_APP"
 "$kn" "${args[@]}"
 scheme=https

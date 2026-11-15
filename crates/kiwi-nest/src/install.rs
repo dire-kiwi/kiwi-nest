@@ -53,6 +53,13 @@ pub struct InitArgs {
     /// A proxy in front of the ingress whose X-Forwarded-For is believed (repeatable).
     #[arg(long = "trusted-proxy", value_name = "CIDR")]
     trusted_proxies: Vec<String>,
+    /// The LAN's addresses (repeatable): LAN-only apps are served only to connections from them. Leave out every
+    /// proxy and tunnel connector, loopback included when one runs on this host.
+    #[arg(long = "lan-cidr", value_name = "CIDR")]
+    lan_cidrs: Vec<String>,
+    /// Who the API's domain (with the web UI) and the registry's are served to: public, or lan (--lan-cidr only).
+    #[arg(long, default_value = "public", value_name = "ACCESS", value_parser = ["public", "lan"])]
+    infra_access: String,
     /// The ingress's port for HTTP.
     #[arg(long, default_value_t = 80)]
     http_port: u16,
@@ -269,6 +276,12 @@ pub async fn server_init(global: &kn_cli::GlobalArgs, a: InitArgs) -> anyhow::Re
     }
     for p in &a.trusted_proxies {
         args.extend([s("--trusted-proxy"), p.clone()]);
+    }
+    for c in &a.lan_cidrs {
+        args.extend([s("--lan-cidr"), c.clone()]);
+    }
+    if a.infra_access != "public" {
+        args.extend([s("--infra-access"), a.infra_access.clone()]);
     }
     if a.http_port != 80 {
         args.extend([s("--http-port"), a.http_port.to_string()]);

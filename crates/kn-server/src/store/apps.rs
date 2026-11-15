@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use kn_proto::agent::{AppChange, AppWant, Outcome, Report, VolumeChange, VolumeWant};
 use kn_proto::api::{Accepted, ChangeStatus};
 use kn_proto::backup::Restore;
+use kn_proto::state::Access;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use super::nests;
@@ -68,6 +69,8 @@ pub struct AppRow {
     pub backups: bool,
     /// The backup it was deployed `--restore` from.
     pub restore: Option<Restore>,
+    /// Who the ingress serves it to (`x-kiwi-nest.access`).
+    pub access: Access,
 }
 
 /// A shared volume as the server records it.
@@ -87,7 +90,7 @@ pub struct VolumeRow {
 }
 
 const APP_COLUMNS: &str = "name, state, node_id, domain, generation, seq, bundle_digest, from_app, shared, \
-                           memory_bytes, keep_data, created_at, updated_at, nest, nest_via, idle_timeout_secs, backups, restore";
+                           memory_bytes, keep_data, created_at, updated_at, nest, nest_via, idle_timeout_secs, backups, restore, access";
 
 fn app_row(r: &rusqlite::Row) -> rusqlite::Result<AppRow> {
     let shared: String = r.get(8)?;
@@ -112,6 +115,7 @@ fn app_row(r: &rusqlite::Row) -> rusqlite::Result<AppRow> {
         restore: r
             .get::<_, Option<String>>(17)?
             .and_then(|s| serde_json::from_str(&s).ok()),
+        access: Access::parse(&r.get::<_, String>(18)?).unwrap_or(Access::Lan),
     })
 }
 
@@ -496,12 +500,12 @@ pub fn deploy(
     tx.execute(
         "INSERT INTO apps (name, state, node_id, domain, generation, seq, bundle_digest, from_app, shared,
                            memory_bytes, keep_data, created_at, updated_at, nest, nest_via, idle_timeout_secs,
-                           auth, backups, restore, images)
-         VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                           auth, backups, restore, images, access)
+         VALUES (?1, 'active', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT (name) DO UPDATE SET state = 'active', node_id = ?2, domain = ?3, generation = ?4, seq = ?5,
              bundle_digest = ?6, from_app = ?7, shared = ?8, memory_bytes = ?9, keep_data = 0, created_at = ?10,
              updated_at = ?11, nest = ?12, nest_via = ?13, idle_timeout_secs = ?14, auth = ?15, backups = ?16,
-             restore = ?17, images = ?18",
+             restore = ?17, images = ?18, access = ?19",
         params![
             d.name,
             node_id,
@@ -521,6 +525,7 @@ pub fn deploy(
             d.bundle.backups,
             d.restore.as_ref().map(serde_json::to_string).transpose()?,
             serde_json::to_string(&d.bundle.images)?,
+            d.bundle.access.as_str(),
         ],
     )?;
     tx.commit()?;

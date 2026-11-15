@@ -117,6 +117,10 @@ export function AppDetail({ name, logsOpen }: { name: string; logsOpen: boolean 
             </dd>
             <dt>Domain</dt>
             <dd>{s?.domain ?? i?.domain}</dd>
+            <dt>Access</dt>
+            <dd>
+              {(s?.access ?? i?.access) === 'lan' ? 'LAN only (clients on the cluster\'s LAN)' : 'public'}
+            </dd>
             <dt>Generation</dt>
             <dd>
               {s?.generation ?? i?.generation}

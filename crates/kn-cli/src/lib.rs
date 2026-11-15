@@ -27,6 +27,7 @@ use kn_proto::api::{
     WaitQuery, WhoAmI,
 };
 use kn_proto::backup::{BackupInfo, BackupQuery, BackupResult, ListQuery};
+use kn_proto::state::Access;
 
 /// The standalone node API's default address.
 pub const DEFAULT_NODE_API: &str = "http://127.0.0.1:7380";
@@ -127,6 +128,10 @@ pub enum Command {
         /// Deploy with `x-kiwi-nest.backups: false`: no scheduled backups (`backup app` still works).
         #[arg(long)]
         no_backups: bool,
+        /// Deploy with this `x-kiwi-nest.access` instead of the bundle's: `lan` serves the app only to clients on
+        /// the cluster's LAN (the server's --lan-cidr), `public` to anyone.
+        #[arg(long, value_name = "ACCESS", value_parser = ["public", "lan"])]
+        access: Option<String>,
     },
     /// List the apps.
     List {
@@ -946,15 +951,17 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
             domain,
             idle_timeout,
             no_backups,
+            access,
         } => {
             let timeout = duration("--timeout", &timeout)?;
             let overrides = kn_bundle::overrides::Overrides {
                 domain,
                 idle_timeout,
                 backups: no_backups.then_some(false),
+                access: access.as_deref().and_then(kn_bundle::manifest::Access::parse),
             };
             if node_reads_path && !overrides.is_empty() {
-                bail!("--node-reads-path can't be combined with --domain, --idle-timeout or --no-backups");
+                bail!("--node-reads-path can't be combined with --domain, --idle-timeout, --no-backups or --access");
             }
             let q = DeployQuery {
                 create_only,
@@ -1034,7 +1041,7 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                                 a.generation.to_string(),
                                 a.node.clone().unwrap_or_default(),
                                 a.nest.clone().unwrap_or_default(),
-                                a.domain.clone(),
+                                domain(a),
                                 a.updated_at.clone(),
                             ]
                         })
@@ -1051,7 +1058,7 @@ pub async fn run(global: &GlobalArgs, cmd: Command) -> anyhow::Result<()> {
                                 a.containers.clone(),
                                 a.generation.to_string(),
                                 a.port.to_string(),
-                                a.domain.clone(),
+                                domain(a),
                                 a.updated_at.clone(),
                             ]
                         })
@@ -2060,6 +2067,14 @@ fn print_table(headers: &[&str], rows: Vec<Vec<String>>) {
     }
 }
 
+/// An app's domain, marked if it's served only to the LAN.
+fn domain(a: &AppSummary) -> String {
+    match a.access {
+        Access::Public => a.domain.clone(),
+        Access::Lan => format!("{} (LAN only)", a.domain),
+    }
+}
+
 fn print_info(i: &AppInfo) {
     let idle = if i.idle_timeout_secs == 0 {
         "always on".to_string()
@@ -2087,6 +2102,11 @@ fn print_info(i: &AppInfo) {
         println!("error:       {e}");
     }
     println!("domain:      {}", i.domain);
+    match (i.access, &i.node) {
+        (Access::Public, _) => println!("access:      public"),
+        (Access::Lan, Some(_)) => println!("access:      lan (only clients on the cluster's LAN)"),
+        (Access::Lan, None) => println!("access:      lan (only a cluster's ingress checks it; this node has none)"),
+    }
     if !i.stale {
         println!(
             "routed to:   {}:{} on http://127.0.0.1:{}",
