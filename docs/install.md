@@ -65,20 +65,27 @@ sudo ./kiwi-nest-$V-$T server init \
 
 Other modes: `--ingress internal`, `--ingress certs --certs-dir /etc/kiwi-nest/certs`, `--ingress http`. Add
 `--backup-targets /etc/kiwi-nest/backup-targets.yaml` for backups (see the design's Backups; the file, and the
-files it names, must be readable by the `kiwi-nest` user, say `root:kiwi-nest` mode 0640).
+files it names, must be readable by the `kiwi-nest` user, say `root:kiwi-nest` mode 0640). If something else on
+the host has `127.0.0.1:2019` (another Caddy's admin API, say), give the ingress's Caddy another address for its
+admin API: `--caddy-admin 127.0.0.1:2029` (or `http://127.0.0.1:2029`).
 
-It checks the machine (ports 80 and 443 free, Docker for the registry), then:
+It checks the machine (ports 80 and 443 and Caddy's admin address free, Docker for the registry), then:
 
 - installs itself as a release under `/usr/local/lib/kiwi-nest`, linked from `/usr/local/bin/kiwi-nest`;
 - makes the users `kiwi-nest` (the server) and `kiwi-nest-caddy` (the ingress), and the server's state directory,
   `/var/lib/kiwi-nest-server`;
 - installs Caddy (a pinned release, downloaded and checked against the SHA-512 kiwi-nest records; `--caddy FILE`
-  uses one you have), with nothing but its admin API on loopback: the server configures the rest;
+  uses one you have), with nothing but its admin API on loopback (`/etc/kiwi-nest/caddy.json`): the server
+  configures the rest;
 - writes the units `kiwi-nest-server.service` and `kiwi-nest-caddy.service`, and the server's flags in
-  `kiwi-nest-server.service.d/host.conf`, then enables and starts them;
-- makes the first admin token and prints it, with the commands to use it. It's shown only then.
+  `kiwi-nest-server.service.d/host.conf` (with `--caddy-admin`, if it isn't the default);
+- makes the first admin token and prints it straight away, before starting anything, so a unit that fails to start
+  doesn't lose it. It's shown only then: copy it before you go on;
+- enables and starts the units, and prints the commands to use the token.
 
-Running it again rewrites the units and the drop-in from its flags, and makes no new token.
+If a unit doesn't stay up, init shows the end of its journal; fix that and run it again. Running it again rewrites
+the units and the drop-in from its flags (keeping the drop-in's `--caddy-admin` when it isn't given), and makes no
+new token: use the one the first run printed.
 
 ### Behind a tunnel, with apps only for the LAN
 
@@ -261,6 +268,10 @@ Change the flags there (any of `kiwi-nest node --help`'s, or `server --help`'s f
 your own beside it (`Environment=KIWI_NEST_LOG=debug` in `debug.conf`, say), then `systemctl daemon-reload` and
 restart the unit. Flags can't hold spaces or quotes.
 
+Caddy's boot configuration, `/etc/kiwi-nest/caddy.json`, follows the server's `--caddy-admin`: `server init`,
+`upgrade` and `rollback` write it from the drop-in. After changing `--caddy-admin` by hand, run
+`sudo kiwi-nest units` (which writes it) and restart `kiwi-nest-caddy` and then `kiwi-nest-server`.
+
 ## Where things are
 
 ```text
@@ -269,7 +280,7 @@ restart the unit. Flags can't hold spaces or quotes.
 /usr/local/bin/kiwi-nest                              -> current/kiwi-nest
 /usr/local/lib/kiwi-nest/caddy/caddy                  the ingress's Caddy
 /etc/systemd/system/kiwi-nest-{server,caddy,node}.service, and *.service.d/host.conf
-/etc/kiwi-nest/caddy.json                             Caddy's boot configuration: its admin API on loopback
+/etc/kiwi-nest/caddy.json                             Caddy's boot configuration: its admin API on loopback (--caddy-admin)
 /etc/kiwi-nest/server-ca.crt                          on nodes: the CA given to `node join --ca-cert`
 /var/lib/kiwi-nest-server/                            the server's database, bundles, registry, ingress CA
 /var/lib/kiwi-nest-caddy/                             Caddy's certificates and ACME account

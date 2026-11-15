@@ -128,6 +128,10 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
   `~/.config/kiwi-nest/clusters.json`).
 - `web/`: the web UI (React, TypeScript, Vite; no other dependencies). `src/api.ts` mirrors `kn-proto`'s types;
   `src/views/` has a file per view. It talks only to the CLI's API, sending JSON on every change.
+- `skills/kiwi-nest/`: the agent skill for deploying with kiwi-nest (`SKILL.md`, and `references/` for the bundle
+  format, CI and moving apps over), linked from `~/.claude/skills/kiwi-nest` and `~/.claude-personal/skills/kiwi-nest`
+  to this checkout at `~/personal/kiwi-nest`. It describes the user's clusters (`dire`, `home`) as well as the CLI.
+  When a change adds or alters a CLI command, a flag or a bundle rule, update the skill too.
 
 ## Conventions
 

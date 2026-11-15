@@ -183,7 +183,7 @@ impl IngressConfig {
 }
 
 /// `HOST:PORT` from an `http://HOST:PORT` URL.
-fn admin_listen(url: &str) -> anyhow::Result<String> {
+pub fn admin_listen(url: &str) -> anyhow::Result<String> {
     let rest = url
         .trim_end_matches('/')
         .strip_prefix("http://")
