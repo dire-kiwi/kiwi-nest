@@ -21,6 +21,9 @@ use crate::cluster::{IngressMode, absolute, host_name};
 /// Where `server init` and `node join` keep files they're given, such as a CA certificate.
 const ETC: &str = "/etc/kiwi-nest";
 
+/// Caddy's admin API, unless the server's drop-in says otherwise (as `server --caddy-admin`'s default).
+const DEFAULT_CADDY_ADMIN: &str = "http://127.0.0.1:2019";
+
 #[derive(clap::Args)]
 pub struct InitArgs {
     /// The domain the ingress publishes the server's API at, such as kn.example.com: nodes and the CLI reach the
@@ -56,6 +59,10 @@ pub struct InitArgs {
     /// The ingress's port for HTTPS.
     #[arg(long, default_value_t = 443)]
     https_port: u16,
+    /// Caddy's admin API, on loopback, as http://HOST:PORT or HOST:PORT, for a host where something else has
+    /// 127.0.0.1:2019 [default: the one this host's drop-in has from an earlier run, else http://127.0.0.1:2019].
+    #[arg(long, value_name = "URL")]
+    caddy_admin: Option<String>,
     /// Where the server keeps its database and bundles.
     #[arg(long, default_value = "/var/lib/kiwi-nest-server")]
     state_dir: PathBuf,
@@ -225,6 +232,13 @@ pub async fn server_init(global: &kn_cli::GlobalArgs, a: InitArgs) -> anyhow::Re
     checks::root("kiwi-nest server init")?;
     checks::systemd()?;
     let state_dir = absolute(a.state_dir.clone())?;
+    let sd = Systemd::default();
+    let caddy_admin = match &a.caddy_admin {
+        Some(u) if u.contains("://") => u.clone(),
+        Some(addr) => format!("http://{addr}"),
+        None => caddy_admin(&sd.host_args(SERVER)),
+    };
+    let admin_listen = kn_server::ingress::admin_listen(&caddy_admin).context("--caddy-admin")?;
 
     // The server's flags, checked as the server will check them.
     let mut args = vec![
@@ -262,6 +276,9 @@ pub async fn server_init(global: &kn_cli::GlobalArgs, a: InitArgs) -> anyhow::Re
     if a.https_port != 443 {
         args.extend([s("--https-port"), a.https_port.to_string()]);
     }
+    if caddy_admin != DEFAULT_CADDY_ADMIN {
+        args.extend([s("--caddy-admin"), caddy_admin.clone()]);
+    }
     let parsed = crate::Cli::try_parse_from(
         ["kiwi-nest", "server"]
             .into_iter()
@@ -291,12 +308,25 @@ pub async fn server_init(global: &kn_cli::GlobalArgs, a: InitArgs) -> anyhow::Re
     {
         problems.push(format!("the registry runs in Docker: {e}"));
     }
-    if !systemd::is_active(CADDY) {
+    let caddy_up = systemd::is_active(CADDY);
+    if !caddy_up {
         for port in [a.http_port, a.https_port] {
             if let Err(e) = checks::port_free(port) {
                 problems.push(e.to_string());
             }
         }
+    }
+    // A running Caddy holds its admin address, unless this moves it.
+    let running_admin = std::fs::read_to_string(systemd::CADDY_CONFIG)
+        .ok()
+        .and_then(|t| systemd::caddy_boot_admin(&t));
+    if (!caddy_up || running_admin.as_ref() != Some(&admin_listen))
+        && let Err(e) = checks::addr_free(
+            &admin_listen,
+            "the ingress's Caddy has its admin API there (--caddy-admin)",
+        )
+    {
+        problems.push(e.to_string());
     }
     if !problems.is_empty() {
         bail!("this machine isn't ready:\n  - {}", problems.join("\n  - "));
@@ -331,13 +361,8 @@ pub async fn server_init(global: &kn_cli::GlobalArgs, a: InitArgs) -> anyhow::Re
         kn_install::caddy::version(caddy_bin)?,
         caddy_bin.display()
     );
-    kn_install::layout::write_atomic(
-        Path::new(systemd::CADDY_CONFIG),
-        systemd::caddy_boot_config("127.0.0.1:2019").as_bytes(),
-        0o644,
-    )?;
+    write_caddy_config(&admin_listen)?;
 
-    let sd = Systemd::default();
     for u in [SERVER, CADDY] {
         sd.write_unit(u)?;
     }
@@ -348,11 +373,6 @@ pub async fn server_init(global: &kn_cli::GlobalArgs, a: InitArgs) -> anyhow::Re
         sd.dropin_path(SERVER, HOST_DROPIN).display()
     );
 
-    let token = kn_server::first_admin_token(&state_dir).await?;
-    chown_r(&state_dir, systemd::SERVER_USER)?;
-
-    systemd::systemctl(&["daemon-reload"])?;
-    systemd::systemctl(&["enable", CADDY, SERVER])?;
     let url = format!("https://{}", a.api_domain);
     let url = if a.ingress == IngressMode::Http {
         format!("http://{}", a.api_domain)
@@ -361,9 +381,14 @@ pub async fn server_init(global: &kn_cli::GlobalArgs, a: InitArgs) -> anyhow::Re
     } else {
         url
     };
-    if a.no_start {
-        println!("enabled {CADDY} and {SERVER}; start them with `systemctl start {CADDY} {SERVER}`");
-    } else {
+    let token = token_then_start(&state_dir, &mut std::io::stdout(), async {
+        chown_r(&state_dir, systemd::SERVER_USER)?;
+        systemd::systemctl(&["daemon-reload"])?;
+        systemd::systemctl(&["enable", CADDY, SERVER])?;
+        if a.no_start {
+            println!("enabled {CADDY} and {SERVER}; start them with `systemctl start {CADDY} {SERVER}`");
+            return Ok(());
+        }
         restart(CADDY).await?;
         restart(SERVER).await?;
         wait_for_version(
@@ -374,7 +399,9 @@ pub async fn server_init(global: &kn_cli::GlobalArgs, a: InitArgs) -> anyhow::Re
         )
         .await?;
         println!("the server is up, and the ingress publishes it at {url}");
-    }
+        Ok(())
+    })
+    .await?;
     let ca = state_dir.join("ingress-ca.crt");
     if a.ingress == IngressMode::Internal && !a.no_start {
         for _ in 0..60 {
@@ -389,21 +416,53 @@ pub async fn server_init(global: &kn_cli::GlobalArgs, a: InitArgs) -> anyhow::Re
     } else {
         String::new()
     };
-    match token {
-        Some(t) => {
-            println!("\nThe first admin token, shown only now: keep it safe.\n\n  {t}\n");
-            println!(
-                "On your workstation (copy {} there first, if it's internal):",
-                ca.display()
-            );
-            println!("  kiwi-nest cluster add NAME {url} --token {t}{ca_flag}");
-        }
-        None => println!("\nThe server has admin tokens already, so no new one was made."),
+    if let Some(t) = token {
+        println!(
+            "\nOn your workstation (copy {} there first, if it's internal):",
+            ca.display()
+        );
+        println!("  kiwi-nest cluster add NAME {url} --token {t}{ca_flag}");
     }
     println!("\nThen, for each node: `kiwi-nest token create join`, and on the node, as root:");
     println!("  kiwi-nest node join {url} --token JOIN_TOKEN{ca_flag}");
     let _ = global;
     Ok(())
+}
+
+/// Makes the first admin token (unless the server has one) and shows it at once, then runs `start` (starting the
+/// units). Shown before anything else can fail, the token isn't lost when a unit doesn't start: a second run of
+/// `server init` doesn't make another, since the server has one.
+async fn token_then_start(
+    state_dir: &Path,
+    out: &mut impl std::io::Write,
+    start: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<Option<String>> {
+    let token = kn_server::first_admin_token(state_dir).await?;
+    match &token {
+        Some(t) => writeln!(out, "\nThe first admin token, shown only now: keep it safe.\n\n  {t}\n")?,
+        None => writeln!(out, "the server has admin tokens already, so no new one was made")?,
+    }
+    out.flush()?;
+    start.await?;
+    Ok(token)
+}
+
+/// Caddy's admin API, from the server's flags.
+fn caddy_admin(server_args: &[String]) -> String {
+    systemd::flag(server_args, "--caddy-admin")
+        .unwrap_or(DEFAULT_CADDY_ADMIN)
+        .to_string()
+}
+
+/// Writes Caddy's boot configuration, its admin API at `listen` (`HOST:PORT`). Returns whether it changed.
+fn write_caddy_config(listen: &str) -> anyhow::Result<bool> {
+    let path = Path::new(systemd::CADDY_CONFIG);
+    let text = systemd::caddy_boot_config(listen);
+    if std::fs::read_to_string(path).ok().as_deref() == Some(text.as_str()) {
+        return Ok(false);
+    }
+    kn_install::layout::write_atomic(path, text.as_bytes(), 0o644)?;
+    Ok(true)
 }
 
 impl IngressMode {
@@ -652,6 +711,23 @@ pub fn units() -> anyhow::Result<()> {
             }
         }
     }
+    // Caddy's boot configuration follows the server's --caddy-admin, as `server init` wrote it.
+    if server {
+        let admin = caddy_admin(&sd.host_args(SERVER));
+        match kn_server::ingress::admin_listen(&admin) {
+            Ok(listen) if write_caddy_config(&listen)? => {
+                println!(
+                    "{} now has Caddy's admin API at {listen}, which {CADDY} uses from its next start",
+                    systemd::CADDY_CONFIG
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "warning: {SERVER}'s --caddy-admin: {e:#}; {} stays as it was",
+                systemd::CADDY_CONFIG
+            ),
+        }
+    }
     if !changed.is_empty() {
         println!("updated {}", changed.join(", "));
     }
@@ -871,4 +947,39 @@ pub async fn rollback(a: RollbackArgs) -> anyhow::Result<()> {
         println!("the node runs {target}; its apps kept running");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn init_shows_the_first_admin_token_even_if_the_units_dont_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let err = token_then_start(dir.path(), &mut out, async {
+            bail!("{CADDY} didn't stay up: bind: address already in use")
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("didn't stay up"), "{err}");
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("The first admin token"), "{out}");
+        assert!(out.contains("  kna_"), "{out}");
+
+        // Run again (after fixing what failed), it makes no other token, so the one shown is the way in.
+        let mut again = Vec::new();
+        let token = token_then_start(dir.path(), &mut again, async { Ok(()) })
+            .await
+            .unwrap();
+        assert_eq!(token, None);
+        assert!(String::from_utf8(again).unwrap().contains("no new one was made"));
+    }
+
+    #[test]
+    fn caddys_admin_api_comes_from_the_servers_flags() {
+        assert_eq!(caddy_admin(&[]), DEFAULT_CADDY_ADMIN);
+        let args = ["--ingress", "acme", "--caddy-admin", "http://127.0.0.1:2029"].map(String::from);
+        assert_eq!(caddy_admin(&args), "http://127.0.0.1:2029");
+    }
 }
