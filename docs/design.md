@@ -26,7 +26,7 @@ Goals:
 - App data in btrfs subvolumes. Previews start from instant snapshots. Backups use `btrfs send`, or tar for targets
   that ask for it.
 - Scale to zero: an idle app is stopped, and a request starts it again.
-- One ingress per cluster, handling TLS, basic auth and routing a domain to its node.
+- One ingress per cluster, handling TLS, basic auth, LAN-only apps and routing a domain to its node.
 - A private image registry for the cluster.
 - Install, joining nodes, and upgrades without SSH to every node.
 - A web UI, and a GitHub Action for previews.
@@ -111,6 +111,7 @@ x-kiwi-nest:
   arch: arm64             # optional placement constraints
   node_labels: { disk: ssd }
   backups: false          # optional: skip scheduled backups (previews)
+  access: lan             # optional: public (the default), or lan: only clients on the cluster's LAN
 
 services:
   web:
@@ -139,7 +140,8 @@ volumes:
     `env_file`.
   - `x-kiwi-nest` needs `domain`, `service` and `port`. `idle_timeout` defaults to `0` (always on), so forgetting it
     never stops a production app; previews set it. `backups` defaults to `true`, so scheduled backups include an
-    app unless it says otherwise; previews can. Unknown keys are refused, which catches typos.
+    app unless it says otherwise; previews can. `access` is `public` (the default) or `lan` (see the ingress).
+    Unknown keys are refused, which catches typos.
   - A shared volume is mounted into every service, or only those its `services` list names (which must exist). Its
     target can't be where the service already mounts something, or where another shared volume lands.
   - Every problem in a bundle is reported at once, each with where it is (`services.web.ports: …`).
@@ -395,7 +397,8 @@ command with what it acts on and who asked), on a thread of its own, in WAL
   headers (bar hop-by-hop ones) and body are passed on unchanged, Host included; HTTP/1.1 upgrades such as WebSockets
   become a byte stream between the client and the app. Unknown hosts get 404.
 - **Forwarding headers.** `X-Forwarded-For`, `-Proto` and `-Host` are passed on only from requests that carried the
-  ingress token, since the ingress sets them (Caddy replaces a client's unless it comes from a `--trusted-proxy`).
+  ingress token, since the ingress sets them (Caddy replaces a client's unless it comes from a `--trusted-proxy`,
+  and then appends to it, taking the client to be the rightmost address that isn't a trusted proxy).
   On any other request they're replaced with what the gateway saw: the peer's address, `http`, and the Host.
   `Forwarded`, `X-Forwarded-Port` and `X-Real-IP`, which Caddy would pass on as the client sent them, are removed
   by both the ingress and the gateway.
@@ -472,6 +475,25 @@ command with what it acts on and who asked), on a thread of its own, in WAL
   server kept them gets them from its stored bundle when the server starts; one whose bundle can't be read isn't
   routed until it's deployed again, rather than routed without its auth. The `Authorization` header is passed on to
   the app.
+- **LAN-only apps** (`x-kiwi-nest.access: lan`) are served only to clients on the cluster's LAN, the server's
+  `--lan-cidr` ranges (repeatable, such as `192.168.50.0/24`), so one ingress can serve public apps through a tunnel
+  and private ones on the LAN whatever name a request uses (D33). Before such a domain's own route, the ingress has
+  one that matches the TCP peer (Caddy's `remote_ip`) outside the ranges and answers exactly as for an unknown host
+  (404, the same body), so a refused request never meets basic auth, never reaches a node or wakes the app, and
+  can't tell the name is served from the answer. Over HTTPS the handshake can still tell: with per-name
+  certificates (`acme`) a served name has one and an unknown name doesn't, while a wildcard covers both.
+  - The peer is a connection's address, which no header changes: a request through a proxy or tunnel comes from the
+    proxy, and a Cloudflare tunnel's connector on the ingress's host from `127.0.0.1`. So the ranges must leave out
+    every proxy and connector, loopback included when one runs on the ingress's host. A `--trusted-proxy` inside a
+    LAN range is refused when the server starts, since the requests it brings in would look local.
+  - A LAN-only deploy is refused by a server without an ingress or without `--lan-cidr`. If the ranges are removed
+    later, LAN-only apps are refused to everyone (an access the server doesn't know, likewise), never served to
+    anyone. A standalone node has no ingress and ignores the setting.
+  - `--infra-access lan` does the same for the API's domain (and the web UI on it) and the registry's, so nodes, the
+    CLI and `docker push` must then reach them from the LAN (a GitHub-hosted runner can't). The server's own
+    listener on loopback is unaffected.
+  - `inspect`, `list` and the web UI show which apps are LAN-only; `deploy --access` and the Action's `access`
+    input change it (D32).
 - **The server's own API** is published at `--api-domain` (such as `kn.example.com`), proxied to the server's
   listener (`--listen`, loopback by default), so nodes and the CLI reach it over HTTPS. No app may use that domain.
 - **TLS modes**, per cluster (`--ingress MODE`), all with HTTP on `--http-port` (80) and HTTPS on `--https-port`
@@ -484,7 +506,9 @@ command with what it acts on and who asked), on a thread of its own, in WAL
     holding a certificate chain and its key, readable by Caddy. Caddy never asks a CA. The server reloads Caddy
     when a file in the folder changes, so a renewed certificate is picked up within one interval.
   - `http`: plain HTTP behind another proxy or a Cloudflare tunnel you run. `--trusted-proxy CIDR` (in any mode)
-    names the proxies whose `X-Forwarded-For` Caddy believes.
+    names the proxies whose `X-Forwarded-For` Caddy believes, read from the right (`trusted_proxies_strict`), so
+    the client an app is told of is the address the last trusted proxy saw, not one the client wrote. It has no
+    say in which requests a LAN-only app is served (that's the peer).
 
   A wildcard DNS record and certificate per cluster is the expected setup.
 
@@ -820,7 +844,8 @@ The how-to is [install.md](install.md). Every command here runs as root on the m
 - **The GitHub Action** (`action.yml`, running `scripts/action.sh`) installs the CLI of the server's version (asked
   at `/version`, so it's never older; or `version:`), checked against the release's `SHA256SUMS`, then on a pull
   request deploys `APP-prNUMBER` `--from` production, so it's in production's nest and starts from a snapshot of
-  its data, with `--domain` (the input, with `{name}` and `{number}`), `--idle-timeout 10m` and `--no-backups`; when
+  its data, with `--domain` (the input, with `{name}` and `{number}`), `--idle-timeout 10m`, `--no-backups` and
+  `--access` if the `access` input is set; when
   the pull request closes it deletes the preview, and one that was never deployed isn't an error. Its token is a
   deploy token for the previews' pattern with production as `--from`, so it can't change production. The deploy
   flags rewrite the bundle's `x-kiwi-nest` as the CLI packs it (`kn-bundle`'s `overrides`, D32), so the server and
@@ -946,7 +971,8 @@ for macOS.
 | D29 | Units are the same on every host and run `kiwi-nest ROLE $KIWI_NEST_ARGS`; a host's flags are in a drop-in that upgrades never touch. | Upgrades can then write the units from the new release without losing anything a host set, and a person can see and change a host's flags in one file. Environment variables for each flag would need every flag to have one; a configuration file of kiwi-nest's own would be a second way to say what the flags say. |
 | D30 | The server rolls its release out one node at a time, waits for each to come back running it, and halts at the first failure. | A release that breaks on a node breaks one node, not the cluster, and each node's gateway restart is on its own. Upgrading every node at once would be faster but would take every app's gateway down together and spread a bad release everywhere; an admin pushing to each node would need SSH to every node. |
 | D31 | The CLI sends its version in its `User-Agent`, and the server refuses an older one with `426`; `/version` answers anyone. | An older CLI might misread answers or send what the server now reads differently; refusing it with which version to install is clearer than a confusing failure. Nothing new needs adding to old CLIs, which already sent `kiwi-nest/VERSION`, and `/version` lets the Action install the server's own version. |
-| D32 | A preview's domain, idle timeout and backups are set at deploy time by the CLI rewriting the bundle's `x-kiwi-nest` (`deploy --domain`), not by the server. | One bundle serves production and every preview, the server and nodes check an ordinary bundle, and nothing new crosses the agent link. Overrides kept by the server would have to reach the node's generated Compose file and be recorded with every generation; templating the bundle would bring back the interpolation D12 refuses. |
+| D32 | A preview's domain, idle timeout, backups and access are set at deploy time by the CLI rewriting the bundle's `x-kiwi-nest` (`deploy --domain`), not by the server. | One bundle serves production and every preview, the server and nodes check an ordinary bundle, and nothing new crosses the agent link. Overrides kept by the server would have to reach the node's generated Compose file and be recorded with every generation; templating the bundle would bring back the interpolation D12 refuses. |
+| D33 | A LAN-only app is refused at the ingress by the TCP peer's address (`remote_ip`) against `--lan-cidr`, with the unknown host's 404, before basic auth. | No header can change the peer, so a tunnel's or proxy's requests are refused whatever `X-Forwarded-For` or `CF-Connecting-IP` they carry. Caddy's `client_ip` reads those headers from trusted proxies, and one wrong proxy setting would let a forged one in; it would also tie the check to Cloudflare. Refusing before basic auth and the gateway means a refused request wakes nothing and learns nothing; a 403 would say the name is served. DNS alone (no public record) stops nobody who sends the name through the tunnel. |
 
 ## Build plan
 
@@ -1149,6 +1175,11 @@ flowchart LR
   nodes reach the server's API over HTTPS, so node tokens never cross the LAN in the clear. Someone who can sniff
   the LAN can read an ingress token, and with it skip the ingress's basic auth for that node's apps; the firewall
   still keeps them off the gateway. WireGuard between the VMs can be added later without changing kiwi-nest.
+- **LAN-only apps trust the LAN's addresses.** Anything whose connections come from `--lan-cidr` is served, so a
+  proxy on the LAN that passes public traffic on (other than a `--trusted-proxy`, which is refused) makes that
+  traffic look local, and so does a range that takes in a tunnel's connector. A LAN client reaching the ingress over
+  IPv6 needs its prefix listed too. The ranges are the administrator's to get right; the docs say what to leave
+  out.
 - **Caddy's admin API.** It listens on loopback without authentication, as Caddy's does, so anything running on the
   server's host can read the configuration (the nodes' ingress tokens, the bcrypt hashes) and change it. The
   server's host is expected to run nothing else untrusted. Caddy keeps the configuration only in memory.

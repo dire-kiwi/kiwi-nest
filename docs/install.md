@@ -80,6 +80,35 @@ It checks the machine (ports 80 and 443 free, Docker for the registry), then:
 
 Running it again rewrites the units and the drop-in from its flags, and makes no new token.
 
+### Behind a tunnel, with apps only for the LAN
+
+One ingress can serve public apps through a proxy or tunnel and keep others for the LAN. Say a Cloudflare tunnel's
+connector (`cloudflared`) runs on the server's host and sends `*.example.com` to `https://localhost:443`, and the
+LAN is `192.168.50.0/24`:
+
+```sh
+sudo ./kiwi-nest-$V-$T server init \
+  --api-domain kn.example.com --ingress certs --certs-dir /etc/kiwi-nest/certs \
+  --trusted-proxy 127.0.0.1 \
+  --lan-cidr 192.168.50.0/24 \
+  --infra-access lan                            # optional: the API, web UI and registry for the LAN only too
+```
+
+- `--trusted-proxy 127.0.0.1` names the connector as a proxy, so apps are told the visitor's address (Caddy reads
+  `X-Forwarded-For` from the right, past the trusted proxies), not the connector's.
+- `--lan-cidr` (repeatable) is where the LAN's clients connect from. An app whose bundle says
+  `x-kiwi-nest.access: lan` (or deployed with `--access lan`) is served only to connections from there; anything
+  else gets the ingress's 404 for an unknown host, before basic auth, and the app isn't woken. The check is the
+  connection's own address, never a header, so every request through the tunnel (which comes from the connector, on
+  127.0.0.1) is refused, whatever name or headers it uses.
+- So leave every proxy and connector out of the ranges, loopback included when one runs on the ingress's host. A
+  `--trusted-proxy` inside a LAN range is refused. If LAN clients may reach the ingress over IPv6, list their
+  prefix too. The machines that connect to the API (nodes, the CLI on the server's host) must use its LAN address,
+  not `localhost`, when `--infra-access lan`.
+
+On a running server, the same flags go in its drop-in (see [each host's own settings](#each-hosts-own-settings)).
+`kiwi-nest inspect APP` and `list` show an app's access; the web UI marks LAN-only apps.
+
 ## Nodes
 
 **btrfs.** A spare disk is simplest:
@@ -175,8 +204,8 @@ jobs:
 
 The Action installs the CLI of the server's version (or `version:`), checked against the release's `SHA256SUMS`,
 and deploys `blog-prNUMBER` with the domain given, `idle_timeout: 10m` and no scheduled backups (`idle-timeout:` and
-`backups:` change that; they're applied with `kiwi-nest deploy --domain --idle-timeout --no-backups`, which rewrite
-the bundle's `x-kiwi-nest` as it's uploaded). The first deploy snapshots production's volumes; later pushes keep
+`backups:` change that, and `access: lan` makes previews LAN-only; they're applied with `kiwi-nest deploy --domain
+--idle-timeout --no-backups --access`, which rewrite the bundle's `x-kiwi-nest` as it's uploaded). The first deploy snapshots production's volumes; later pushes keep
 the preview's data. `ca-cert:` takes the internal CA's PEM, from a secret.
 
 ## Upgrades and rollbacks
