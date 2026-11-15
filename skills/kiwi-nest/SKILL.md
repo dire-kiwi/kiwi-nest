@@ -43,7 +43,8 @@ workstation may not have `home`: it's in `ivan`'s CLI on VM 207 (`ssh ivan@192.1
 `vm203` joins in PRO-9's step 2: check `kiwi-nest --cluster dire node list` before relying on it. Both nodes are
 amd64: build images for `linux/amd64`.
 
-**Who can reach which names** (decided by DNS, so pick the domain by who should reach the app):
+**Who can reach which names.** DNS decides which names Cloudflare forwards, and `access: lan` makes the ingress
+itself refuse anyone off the LAN (below), so a private app needs both a LAN-only name and `access: lan`:
 
 | Names | Reached from | Through |
 |---|---|---|
@@ -55,10 +56,13 @@ amd64: build images for `linux/amd64`.
 One subdomain level per wildcard: `a.dire.nz` or `a.code.dire.nz`, not `a.b.dire.nz`. A LAN-only app on a
 `*.dire.nz` name needs its own DNS-only record; otherwise use `*.code.dire.nz`.
 
-<!-- TODO(KN-19): once KN-19 lands and dire runs a release with it, document `x-kiwi-nest.access: lan` (Caddy
-refuses requests whose TCP peer isn't on `--lan-cidr 192.168.50.0/24`, so tunnel traffic gets 403) and
-`deploy --access lan`, and use it for code, its previews and any private app. Until then privacy is by name
-only, and the bundle checker refuses an `access` key. -->
+**LAN-only apps: `x-kiwi-nest.access: lan`** (or `deploy --access lan`). Both clusters run 0.2.0 with
+`--lan-cidr 192.168.50.0/24`. The ingress serves such an app only to connections from that range. It checks the
+TCP peer, never a header, so everything through the tunnel (which arrives from cloudflared on 127.0.0.1) gets the
+ingress's 404 for an unknown host, whatever name or `X-Forwarded-For` it sends. A refused request never meets basic
+auth and never wakes the app. Use it for `code`, its previews and any private app, on a LAN-only name too. The
+API, the web UI and the registry are LAN-only the same way (`--infra-access lan`). A 404 from the LAN on a LAN-only
+app means the name isn't routed; from outside, it's the refusal.
 
 **The move from site-deploy is in progress** (PRO-9). Until its switches happen, the tunnel still sends
 `*.dire.nz` to site-deploy, and `*.code.dire.nz` still resolves to VM 203's site-deploy, so an app on kiwi-nest
@@ -79,7 +83,7 @@ All take `--cluster NAME` (omitted below). `kiwi-nest COMMAND --help` has every 
 | `inspect NAME` | Node, nest and why it's there, status, error, domain, routing, idle timeout, open requests, Compose project, volumes, and each container's state |
 | `deploy NAME PATH` | PATH is the bundle directory (the CLI zips it) or a ZIP. Creates the app or **replaces it in place**, keeping its volumes. Waits until the node reports it (`--timeout`, 15m). `--create-only` refuses if NAME exists |
 | `deploy NAME PATH --from APP` | A preview: on NAME's first deploy, each named volume it shares with APP starts as an instant snapshot of APP's. Later deploys keep NAME's data and say `--from` was ignored, so CI can pass it every time |
-| `deploy … --domain D --idle-timeout 10m --no-backups` | Override the bundle's `domain`, `idle_timeout` and `backups`, such as for a preview made from production's bundle |
+| `deploy … --domain D --idle-timeout 10m --no-backups --access lan` | Override the bundle's `domain`, `idle_timeout`, `backups` and `access` (`lan` or `public`), such as for a preview made from production's bundle |
 | `deploy … --node NODE` | Pick the node of a **new** nest (prefer `node_labels` in the bundle). A nest never moves |
 | `deploy … --queue` | Save it even if the node is offline (refused otherwise); applied when the node is back |
 | `logs NAME` | `-n/--tail N`, `-f/--follow`, `-t/--timestamps`, `-s/--service S` |
@@ -117,8 +121,8 @@ starts it), `suspended` (only `resume` starts it), `failed` (its last deploy fai
    - **No `$VAR`**: write `$$` for a literal `$`. Settings go into a file in the bundle (an `env_file` the release
      script writes), never into the repo if they're secret.
 3. **Protect it unless it's meant to be public.** `*.dire.nz` is the internet. For a private app, preview or anything
-   showing data, check with the user, then add `auth` (bcrypt hashes, checked by Caddy before a request reaches the
-   node or wakes the app), or use a `*.code.dire.nz` name.
+   showing data, check with the user, then make it LAN-only (`access: lan` and a `*.code.dire.nz` name), or add
+   `auth` (bcrypt hashes, checked by Caddy before a request reaches the node or wakes the app), or both.
 4. **Build the bundle in a scratch directory** (`$TMPDIR`), not in the user's repo, with `compose.yaml` at its
    root. No ZIP step is needed: `deploy` takes the directory.
 5. **Deploy:** `kiwi-nest --cluster dire deploy NAME ./bundle`. It prints the node and nest, then the result. A
@@ -153,7 +157,7 @@ deploy of the same name).
   Snapshots share disk space until either side writes.
 - **It's production's data in a preview**, running unreviewed code: accounts, password hashes, API tokens and the
   app's own secrets come along, and so does anything the app does by itself (schedules, emails, webhooks). Keep
-  previews behind `auth` or on a LAN-only name, turn such jobs off for previews (an environment setting in the
+  previews behind `auth` or LAN-only (`--access lan` on a LAN-only name), turn such jobs off for previews (an environment setting in the
   preview's bundle), and give the preview its own signing keys if the app keeps them in its data.
 - To refresh a preview's data, delete it (which removes its data) and deploy again with `--from`. Deleting the
   preview never touches production's volumes.
@@ -193,9 +197,11 @@ Read `references/from-site-deploy.md`: what changes in the bundle, the scripts a
 ## Don't
 
 - Don't deploy real apps to `home`, or try out a kiwi-nest release on `dire`: releases go to `home` first.
-- Don't run `server init` again on VM 201 with 0.1.1 (what it runs now): that release puts Caddy's admin port back
-  to 2019, which site-deploy's Caddy holds, and breaks the ingress. Releases after 0.1.1 keep the drop-in's
-  `--caddy-admin http://127.0.0.1:2029` (or take `--caddy-admin`) (KN-21). Upgrades (`sudo kiwi-nest upgrade`) are
+- Don't run `server init` on VM 201 with 0.1.1: that release puts Caddy's admin port back to 2019, which
+  site-deploy's Caddy holds, and breaks the ingress. 0.2.0 (what it runs now) keeps the drop-in's
+  `--caddy-admin http://127.0.0.1:2029` (or takes `--caddy-admin`) (KN-21). Upgrades (`sudo kiwi-nest upgrade`) are
   fine.
+- Don't add 127.0.0.1 (or any proxy's address) to `--lan-cidr`: cloudflared runs on 201, so its requests would
+  count as the LAN's.
 - Don't print or commit tokens, and don't make admin tokens for CI: use deploy tokens.
 - Don't change Caddy's configuration by hand: the server replaces it.

@@ -76,7 +76,7 @@ appears on a command line. Other things worth copying from docs-deploy:
 
 kiwi-nest's repository is a GitHub Action (`action.yml`, `scripts/action.sh`). On a pull request event it installs
 the CLI of the server's version, then deploys `APP-prNUMBER` `--from APP` with `--domain`, `--idle-timeout` and
-`--no-backups`, or deletes the preview (and its data) once the pull request is closed. It reads `.number` and
+`--no-backups` (and `--access` if given), or deletes the preview (and its data) once the pull request is closed. It reads `.number` and
 `.action` from the event, so it also works under kiwicd.
 
 ```yaml
@@ -90,23 +90,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # build the bundle into ./bundle here, unless the repository is the bundle
-      - uses: dire-kiwi/kiwi-nest@v0.1.1      # a release's tag
+      - uses: dire-kiwi/kiwi-nest@v0.2.0      # a release's tag
         with:
           server: https://kn.dire.nz
           token: ${{ secrets.KIWI_NEST_PREVIEW_TOKEN }}   # --pattern 'code-pr*' --from code
           app: code
           domain: "pr{number}.code.dire.nz"
+          access: lan                         # only the LAN, whatever name a request uses
           bundle: ./bundle
 ```
 
 Inputs: `server`, `token`, `app` (required); `domain` (needed to deploy; `{name}` is the preview's name, `{number}`
 the pull request's); `bundle` (default `.`); `name` (default `APP-prNUMBER`); `idle-timeout` (default `10m`, empty
-keeps the bundle's); `backups` (default `false`); `ca-cert`; `version` (default the server's); `command` (`deploy`
+keeps the bundle's); `backups` (default `false`); `access` (`lan` or `public`, from 0.2.0; empty keeps the
+bundle's); `ca-cert`; `version` (default the server's); `command` (`deploy`
 or `delete`, default from the event); `repository`. Outputs: `name`, `url`.
 
 The preview's bundle is usually production's, built from the pull request's code. If it carries
 `node_labels`, they must match production's node (a preview always goes to production's nest), and keep previews
-behind `auth` or on a LAN-only name: they hold a copy of production's data.
+behind `auth` or LAN-only (`access: lan`): they hold a copy of production's data.
 
 ## Pushing images from CI
 

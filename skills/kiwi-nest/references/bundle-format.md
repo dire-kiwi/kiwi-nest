@@ -35,10 +35,7 @@ Required, at the top level of `compose.yaml`. Unknown keys are refused, which ca
 | `arch` | no | `amd64` or `arm64`, for placement. |
 | `node_labels` | no | Labels the node must have, such as `{ vm: "201" }`. Applied when the app's nest is placed, and checked for every member joining it. Quote the values. |
 | `backups` | no | `false` leaves the app out of scheduled backups (`backup app` still works). Default `true`. `deploy --no-backups` sets it. |
-
-<!-- TODO(KN-19): document `access: lan` (refuse requests that don't come from the LAN, `--lan-cidr` on the
-server) once KN-19 has landed and the dire cluster runs a release with it. Until then the checker refuses an
-`access` key. -->
+| `access` | no | `public` (the default) or `lan`. With `lan`, the ingress serves the app only to connections from the server's `--lan-cidr` (`192.168.50.0/24` on `dire` and `home`), matched on the TCP peer, never a header. Anyone else, including everything through the Cloudflare tunnel, gets the ingress's 404 for an unknown host, before basic auth, and the app isn't woken. A server without `--lan-cidr` refuses the deploy. `deploy --access lan\|public` overrides it. |
 
 Generate a hash with `htpasswd -nbB USER PASSWORD` (apache-tools; the part after `:`), or
 `docker run --rm caddy:2 caddy hash-password --plaintext PASSWORD`. Don't put the password in the bundle or the repo.
@@ -234,6 +231,25 @@ services:
 ```
 
 (The hash is an example; generate a real one.)
+
+### 4b. LAN only
+
+```yaml
+x-kiwi-nest:
+  domain: notes.code.dire.nz      # a LAN-only name (DNS-only record)
+  service: web
+  port: 80
+  access: lan                     # and the ingress refuses anyone off 192.168.50.0/24
+  node_labels: { vm: "203" }
+
+services:
+  web:
+    image: nginx:alpine
+    volumes: [ "./public:/usr/share/nginx/html:ro" ]
+```
+
+From outside the LAN (the tunnel included) it answers as if nothing were served there. Add `auth` too if not
+everyone on the LAN should see it.
 
 ### 5. A dependencies image from the cluster's registry
 
