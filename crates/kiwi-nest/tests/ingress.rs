@@ -16,6 +16,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// An HTTPS client for the ingress at `https`, trusting its CA, with the test's domains resolved to it.
 fn client(ca: &Path, https: u16) -> reqwest::Client {
+    client_from(ca, https, [127, 0, 0, 1].into())
+}
+
+/// [`client`], connecting from `local` (such as 127.0.0.2, which Linux puts on loopback with the rest of
+/// 127.0.0.0/8), so the ingress sees a peer of that address.
+fn client_from(ca: &Path, https: u16, local: std::net::IpAddr) -> reqwest::Client {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let pem = std::fs::read(ca).unwrap();
     let addr: SocketAddr = ([127, 0, 0, 1], https).into();
@@ -23,6 +29,7 @@ fn client(ca: &Path, https: u16) -> reqwest::Client {
         .tls_certs_merge(reqwest::Certificate::from_pem_bundle(&pem).unwrap())
         .resolve("wake.localhost", addr)
         .resolve("kn.localhost", addr)
+        .local_address(local)
         .timeout(Duration::from_secs(120))
         .build()
         .unwrap()
@@ -261,5 +268,115 @@ fn the_web_ui_works_through_the_ingress_from_its_own_origin_only() {
         .block_on(from(&format!("https://wake.localhost:{https}"), "same-site").send())
         .unwrap();
     assert_eq!(r.status(), 403);
+    drop(caddy);
+}
+
+/// A LAN-only app, and the API with `--infra-access lan`, through the ingress: served to a peer in `--lan-cidr`,
+/// and to anyone else answered as an unknown host, without waking the app, whatever forwarding headers the request
+/// carries, even from a trusted proxy (whose `X-Forwarded-For` Caddy believes). 127.0.0.1 stands for the LAN and
+/// 127.0.0.2 for a tunnel's connector.
+#[test]
+fn lan_only_apps_are_refused_to_peers_off_the_lan_whatever_their_headers_say() {
+    if !docker_and_btrfs() {
+        return;
+    }
+    let Some(bin) = caddy_bin() else { return };
+    let caddy = Caddy::start(bin);
+    let (http, https) = (free_port(), free_port());
+    let mut server = Server::start_with(&[
+        "--ingress",
+        "internal",
+        "--caddy-admin",
+        &format!("http://127.0.0.1:{}", caddy.admin),
+        "--api-domain",
+        "kn.localhost",
+        "--http-port",
+        &http.to_string(),
+        "--https-port",
+        &https.to_string(),
+        "--ingress-sync",
+        "1s",
+        // The CLI and the node reach kn.localhost from loopback, which may be ::1.
+        "--lan-cidr",
+        "127.0.0.1",
+        "--lan-cidr",
+        "::1",
+        "--trusted-proxy",
+        "127.0.0.2",
+        "--infra-access",
+        "lan",
+    ]);
+    let ca = server.dir.path().join("server/ingress-ca.crt");
+    wait_for("the ingress CA is saved", Duration::from_secs(30), || ca.exists());
+    server.url = format!("https://kn.localhost:{https}");
+    server.ca_cert = Some(ca.clone());
+    server.ok(&["node", "list"]);
+    let prefix = random_prefix();
+    let _a = ClusterNode::join_with(
+        &server,
+        "a",
+        &format!("{prefix}a-"),
+        &["--ingress-listen", "127.0.0.1:0"],
+    );
+    server.wait_online("a", true);
+
+    let bundle = tempfile::tempdir().unwrap();
+    write_python_bundle(bundle.path(), "wake.localhost", "3s", ", access: lan");
+    let bundle = bundle.path().to_str().unwrap().to_string();
+    server.ok(&["deploy", "wake", &bundle]);
+    let info = server.ok(&["inspect", "wake"]);
+    assert!(info.contains("access:      lan"), "{info}");
+    wait_for("wake is idle", Duration::from_secs(60), || {
+        status(&server, "wake") == "idle"
+    });
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _in_runtime = rt.enter();
+    let lan = client(&ca, https);
+    let outside = client_from(&ca, https, [127, 0, 0, 2].into());
+    let url = format!("https://wake.localhost:{https}/");
+    let get = |c: &reqwest::Client, url: &str, headers: &[(&str, &str)]| {
+        let mut req = c.get(url);
+        for (k, v) in headers {
+            req = req.header(*k, *v);
+        }
+        let resp = rt.block_on(req.send()).unwrap();
+        let code = resp.status().as_u16();
+        (code, rt.block_on(resp.text()).unwrap_or_default())
+    };
+
+    // Off the LAN: the unknown host's answer, whatever the request says about where it came from, and the app
+    // isn't woken (the request never reached the node).
+    let refused = (404, "nothing is served at this address\n".to_string());
+    for headers in [
+        &[][..],
+        &[("x-forwarded-for", "127.0.0.1")][..],
+        &[("x-forwarded-for", "127.0.0.1, 127.0.0.2")][..],
+        &[("cf-connecting-ip", "127.0.0.1"), ("x-real-ip", "127.0.0.1")][..],
+        &[("forwarded", "for=127.0.0.1")][..],
+    ] {
+        assert_eq!(get(&outside, &url, headers), refused, "{headers:?}");
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(status(&server, "wake"), "idle");
+
+    // The API and the web UI on its domain are LAN-only too; the CLI and the node, on the LAN, still reach it.
+    let api = format!("https://kn.localhost:{https}{}/version", kn_proto::API_PREFIX);
+    assert_eq!(get(&outside, &api, &[]), refused);
+    assert_eq!(get(&outside, &format!("https://kn.localhost:{https}/"), &[]), refused);
+    assert_eq!(get(&lan, &api, &[]).0, 200);
+
+    // From the LAN: the app wakes and answers.
+    assert_eq!(get(&lan, &url, &[]), (200, "hello".to_string()));
+    assert_eq!(status(&server, "wake"), "running");
+
+    // Deployed again with `--access public`, it's served to anyone.
+    server.ok(&["deploy", "wake", &bundle, "--access", "public"]);
+    let info = server.ok(&["inspect", "wake"]);
+    assert!(info.contains("access:      public"), "{info}");
+    wait_for("wake is public", Duration::from_secs(60), || {
+        rt.block_on(outside.get(&url).send())
+            .is_ok_and(|r| r.status().as_u16() == 200)
+    });
     drop(caddy);
 }
