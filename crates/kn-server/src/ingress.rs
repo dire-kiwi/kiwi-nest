@@ -701,6 +701,12 @@ impl Ingress {
                                 r.domain
                             ));
                         }
+                        if r.access == Access::Lan && self.cfg.lan_ranges.is_empty() {
+                            warnings.push(format!(
+                                "`{}` is refused to everyone: it's LAN-only, and the server has no --lan-cidr",
+                                r.domain
+                            ));
+                        }
                     }
                     for w in warnings.iter().filter(|w| !warned.contains(w)) {
                         tracing::warn!("{w}");
