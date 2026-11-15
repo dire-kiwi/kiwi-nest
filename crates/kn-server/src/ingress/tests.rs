@@ -24,6 +24,14 @@ fn route(domain: &str, upstream: &str, auth: bool) -> Route {
         } else {
             vec![]
         },
+        access: Access::Public,
+    }
+}
+
+fn lan(domain: &str, upstream: &str, auth: bool) -> Route {
+    Route {
+        access: Access::Lan,
+        ..route(domain, upstream, auth)
     }
 }
 
@@ -230,6 +238,11 @@ fn plain_http_mode() {
         server(&config)["trusted_proxies"],
         json!({ "source": "static", "ranges": ["10.0.0.0/8", "192.168.1.1"] })
     );
+    // The client is the first untrusted address from the right, not whatever the client put first.
+    assert_eq!(server(&config)["trusted_proxies_strict"], 1);
+    let untrusting = generate(&cfg(Tls::Http), &[]);
+    assert!(server(&untrusting).get("trusted_proxies").is_none());
+    assert!(server(&untrusting).get("trusted_proxies_strict").is_none());
     // Auth is checked the same way.
     assert_eq!(handlers(&config, "blog.example.com")[0]["handler"], "authentication");
 }
@@ -274,6 +287,128 @@ fn the_configuration_is_checked() {
         ca: Some("letsencrypt".into())
     }));
     assert!(!bad(&|c| c.trusted_proxies = vec!["fd00::/8".into(), "10.1.2.3".into()]));
+    assert!(bad(&|c| c.lan_ranges = vec!["192.168.50.0/24".into(), "lan".into()]));
+    assert!(bad(&|c| c.lan_ranges = vec!["192.168.50.0/33".into()]));
+    assert!(!bad(
+        &|c| c.lan_ranges = vec!["192.168.50.0/24".into(), "fd00::/8".into()]
+    ));
+    // --infra-access lan needs ranges.
+    assert!(bad(&|c| c.infra_access = Access::Lan));
+    assert!(!bad(&|c| {
+        c.infra_access = Access::Lan;
+        c.lan_ranges = vec!["192.168.50.0/24".into()];
+    }));
+    // A trusted proxy brings in other people's requests, so it can't be inside the LAN's ranges.
+    let both = |proxy: &str, lan: &str| {
+        let mut c = cfg(Tls::Http);
+        c.trusted_proxies = vec![proxy.into()];
+        c.lan_ranges = vec![lan.into()];
+        c.validate().map_err(|e| e.to_string())
+    };
+    for (proxy, lan) in [
+        ("192.168.50.7", "192.168.50.0/24"),
+        ("192.168.0.0/16", "192.168.50.0/24"),
+        ("127.0.0.1", "127.0.0.0/8"),
+        ("0.0.0.0/0", "10.0.0.0/8"),
+        ("fd00::1", "fd00::/8"),
+        ("::/0", "fd00::/8"),
+    ] {
+        let err = both(proxy, lan).expect_err(&format!("{proxy} in {lan}"));
+        assert!(err.contains("inside the LAN range"), "{err}");
+    }
+    for (proxy, lan) in [
+        ("127.0.0.1", "192.168.50.0/24"),
+        ("192.168.51.1", "192.168.50.0/24"),
+        ("10.0.0.0/8", "11.0.0.0/8"),
+        ("::1", "127.0.0.0/8"),
+        ("0.0.0.0/0", "fd00::/8"),
+    ] {
+        assert!(both(proxy, lan).is_ok(), "{proxy} and {lan}");
+    }
+}
+
+#[test]
+fn lan_only_domains_are_refused_to_peers_off_the_lan_before_anything_else() {
+    let mut c = cfg(Tls::Folder("/etc/kn/certs".into()));
+    c.lan_ranges = vec!["192.168.50.0/24".into(), "fd00::/8".into()];
+    c.trusted_proxies = vec!["127.0.0.1".into()];
+    let config = generate(
+        &c,
+        &[
+            lan("docs.example.com", "10.0.0.5:7382", true),
+            route("blog.example.com", "10.0.0.5:7382", false),
+        ],
+    );
+    let routes = server(&config)["routes"].as_array().unwrap();
+    let catch_all = routes.last().unwrap();
+    let at = |host: &str| -> Vec<&Value> { routes.iter().filter(|r| r["match"][0]["host"][0] == host).collect() };
+
+    // The refusal comes first: it matches the TCP peer (`remote_ip`, never a header) outside the ranges, and
+    // answers exactly as for an unknown host, so a refused request never meets basic auth or reaches the node.
+    let docs = at("docs.example.com");
+    assert_eq!(docs.len(), 2);
+    assert_eq!(
+        docs[0]["match"],
+        json!([{
+            "host": ["docs.example.com"],
+            "not": [{ "remote_ip": { "ranges": ["192.168.50.0/24", "fd00::/8"] } }],
+        }])
+    );
+    assert_eq!(docs[0]["handle"], catch_all["handle"]);
+    assert_eq!(docs[0]["terminal"], true);
+    assert!(!docs[0].to_string().contains("client_ip"));
+    // Then the app's own route, as for any app.
+    assert_eq!(docs[1]["match"], json!([{ "host": ["docs.example.com"] }]));
+    assert_eq!(docs[1]["handle"][0]["handler"], "authentication");
+    assert_eq!(docs[1]["handle"][1]["handler"], "reverse_proxy");
+    let i = |r: &Value| routes.iter().position(|x| x == r).unwrap();
+    assert_eq!(i(docs[1]), i(docs[0]) + 1);
+
+    // A public app, and the API (public by default), have no refusal.
+    assert_eq!(at("blog.example.com").len(), 1);
+    assert_eq!(at("kn.example.com").len(), 1);
+
+    // Without ranges (the server's --lan-cidr removed after it was deployed), a LAN-only app fails closed.
+    let mut none = cfg(Tls::Http);
+    none.lan_ranges.clear();
+    let config = generate(&none, &[lan("docs.example.com", "10.0.0.5:7382", false)]);
+    let routes = server(&config)["routes"].as_array().unwrap();
+    let docs: Vec<&Value> = routes
+        .iter()
+        .filter(|r| r["match"][0]["host"][0] == "docs.example.com")
+        .collect();
+    assert_eq!(docs[0]["match"], json!([{ "host": ["docs.example.com"] }]));
+    assert_eq!(docs[0]["handle"][0]["status_code"], 404);
+}
+
+#[test]
+fn infra_access_lan_refuses_the_api_and_the_registry_off_the_lan() {
+    let mut c = cfg(Tls::Internal);
+    c.lan_ranges = vec!["192.168.50.0/24".into()];
+    c.infra_access = Access::Lan;
+    c.registry = Some(RegistryRoute {
+        domain: "registry.example.com".into(),
+        upstream: "127.0.0.1:5000".parse().unwrap(),
+    });
+    let config = generate(&c, &[route("blog.example.com", "10.0.0.5:7382", false)]);
+    let routes = server(&config)["routes"].as_array().unwrap();
+    for host in ["kn.example.com", "registry.example.com"] {
+        let at: Vec<&Value> = routes.iter().filter(|r| r["match"][0]["host"][0] == host).collect();
+        assert_eq!(at.len(), 2, "{host}");
+        assert_eq!(
+            at[0]["match"][0]["not"],
+            json!([{ "remote_ip": { "ranges": ["192.168.50.0/24"] } }]),
+            "{host}"
+        );
+        assert_eq!(at[0]["handle"][0]["status_code"], 404, "{host}");
+        assert!(at[1]["match"][0].get("not").is_none(), "{host}");
+    }
+    // Apps keep their own access.
+    let blog: Vec<&Value> = routes
+        .iter()
+        .filter(|r| r["match"][0]["host"][0] == "blog.example.com")
+        .collect();
+    assert_eq!(blog.len(), 1);
 }
 
 #[test]
@@ -312,6 +447,13 @@ fn routes_come_from_active_apps_on_nodes_the_ingress_can_reach() {
         )
         .unwrap();
     };
+    let access = |name: &str, access: &str| {
+        c.execute(
+            "UPDATE apps SET access = ?2 WHERE name = ?1",
+            rusqlite::params![name, access],
+        )
+        .unwrap();
+    };
     let auth = json!([{ "user": "preview", "hash": HASH }]).to_string();
     app("blog", "active", 1, Some("blog.test"), Some("[]"));
     app("blog-pr1", "active", 1, Some("blog-pr1.test"), Some(&auth));
@@ -321,6 +463,11 @@ fn routes_come_from_active_apps_on_nodes_the_ingress_can_reach() {
     app("shop", "active", 2, Some("shop.test"), Some("[]"));
     app("notes", "active", 3, Some("notes.test"), Some("[]"));
     app("maps", "active", 4, Some("maps.test"), Some("[]"));
+    app("docs", "active", 1, Some("docs.test"), Some("[]"));
+    app("wiki", "active", 1, Some("wiki.test"), Some("[]"));
+    access("docs", "lan");
+    // A value this server doesn't know fails closed.
+    access("wiki", "staff");
     let (routes, warnings) = super::routes(&c).unwrap();
     assert_eq!(
         routes,
@@ -333,12 +480,28 @@ fn routes_come_from_active_apps_on_nodes_the_ingress_can_reach() {
                     user: "preview".into(),
                     hash: HASH.into()
                 }],
+                access: Access::Public,
             },
             Route {
                 domain: "blog.test".into(),
                 upstream: "10.0.0.5:7382".parse().unwrap(),
                 token: "kni_a".into(),
                 auth: vec![],
+                access: Access::Public,
+            },
+            Route {
+                domain: "docs.test".into(),
+                upstream: "10.0.0.5:7382".parse().unwrap(),
+                token: "kni_a".into(),
+                auth: vec![],
+                access: Access::Lan,
+            },
+            Route {
+                domain: "wiki.test".into(),
+                upstream: "10.0.0.5:7382".parse().unwrap(),
+                token: "kni_a".into(),
+                auth: vec![],
+                access: Access::Lan,
             },
         ]
     );

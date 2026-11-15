@@ -8,6 +8,9 @@ export const PREFIX = '/v1'
 
 export type AppStatus = 'deploying' | 'running' | 'idle' | 'suspended' | 'failed'
 export type SharedMode = 'snapshot' | 'ro' | 'rw'
+
+/** Who the cluster's ingress serves an app to: anyone, or only clients on its LAN. */
+export type Access = 'public' | 'lan'
 export type TokenKind = 'admin' | 'deploy' | 'join' | 'node'
 export type BackupKind = 'app' | 'volume' | 'server'
 export type BackupFormat = 'send' | 'tar'
@@ -52,6 +55,7 @@ export interface AppSummary {
   updated_at: string
   error?: string
   idle_timeout_secs: number
+  access?: Access
   last_request_at?: string
   open_requests: number
   space?: Record<string, Space>
@@ -84,6 +88,7 @@ export interface AppInfo {
   container_port: number
   port: number
   idle_timeout_secs: number
+  access?: Access
   project: string
   bundle_digest: string
   volumes: string[]

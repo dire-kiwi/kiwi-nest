@@ -69,7 +69,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::NodeFacts;
-use crate::state::{AppStatus, SharedMode};
+use crate::state::{Access, AppStatus, SharedMode};
 
 /// `GET /version`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +231,9 @@ pub struct AppSummary {
     /// Seconds without requests before the app is stopped; 0 means always on.
     #[serde(default)]
     pub idle_timeout_secs: u64,
+    /// Who the ingress serves it to.
+    #[serde(default)]
+    pub access: Access,
     /// When a request through the gateway last began or ended (RFC 3339); none since the node started, if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_request_at: Option<String>,
@@ -268,6 +271,9 @@ pub struct AppInfo {
     pub port: u16,
     /// Seconds without requests before the app is stopped; 0 means always on.
     pub idle_timeout_secs: u64,
+    /// Who the ingress serves it to.
+    #[serde(default)]
+    pub access: Access,
     /// The Compose project the app runs as.
     pub project: String,
     /// The bundle's digest, `sha256:…`.

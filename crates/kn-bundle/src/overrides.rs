@@ -1,5 +1,6 @@
 //! Changing a bundle's `x-kiwi-nest` when it's deployed (`kiwi-nest deploy --domain …`), so a pull request's
-//! preview can be deployed from production's bundle: its own domain, idling out, and no scheduled backups.
+//! preview can be deployed from production's bundle: its own domain, idling out, no scheduled backups, and served
+//! only on the LAN if it should be.
 //!
 //! The CLI rewrites `compose.yaml` before it packs the bundle, so the server and the node see an ordinary bundle
 //! and check it as they check any other. The file is written again from its parsed form, with merge keys (`<<`)
@@ -9,7 +10,7 @@ use std::path::Path;
 
 use serde_yaml_ng::Value;
 
-use crate::manifest::{is_valid_domain, parse_duration};
+use crate::manifest::{Access, is_valid_domain, parse_duration};
 use crate::{BundleError, COMPOSE_FILE, Limits};
 
 /// What to change in `x-kiwi-nest`.
@@ -18,6 +19,7 @@ pub struct Overrides {
     pub domain: Option<String>,
     pub idle_timeout: Option<String>,
     pub backups: Option<bool>,
+    pub access: Option<Access>,
 }
 
 impl Overrides {
@@ -54,6 +56,9 @@ pub fn apply(yaml: &str, o: &Overrides) -> Result<String, String> {
     }
     if let Some(b) = o.backups {
         m.insert("backups".into(), Value::Bool(b));
+    }
+    if let Some(a) = o.access {
+        m.insert("access".into(), Value::String(a.as_str().into()));
     }
     let body = serde_yaml_ng::to_string(&doc).map_err(|e| format!("writing compose.yaml: {e}"))?;
     Ok(format!("# x-kiwi-nest changed by `kiwi-nest deploy`.\n{body}"))
@@ -102,6 +107,7 @@ services:
             domain: Some("blog-pr12.example.com".into()),
             idle_timeout: Some("10m".into()),
             backups: Some(false),
+            access: Some(Access::Lan),
         };
         let out = apply(BUNDLE, &o).unwrap();
         let v: Value = serde_yaml_ng::from_str(&out).unwrap();
@@ -109,6 +115,8 @@ services:
         assert_eq!(m["domain"].as_str(), Some("blog-pr12.example.com"));
         assert_eq!(m["idle_timeout"].as_str(), Some("10m"));
         assert_eq!(m["backups"].as_bool(), Some(false));
+        assert_eq!(m["access"].as_str(), Some("lan"));
+        crate::manifest::parse(m).expect("the bundle checker reads what was written");
         assert_eq!(m["port"].as_u64(), Some(8080));
         // Merge keys are applied, and `$$` stays as it was.
         assert_eq!(v["services"]["web"]["mem_limit"].as_str(), Some("128m"));
@@ -125,6 +133,7 @@ services:
         .unwrap();
         let v: Value = serde_yaml_ng::from_str(&only).unwrap();
         assert!(v["x-kiwi-nest"].get("idle_timeout").is_none());
+        assert!(v["x-kiwi-nest"].get("access").is_none());
     }
 
     #[test]

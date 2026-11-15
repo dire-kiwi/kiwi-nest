@@ -172,6 +172,8 @@ pub struct CheckedApp {
     pub backups: bool,
     /// Its basic-auth users, checked by the ingress.
     pub auth: Vec<crate::ingress::BasicAuth>,
+    /// Who the ingress serves it to.
+    pub access: kn_proto::state::Access,
     /// Its services' images, as the bundle names them.
     pub images: Vec<String>,
 }
@@ -242,6 +244,7 @@ pub fn check_app(zip: &Path, scratch: &Path, limits: &Limits) -> Result<CheckedA
                 hash: a.hash.clone(),
             })
             .collect(),
+        access: m.access,
         images,
     })
 }

@@ -42,7 +42,7 @@ use kn_bundle::manifest::{Arch, is_valid_app_name};
 use kn_bundle::{BundleError, CheckOptions, CheckedBundle, Problems};
 use kn_proto::api::{AppInfo, AppSummary, ContainerInfo, KeptImage, LogsQuery, PruneReport, SharedMountInfo};
 use kn_proto::backup::Restore;
-use kn_proto::state::{AppStatus, SharedMode};
+use kn_proto::state::{Access, AppStatus, SharedMode};
 use serde::{Deserialize, Serialize};
 use tokio::process::Child;
 use tokio::sync::{Mutex as AsyncMutex, OwnedRwLockReadGuard, RwLock, mpsc, oneshot};
@@ -72,6 +72,9 @@ pub struct AppRecord {
     pub service: String,
     pub container_port: u16,
     pub idle_timeout_secs: u64,
+    /// `x-kiwi-nest.access`: only the cluster's ingress acts on it.
+    #[serde(default, skip_serializing_if = "Access::is_public")]
+    pub access: Access,
     pub bundle_digest: String,
     pub services: Vec<String>,
     pub volumes: Vec<String>,
@@ -794,6 +797,7 @@ impl Apps {
                     last_request_at: last.map(rfc3339),
                     open_requests: open,
                     idle_timeout_secs: r.idle_timeout_secs,
+                    access: r.access,
                     error: r.error,
                     name: r.name,
                     status: r.status,
@@ -1279,6 +1283,7 @@ impl App<'_> {
                 service: m.service.clone(),
                 container_port: m.port,
                 idle_timeout_secs: m.idle_timeout_secs,
+                access: m.access,
                 bundle_digest: staged.digest.clone(),
                 services: staged.bundle.services.iter().map(|s| s.name.clone()).collect(),
                 volumes,
@@ -1962,6 +1967,7 @@ impl App<'_> {
             container_port: r.container_port,
             port: r.port,
             idle_timeout_secs: r.idle_timeout_secs,
+            access: r.access,
             project: r.project,
             bundle_digest: r.bundle_digest,
             volumes: r.volumes,

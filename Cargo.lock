@@ -1074,6 +1074,7 @@ name = "kn-bundle"
 version = "0.1.1"
 dependencies = [
  "hex",
+ "kn-proto",
  "libc",
  "serde",
  "serde_yaml_ng",

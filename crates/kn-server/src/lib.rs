@@ -249,6 +249,11 @@ impl Server {
         (r.domain == domain).then_some("the image registry's domain")
     }
 
+    /// Whether the ingress can serve apps only to the LAN: there is one, and it knows the LAN's ranges.
+    pub fn serves_lan(&self) -> bool {
+        self.ingress.as_ref().is_some_and(|i| !i.config().lan_ranges.is_empty())
+    }
+
     /// Whether a node is online, for the store's transactions.
     pub fn online(&self) -> impl Fn(u64) -> bool + Send + 'static {
         let hub = self.hub.clone();

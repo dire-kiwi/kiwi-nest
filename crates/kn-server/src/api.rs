@@ -21,7 +21,7 @@ use kn_proto::api::{
     WhoAmI,
 };
 use kn_proto::backup::{BackupInfo, BackupQuery, BackupResult, Kind as BackupKind, ListQuery, Restore};
-use kn_proto::state::AppStatus;
+use kn_proto::state::{Access, AppStatus};
 use serde::de::DeserializeOwned;
 
 use crate::Server;
@@ -227,6 +227,7 @@ impl View {
         info.pending = self.pending();
         info.nest = self.app.nest.clone();
         info.placement = self.placement();
+        info.access = self.app.access;
     }
 
     fn summary(&self) -> AppSummary {
@@ -242,6 +243,7 @@ impl View {
             generation: r.map_or(0, |r| r.generation),
             error: r.and_then(|r| r.error.clone()),
             idle_timeout_secs: self.app.idle_timeout_secs,
+            access: self.app.access,
             last_request_at: r.and_then(|r| r.last_request_at).map(rfc3339),
             // What it last reported; an offline node's requests can't be known.
             open_requests: r.filter(|_| self.online).map_or(0, |r| r.open_requests),
@@ -274,6 +276,7 @@ impl View {
             container_port: 0,
             port: r.map_or(0, |r| r.port),
             idle_timeout_secs: self.app.idle_timeout_secs,
+            access: self.app.access,
             project: String::new(),
             bundle_digest: r
                 .map(|r| r.bundle_digest.clone())
@@ -429,6 +432,13 @@ async fn deploy(
             "domain `{}` is {reserved}, so no app can use it",
             checked.domain
         )));
+    }
+    if checked.access == Access::Lan && !s.serves_lan() {
+        return Err(Error::BadRequest(
+            "the bundle says `access: lan`, but this cluster can't tell its LAN apart: its server needs an \
+             --ingress and the LAN's ranges as --lan-cidr"
+                .into(),
+        ));
     }
     if !caller.is_admin() && !checked.shared_rw.is_empty() {
         return Err(Error::Forbidden(format!(

@@ -57,6 +57,12 @@ inputs:
     description: Whether scheduled backups include the preview.
     required: false
     default: "false"
+  access:
+    description: >-
+      The preview's `x-kiwi-nest.access`: `lan` serves it only to clients on the cluster's LAN (the server's
+      `--lan-cidr`), `public` to anyone; empty keeps the bundle's.
+    required: false
+    default: ""
   ca-cert:
     description: A CA certificate (PEM) to trust for the server, such as the ingress's internal CA.
     required: false
@@ -97,6 +103,7 @@ runs:
         KN_NAME: ${{ inputs.name }}
         KN_IDLE_TIMEOUT: ${{ inputs.idle-timeout }}
         KN_BACKUPS: ${{ inputs.backups }}
+        KN_ACCESS: ${{ inputs.access }}
         KN_CA_CERT: ${{ inputs.ca-cert }}
         KN_VERSION: ${{ inputs.version }}
         KN_COMMAND: ${{ inputs.command }}

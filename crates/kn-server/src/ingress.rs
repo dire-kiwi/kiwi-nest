@@ -14,6 +14,11 @@
 //! - **Basic auth** is checked by Caddy, with bcrypt and its cache of verified credentials, so a request without
 //!   them never reaches a node, nor wakes an app. An app whose users aren't known (deployed before the server kept
 //!   them, and its bundle unreadable) isn't routed at all, rather than routed without its auth.
+//! - **LAN-only apps** (`x-kiwi-nest.access: lan`), and with `infra_access` the API and the registry, are served
+//!   only to connections whose peer is in `lan_ranges`. The check is the TCP peer (Caddy's `remote_ip`), never a
+//!   header, so a request through a tunnel or proxy (whose peer is the proxy) is refused whatever `X-Forwarded-For`
+//!   it carries. It comes before basic auth, and the answer is the unknown host's 404, so a refused request never
+//!   reaches a node, wakes an app, or learns that the name is served. Without ranges, they're refused to everyone.
 //! - **The server's own API** is published at `api_domain`, proxied to the server's listener, so nodes and the CLI
 //!   reach it over HTTPS.
 //! - **TLS**, per cluster ([`Tls`]): automatic ACME; Caddy's internal CA (whose root the server writes to
@@ -25,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use kn_proto::agent::INGRESS_HEADER;
+use kn_proto::state::Access;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -90,6 +96,10 @@ pub struct IngressConfig {
     pub api_domain: Option<String>,
     /// Proxies in front of the ingress (CIDR ranges) whose `X-Forwarded-For` is believed.
     pub trusted_proxies: Vec<String>,
+    /// The LAN's ranges: the peers LAN-only domains are served to.
+    pub lan_ranges: Vec<String>,
+    /// Who the API's domain (and the web UI on it) and the registry's are served to.
+    pub infra_access: Access,
     /// How often the configuration is checked, so a restarted Caddy gets it back.
     pub sync_interval: Duration,
     /// The image registry, if the server runs one.
@@ -113,6 +123,8 @@ impl IngressConfig {
             https_port: 443,
             api_domain: None,
             trusted_proxies: Vec::new(),
+            lan_ranges: Vec::new(),
+            infra_access: Access::Public,
             sync_interval: Duration::from_secs(10),
             registry: None,
         }
@@ -130,9 +142,26 @@ impl IngressConfig {
             anyhow::bail!("the ingress needs two different ports for HTTP and HTTPS");
         }
         for r in &self.trusted_proxies {
-            if !valid_cidr(r) {
+            if cidr(r).is_none() {
                 anyhow::bail!("a trusted proxy is an IP address or a CIDR range, such as 10.0.0.0/8, not {r:?}");
             }
+        }
+        for r in &self.lan_ranges {
+            if cidr(r).is_none() {
+                anyhow::bail!("a LAN range is an IP address or a CIDR range, such as 192.168.1.0/24, not {r:?}");
+            }
+        }
+        // A proxy brings in other people's requests: from one inside the LAN's ranges, they'd look local.
+        for p in &self.trusted_proxies {
+            if let Some(l) = self.lan_ranges.iter().find(|l| overlap(p, l)) {
+                anyhow::bail!(
+                    "the trusted proxy {p} is inside the LAN range {l}, so the requests it brings in would be served \
+                     as the LAN's; leave the proxy out of --lan-cidr"
+                );
+            }
+        }
+        if self.infra_access == Access::Lan && self.lan_ranges.is_empty() {
+            anyhow::bail!("--infra-access lan needs the LAN's ranges, as --lan-cidr");
         }
         match &self.tls {
             Tls::Folder(dir) if !dir.is_absolute() => {
@@ -169,14 +198,36 @@ fn admin_listen(url: &str) -> anyhow::Result<String> {
     Ok(rest.to_string())
 }
 
-fn valid_cidr(r: &str) -> bool {
+/// An address or CIDR range as its first address and prefix length (an address alone is all of its bits).
+fn cidr(r: &str) -> Option<(IpAddr, u8)> {
     let (ip, bits) = match r.split_once('/') {
         Some((ip, bits)) => (ip, Some(bits)),
         None => (r, None),
     };
-    let Ok(ip) = ip.parse::<IpAddr>() else { return false };
+    let ip = ip.parse::<IpAddr>().ok()?;
     let max = if ip.is_ipv4() { 32 } else { 128 };
-    bits.is_none_or(|b| b.parse::<u8>().is_ok_and(|b| b <= max))
+    let bits = match bits {
+        Some(b) => b.parse::<u8>().ok().filter(|b| *b <= max)?,
+        None => max,
+    };
+    Some((ip, bits))
+}
+
+/// Whether two ranges share an address (then one holds the other: CIDR ranges never partly overlap).
+fn overlap(a: &str, b: &str) -> bool {
+    let bits = |ip: IpAddr| match ip {
+        IpAddr::V4(v) => (u128::from(u32::from(v)), 32),
+        IpAddr::V6(v) => (u128::from(v), 128),
+    };
+    let (Some((a, alen)), Some((b, blen))) = (cidr(a), cidr(b)) else {
+        return false;
+    };
+    let ((x, width), (y, other)) = (bits(a), bits(b));
+    if width != other {
+        return false;
+    }
+    let shift = width - u32::from(alen.min(blen));
+    shift == 128 || x >> shift == y >> shift
 }
 
 /// One basic-auth user of an app: a name and a bcrypt hash (checked by the bundle checker).
@@ -193,6 +244,7 @@ pub struct Route {
     pub upstream: SocketAddr,
     pub token: String,
     pub auth: Vec<BasicAuth>,
+    pub access: Access,
 }
 
 /// The address to reach a listener at: an unspecified address (`0.0.0.0`, `::`) becomes loopback.
@@ -208,18 +260,36 @@ pub fn reachable(addr: SocketAddr) -> SocketAddr {
 /// that can't be routed are left out, so Caddy answers 404 for them, and returned as warnings.
 pub fn routes(c: &Connection) -> Result<(Vec<Route>, Vec<String>)> {
     let mut st = c.prepare(
-        "SELECT a.name, a.domain, a.auth, n.name, n.ingress_token, json_extract(n.facts, '$.ingress')
+        "SELECT a.name, a.domain, a.auth, n.name, n.ingress_token, json_extract(n.facts, '$.ingress'), a.access
          FROM apps a JOIN nodes n ON n.id = a.node_id
          WHERE a.state = 'active' AND a.domain IS NOT NULL AND n.forgotten_at IS NULL
          ORDER BY a.domain",
     )?;
-    type Row = (String, String, Option<String>, String, Option<String>, Option<String>);
+    type Row = (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    );
     let rows = st.query_map([], |r| -> rusqlite::Result<Row> {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        Ok((
+            r.get(0)?,
+            r.get(1)?,
+            r.get(2)?,
+            r.get(3)?,
+            r.get(4)?,
+            r.get(5)?,
+            r.get(6)?,
+        ))
     })?;
     let (mut routes, mut warnings) = (Vec::new(), Vec::new());
     for row in rows {
-        let (app, domain, auth, node, token, ingress) = row?;
+        let (app, domain, auth, node, token, ingress, access) = row?;
+        // Anything but `public` is served to the LAN only, so a value this server doesn't know fails closed.
+        let access = Access::parse(&access).unwrap_or(Access::Lan);
         let auth: Option<Vec<BasicAuth>> = match auth.map(|a| serde_json::from_str(&a)) {
             Some(Ok(a)) => Some(a),
             Some(Err(_)) | None => None,
@@ -258,6 +328,7 @@ pub fn routes(c: &Connection) -> Result<(Vec<Route>, Vec<String>)> {
             upstream,
             token,
             auth,
+            access,
         });
     }
     Ok((routes, warnings))
@@ -305,6 +376,9 @@ pub fn forbidden(
 pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, routes: &[Route]) -> Value {
     let mut handlers = Vec::new();
     if let Some(domain) = &cfg.api_domain {
+        if cfg.infra_access == Access::Lan {
+            handlers.push(off_lan(cfg, domain));
+        }
         handlers.push(json!({
             "match": [{ "host": [domain] }],
             "handle": [{
@@ -318,6 +392,9 @@ pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, ro
         }));
     }
     if let Some(reg) = &cfg.registry {
+        if cfg.infra_access == Access::Lan {
+            handlers.push(off_lan(cfg, &reg.domain));
+        }
         handlers.push(registry_route(reg, api));
     }
     for r in routes {
@@ -326,6 +403,9 @@ pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, ro
             || forbidden(cfg, r.upstream, admin_listen, api).is_some()
         {
             continue;
+        }
+        if r.access == Access::Lan {
+            handlers.push(off_lan(cfg, &r.domain));
         }
         let mut handle = Vec::new();
         if !r.auth.is_empty() {
@@ -363,17 +443,7 @@ pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, ro
             "terminal": true,
         }));
     }
-    handlers.push(json!({
-        "handle": [{
-            "handler": "static_response",
-            "status_code": 404,
-            "headers": {
-                "Content-Type": ["text/plain; charset=utf-8"],
-                "Cache-Control": ["no-store"],
-            },
-            "body": UNKNOWN_HOST,
-        }],
-    }));
+    handlers.push(json!({ "handle": [unknown_host()] }));
 
     let tls = cfg.tls != Tls::Http;
     let mut server = json!({
@@ -382,6 +452,9 @@ pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, ro
     });
     if !cfg.trusted_proxies.is_empty() {
         server["trusted_proxies"] = json!({ "source": "static", "ranges": cfg.trusted_proxies });
+        // The client is the first address from the right that isn't a trusted proxy: the leftmost is whatever the
+        // client wrote.
+        server["trusted_proxies_strict"] = json!(1);
     }
     let mut apps = json!({});
     match &cfg.tls {
@@ -427,6 +500,30 @@ pub fn caddy_config(cfg: &IngressConfig, admin_listen: &str, api: SocketAddr, ro
         },
         "apps": apps,
     })
+}
+
+/// The answer for a host nothing is served at.
+fn unknown_host() -> Value {
+    json!({
+        "handler": "static_response",
+        "status_code": 404,
+        "headers": {
+            "Content-Type": ["text/plain; charset=utf-8"],
+            "Cache-Control": ["no-store"],
+        },
+        "body": UNKNOWN_HOST,
+    })
+}
+
+/// The route that refuses a LAN-only domain to connections from outside the LAN's ranges (all of them, if there are
+/// none), as if nothing were served there. It goes before the domain's own route, so a refused request never meets
+/// basic auth or reaches a node. It matches the TCP peer, which no header can change.
+fn off_lan(cfg: &IngressConfig, domain: &str) -> Value {
+    let mut m = json!({ "host": [domain] });
+    if !cfg.lan_ranges.is_empty() {
+        m["not"] = json!([{ "remote_ip": { "ranges": cfg.lan_ranges } }]);
+    }
+    json!({ "match": [m], "handle": [unknown_host()], "terminal": true })
 }
 
 /// The registry's route. Like Caddy's `forward_auth`: each request is first sent to the server's
