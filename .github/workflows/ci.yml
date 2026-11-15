@@ -73,6 +73,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # It parses action.yml with PyYAML.
+      - run: python3 -c 'import yaml' || { sudo apt-get update -qq && sudo apt-get install -y -qq python3-yaml; }
       - run: scripts/test-action.sh
 
   # btrfs send needs root: the tests of the `send` format run as root, through sudo.

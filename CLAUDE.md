@@ -33,7 +33,8 @@ kiwi-nest is written from scratch; don't copy from or refer to other deployment 
   the CLI alone on a Mac. Pushing a tag `vVERSION` publishes a release (`.github/workflows/release.yml`).
 - The binary's `cluster` feature (default) holds the server, the node and the installers; `cargo build -p kiwi-nest
   --no-default-features` is the CLI alone, as for macOS, and `make clippy` lints it too (CI builds it on macOS).
-- `scripts/test-action.sh` tests the GitHub Action's script (`action.yml`, `scripts/action.sh`) against a fake
+- `scripts/test-action.sh` checks `action.yml` parses (with PyYAML) and tests the GitHub Action's script
+  (`scripts/action.sh`) against a fake
   release.
 - Installing (`server init`, `node join`, `upgrade`, `rollback`) needs root and systemd, so it's tried on real machines
   (see `docs/install.md`), not in tests; its pieces in `kn-install` have unit tests.

@@ -7,6 +7,19 @@ here=$(cd "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+# action.yml must parse (a plain scalar with `: ` in it doesn't, and GitHub and act refuse the Action), each input
+# needs a description, and the step must pass every input to the script and name no input that doesn't exist.
+python3 -I - "$here/../action.yml" <<'PY'
+import re, sys, yaml
+action = yaml.safe_load(open(sys.argv[1]))
+inputs = action["inputs"]
+for name, spec in inputs.items():
+    assert isinstance(spec.get("description"), str), f"input {name} has no description"
+env = action["runs"]["steps"][0]["env"]
+used = {m for v in env.values() for m in re.findall(r"\$\{\{ inputs\.([\w-]+) \}\}", str(v))}
+assert used == set(inputs), f"inputs passed to the script {sorted(used)}, declared {sorted(inputs)}"
+PY
+
 version=9.8.7
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) target=x86_64-unknown-linux-musl ;;

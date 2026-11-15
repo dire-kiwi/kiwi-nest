@@ -40,7 +40,7 @@ binaries: server, node and CLI in one), and the CLI for macOS, `…-aarch64-appl
 Download yours and check it:
 
 ```sh
-V=0.2.0   # the release
+V=0.2.1   # the release
 T=x86_64-unknown-linux-musl
 curl -fLO https://github.com/dire-kiwi/kiwi-nest/releases/download/v$V/kiwi-nest-$V-$T
 curl -fLO https://github.com/dire-kiwi/kiwi-nest/releases/download/v$V/SHA256SUMS
@@ -198,7 +198,7 @@ jobs:
     runs-on: ubuntu-latest      # it must reach the server's API: a self-hosted runner for a LAN-only cluster
     steps:
       - uses: actions/checkout@v4
-      - uses: dire-kiwi/kiwi-nest@v0.2.0
+      - uses: dire-kiwi/kiwi-nest@v0.2.1
         id: preview
         with:
           server: https://kn.example.com
