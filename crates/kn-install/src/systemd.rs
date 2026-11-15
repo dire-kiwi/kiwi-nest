@@ -133,6 +133,12 @@ pub fn caddy_boot_config(admin: &str) -> String {
     serde_json::json!({ "admin": { "listen": admin } }).to_string() + "\n"
 }
 
+/// The admin API's address in a boot configuration, however it's written (one edited by hand, say).
+pub fn caddy_boot_admin(text: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    Some(v.pointer("/admin/listen")?.as_str()?.to_string())
+}
+
 /// A host's drop-in: its flags, and any other settings for the unit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DropIn {
@@ -327,6 +333,15 @@ mod tests {
         assert!(!unit(NODE).unwrap().contains("User="));
         assert!(unit(CADDY).unwrap().contains("CAP_NET_BIND_SERVICE"));
         assert!(unit("other.service").is_none());
+    }
+
+    #[test]
+    fn reads_the_admin_address_back_from_caddys_boot_configuration() {
+        let text = caddy_boot_config("127.0.0.1:2029");
+        assert_eq!(caddy_boot_admin(&text).as_deref(), Some("127.0.0.1:2029"));
+        let by_hand = "{\n  \"admin\": {\"listen\": \"127.0.0.1:2029\"}\n}\n";
+        assert_eq!(caddy_boot_admin(by_hand).as_deref(), Some("127.0.0.1:2029"));
+        assert_eq!(caddy_boot_admin("{}"), None);
     }
 
     #[test]

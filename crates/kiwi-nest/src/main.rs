@@ -43,8 +43,8 @@ enum Cmd {
     /// Go back to an earlier release installed on this machine, as root, and restart into it.
     #[cfg(feature = "cluster")]
     Rollback(install::RollbackArgs),
-    /// Write this release's systemd units for what's installed here (`upgrade` and `rollback` run this with the
-    /// release they switch to).
+    /// Write this release's systemd units for what's installed here, and Caddy's boot configuration from the server's
+    /// --caddy-admin (`upgrade` and `rollback` run this with the release they switch to).
     #[cfg(feature = "cluster")]
     #[command(hide = true)]
     Units,

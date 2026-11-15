@@ -769,13 +769,16 @@ The how-to is [install.md](install.md). Every command here runs as root on the m
   `KIWI_NEST_ARGS` (and for a node `RequiresMountsFor=` its volumes, so it starts after their mount). `server init`
   and `node join` write the drop-in; upgrades write the units again from the new release (`kiwi-nest units`, run
   with the new binary) and never touch a drop-in.
-- **`kiwi-nest server init`** checks the machine (ports 80 and 443, Docker for the registry) and the server's flags
+- **`kiwi-nest server init`** checks the machine (ports 80 and 443, Caddy's admin address, Docker for the registry) and the server's flags
   (as the server parses and checks them), installs itself, makes the two users and the state directory, installs
   Caddy (a pinned release, checked against the SHA-512 recorded in `kn-install`'s `caddy`, not only against the
   checksums file beside it; a distribution's package would start a Caddy of its own on port 80), whose boot
-  configuration is its admin API on loopback alone, writes the units and the drop-in, makes the first admin token
-  itself (`kn_server::first_admin_token`, so it's printed to whoever ran the command rather than to the journal),
-  and starts everything. With `--ingress internal` it waits for the CA's root and says how to trust it.
+  configuration (`/etc/kiwi-nest/caddy.json`) is its admin API on loopback alone (`--caddy-admin`, which also goes
+  in the server's drop-in; a later run without it keeps the drop-in's), writes the units and the drop-in, makes the
+  first admin token itself (`kn_server::first_admin_token`, so it's printed to whoever ran the command rather than
+  to the journal) and prints it at once, then starts everything: a unit that fails to start doesn't lose the token,
+  which a second run wouldn't make again. `kiwi-nest units` (so `upgrade` and `rollback` too) writes Caddy's boot
+  configuration again from the drop-in's `--caddy-admin`. With `--ingress internal` it waits for the CA's root and says how to trust it.
 - **`kiwi-nest node join URL --token JOIN`** checks, reporting every problem at once: Docker and the Compose plugin;
   the volumes directory, on btrfs, reached without symlinks, and (a warning) mounted from `/etc/fstab`; the private
   address (`--address`, by default the source address of the route to the server), which must be this machine's,
