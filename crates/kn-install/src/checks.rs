@@ -157,6 +157,13 @@ pub fn port_free(port: u16) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("port {port} isn't free ({e}): the ingress's Caddy listens on it"))
 }
 
+/// An address, `HOST:PORT`, is free to listen on (for Caddy's admin API).
+pub fn addr_free(addr: &str, what: &str) -> anyhow::Result<()> {
+    TcpListener::bind(addr)
+        .map(drop)
+        .map_err(|e| anyhow::anyhow!("{addr} isn't free ({e}): {what}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +204,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("isn't an address of this machine"), "{err}");
+    }
+
+    #[test]
+    fn an_address_in_use_isnt_free() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let err = addr_free(&addr, "Caddy's admin API listens there")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("isn't free") && err.contains("Caddy's admin API"), "{err}");
+        drop(l);
+        addr_free(&addr, "x").unwrap();
     }
 
     #[test]
