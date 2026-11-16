@@ -1,6 +1,10 @@
 import { useState, type ReactNode } from 'react'
 import { ApiError, type AppStatus, type Space } from './api'
+import { useCluster } from './cluster'
 import { bytes, local, relative } from './format'
+
+/** How a state is coloured: fine, wants a look, wrong, in progress, or at rest. */
+export type Tone = 'ok' | 'warn' | 'bad' | 'info' | 'idle'
 
 /** A time shown relative to now, with the local time on hover. */
 export function Time({ at, empty = '—' }: { at?: string | null; empty?: string }) {
@@ -12,15 +16,17 @@ export function Time({ at, empty = '—' }: { at?: string | null; empty?: string
   )
 }
 
-export function Badge({ kind, children, title }: { kind: string; children: ReactNode; title?: string }) {
+/** A state in words, with a dot in its colour (the colour never says it alone). */
+export function Badge({ kind, children, title }: { kind: Tone; children: ReactNode; title?: string }) {
   return (
-    <span className={`badge badge-${kind}`} title={title}>
+    <span className={`badge tone-${kind}`} title={title}>
+      <i className="dot" />
       {children}
     </span>
   )
 }
 
-const STATUS_KIND: Record<AppStatus, string> = {
+export const STATUS_TONE: Record<AppStatus, Tone> = {
   running: 'ok',
   idle: 'idle',
   suspended: 'warn',
@@ -29,7 +35,18 @@ const STATUS_KIND: Record<AppStatus, string> = {
 }
 
 export function StatusBadge({ status }: { status: AppStatus }) {
-  return <Badge kind={STATUS_KIND[status] ?? 'idle'}>{status}</Badge>
+  return <Badge kind={STATUS_TONE[status] ?? 'idle'}>{status}</Badge>
+}
+
+/** A link to an app's page, with a dot for its status when the list has it. */
+export function AppLink({ name }: { name: string }) {
+  const status = useCluster().apps.data?.find((a) => a.name === name)?.status
+  return (
+    <a className="name app-link" href={`#/apps/${encodeURIComponent(name)}`} title={status}>
+      {status && <i className={`dot tone-${STATUS_TONE[status] ?? 'idle'}`} />}
+      {name}
+    </a>
+  )
 }
 
 export function Labels({ labels }: { labels?: Record<string, string> }) {
@@ -46,11 +63,59 @@ export function Labels({ labels }: { labels?: Record<string, string> }) {
   )
 }
 
-export function SpaceText({ space }: { space?: Space }) {
-  if (!space) return <span className="muted">not measured yet</span>
+/**
+ * A share of a whole as a bar. The fill's colour says how it's doing, and the track is a lighter step of the same
+ * colour, so the state reads across the whole bar.
+ */
+export function Meter({
+  value,
+  max,
+  tone = 'accent',
+  label,
+}: {
+  value: number
+  max: number
+  tone?: 'accent' | 'warn' | 'bad'
+  label: string
+}) {
+  const share = max > 0 ? Math.min(1, Math.max(0, value / max)) : 0
   return (
-    <span title={`${space.bytes} bytes, ${space.exclusive_bytes} of them its own`}>
-      {bytes(space.bytes)} <span className="muted">({bytes(space.exclusive_bytes)} exclusive)</span>
+    <div
+      className={`meter meter-${tone}`}
+      role="meter"
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={Math.round(share * 100)}
+      title={label}
+    >
+      <div className="meter-fill" style={{ width: `${share * 100}%` }} />
+    </div>
+  )
+}
+
+/**
+ * What a subvolume takes. With `max` (the largest in its table), a bar compares it with the others: the solid part
+ * is its own, the lighter part what it shares with snapshots.
+ */
+export function SpaceText({ space, max }: { space?: Space; max?: number }) {
+  if (!space) return <span className="muted">not measured yet</span>
+  const title = `${space.bytes} bytes, ${space.exclusive_bytes} of them its own`
+  return (
+    <span className="space" title={title}>
+      <span className="space-text">
+        {bytes(space.bytes)} <span className="muted">· {bytes(space.exclusive_bytes)} its own</span>
+      </span>
+      {max !== undefined && max > 0 && (
+        <span className="space-bar" aria-hidden="true">
+          {space.exclusive_bytes > 0 && (
+            <i className="space-own" style={{ width: `${(space.exclusive_bytes / max) * 100}%` }} />
+          )}
+          {space.bytes > space.exclusive_bytes && (
+            <i className="space-shared" style={{ width: `${((space.bytes - space.exclusive_bytes) / max) * 100}%` }} />
+          )}
+        </span>
+      )}
     </span>
   )
 }
@@ -60,7 +125,7 @@ export function ErrorBox({ error, prefix }: { error?: Error | null; prefix?: str
   if (!error) return null
   const problems = error instanceof ApiError ? error.problems : []
   return (
-    <div className="error" role="alert">
+    <div className="callout tone-bad" role="alert">
       {prefix ? `${prefix}: ` : ''}
       {error.message}
       {problems.length > 0 && (
@@ -82,6 +147,7 @@ export function Action({
   onDone,
   onError,
   kind = 'secondary',
+  small,
   disabled,
   title,
 }: {
@@ -90,7 +156,8 @@ export function Action({
   run: () => Promise<unknown>
   onDone?: (result: unknown) => void
   onError?: (e: Error) => void
-  kind?: 'primary' | 'secondary' | 'danger'
+  kind?: 'primary' | 'secondary' | 'ghost'
+  small?: boolean
   disabled?: boolean
   title?: string
 }) {
@@ -112,7 +179,12 @@ export function Action({
   }
   return (
     <span className="action">
-      <button className={`btn btn-${kind}`} onClick={click} disabled={busy || disabled} title={title}>
+      <button
+        className={`btn btn-${kind}${small ? ' btn-sm' : ''}`}
+        onClick={click}
+        disabled={busy || disabled}
+        title={title}
+      >
         {busy ? (busyLabel ?? `${label}…`) : label}
       </button>
       {error && (
@@ -124,21 +196,55 @@ export function Action({
   )
 }
 
-export function Section({ title, children, actions }: { title: ReactNode; children: ReactNode; actions?: ReactNode }) {
+/** A view's heading: what it is, a line about it, and its actions. */
+export function PageHead({ title, sub, actions }: { title: ReactNode; sub?: ReactNode; actions?: ReactNode }) {
   return (
-    <section className="section">
-      <div className="section-head">
-        <h2>{title}</h2>
-        {actions && <div className="section-actions">{actions}</div>}
+    <header className="page-head">
+      <div className="page-title">
+        <h1>{title}</h1>
+        {sub && <p className="page-sub">{sub}</p>}
       </div>
-      {children}
+      {actions && <div className="page-actions">{actions}</div>}
+    </header>
+  )
+}
+
+/** A titled box. `flush` drops the padding, for a table that reaches the edges. */
+export function Panel({
+  title,
+  note,
+  actions,
+  flush,
+  children,
+}: {
+  title?: ReactNode
+  note?: ReactNode
+  actions?: ReactNode
+  flush?: boolean
+  children: ReactNode
+}) {
+  return (
+    <section className="panel">
+      {(title || actions) && (
+        <header className="panel-head">
+          <h2>{title}</h2>
+          {note && <span className="panel-note">{note}</span>}
+          {actions && <div className="panel-actions">{actions}</div>}
+        </header>
+      )}
+      <div className={flush ? 'panel-body flush' : 'panel-body'}>{children}</div>
     </section>
   )
+}
+
+/** What a list says when it has nothing to list. */
+export function Empty({ children }: { children: ReactNode }) {
+  return <p className="empty">{children}</p>
 }
 
 /** The state of a polled view: loading the first time, or a failed refresh (keeping what was shown). */
 export function PollState({ loading, error, hasData }: { loading: boolean; error?: Error; hasData: boolean }) {
   if (error) return <ErrorBox error={error} prefix={hasData ? "Couldn't refresh" : undefined} />
-  if (loading && !hasData) return <p className="muted">Loading…</p>
+  if (loading && !hasData) return <p className="empty">Loading…</p>
   return null
 }
