@@ -729,15 +729,30 @@ command with what it acts on and who asked), on a thread of its own, in WAL
   as the CLI: nothing in it is the UI's own but logging in. Routing is in the URL's fragment (`#/apps/blog`), so the
   server only serves `index.html` and the files Vite names by their contents (cached for good). Every page has a
   strict Content-Security-Policy (only the server's own scripts, styles and API; no inline scripts, no framing).
-- **Views.** Nodes: online or not, cordoned, version and link version, architecture, memory and headroom, labels,
-  the btrfs filesystem's free and unallocated space (with a warning below 10%), the space its volumes take, and
-  its nests. Nests: their node, apps, shared volumes, memory and disk use, and why they're where they are. Apps by
-  node: status, containers, domain, nest, idle timeout and last activity, and each app's details: its containers,
-  placement, volumes with their space, and its recent commands (`GET /apps/{name}/commands`: what was run, by whom,
-  and how it ended; inspecting isn't listed). Shared volumes with their snapshots and the space each takes, and
-  every app's volumes. Backups by target. The lists refresh every few seconds; an app's details from its node every
-  30 seconds, since each is a command; the backups only when asked, since listing reads the targets. Nothing
-  refreshes while the tab is hidden, and everything does when it's shown again.
+- **Views.** A sidebar lists them, with a count beside each and a mark on the ones where something needs
+  attention; on a narrow screen it's a bar along the top. Overview (the first page): what needs attention (offline
+  nodes, failed apps, nodes low on space or overcommitted, volumes with a problem; cordoned nodes and suspended apps
+  were asked for, so they aren't listed), the apps by status, nodes online, the apps' memory limits against the
+  nodes' memory and the btrfs space used, each node's memory and disk as bars, the apps last asked for and the
+  latest deploys. Nodes: online or not, cordoned, version and link version, architecture, the apps' memory limits
+  against its memory with the headroom, labels, the btrfs filesystem's used, free and unallocated space (with a
+  warning below 10%), the space its volumes take, and its nests. Nests: their node, apps, shared volumes, memory and
+  disk use, and why they're where they are. Apps by node, filtered by name, domain, nest or status: status,
+  containers, domain (a link to the app through the ingress), nest, idle timeout and last activity, and each app's
+  page, with two tabs. Its overview: its containers, placement, volumes with their space, and its recent commands
+  (`GET /apps/{name}/commands`: what was run, by whom, and how it ended; inspecting isn't listed). Its logs
+  (`#/apps/NAME/logs`) load when the tab is first shown and keep following while the other tab shows. Shared volumes
+  with their snapshots and the space each takes, and every app's volumes; a bar compares each with the largest in its
+  table, split into what's its own and what it shares with snapshots. Backups by target, a line for each app, volume
+  or the server that opens onto its backups. The lists (apps, nodes, nests, shared volumes) are fetched once for
+  every view and the sidebar, and refresh every few seconds; an app's details from its node every 30 seconds, since
+  each is a command; the backups only when asked, since listing reads the targets. Nothing refreshes while the tab
+  is hidden, and everything does when it's shown again.
+- **Look.** One stylesheet, no UI library, and icons drawn in the code, so the page loads nothing but the server's
+  own files. Light and dark follow the system unless the reader picks one (the button in the sidebar), which the
+  browser remembers (`localStorage`). A state is always a word with its coloured dot, never colour alone. Bars get
+  their widths from React through the CSSOM, which the Content-Security-Policy allows (it refuses `style`
+  attributes in markup).
 - **Actions:** suspend, resume (which wakes a suspended or idle app and returns once it's up), logs (followed as
   they come), back up now, cordon and uncordon. Deploying and deleting stay with the CLI and CI.
 - **Users and logins.** The UI's users are made with an admin token (`kiwi-nest user add NAME`, which asks for the

@@ -128,7 +128,9 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
 - `crates/kn-cli`: the CLI commands (`push` runs `docker login`, `tag` and `push`), and `config` (clusters in
   `~/.config/kiwi-nest/clusters.json`).
 - `web/`: the web UI (React, TypeScript, Vite; no other dependencies). `src/api.ts` mirrors `kn-proto`'s types;
-  `src/views/` has a file per view. It talks only to the CLI's API, sending JSON on every change.
+  `src/views/` has a file per view; `src/cluster.tsx` fetches the lists every view shares and works out what needs
+  attention; `src/components.tsx`, `src/icons.tsx` and `src/style.css` are what the views are built from. It talks
+  only to the CLI's API, sending JSON on every change.
 - `skills/kiwi-nest/`: the agent skill for deploying with kiwi-nest (`SKILL.md`, and `references/` for the bundle
   format, CI and moving apps over), linked from `~/.claude/skills/kiwi-nest` and `~/.claude-personal/skills/kiwi-nest`
   to this checkout at `~/personal/kiwi-nest`. It describes the user's clusters (`dire`, `home`) as well as the CLI.
