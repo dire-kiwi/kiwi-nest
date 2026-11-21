@@ -158,6 +158,19 @@ impl Caller {
         }
     }
 
+    /// Refuses unless the caller may deploy an app that calls `app` (`x-kiwi-nest.uses`): as for `--from`, one it
+    /// manages or one its token names with `--from`, since either way the new app reads from that one.
+    pub fn may_call(&self, app: &str) -> Result<()> {
+        if self.may_manage(app) || self.from.iter().any(|p| matches(p, app)) {
+            Ok(())
+        } else {
+            Err(Error::Forbidden(format!(
+                "this token can't deploy an app that uses `{app}` (`x-kiwi-nest.uses`); give the token \
+                 `--from {app}` to let it"
+            )))
+        }
+    }
+
     pub fn whoami(&self) -> WhoAmI {
         WhoAmI {
             kind: self.kind,

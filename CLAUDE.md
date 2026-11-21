@@ -103,7 +103,7 @@ The CLI goes to `--node-api` if given, else `--server` with `--token`, else the 
   `apps/backup.rs` backs up snapshot sets and restores into first deploys and new volumes; `apps/usage.rs` measures
   the volumes' space now and then, grouped by what can share data;
   `gateway` (the proxy, each app's `gate` of phases and leases, the starting page, the ingress listener's token
-  check), `agent` (the link to the server: joining, the poll loop, the per-app applier and commands, the registry
+  check, the internal listener for calls between apps, `x-kiwi-nest.uses`), `agent` (the link to the server: joining, the poll loop, the per-app applier and commands, the registry
   credential in the node's own Docker configuration; `agent/link.rs` is its HTTP client; `agent/forgotten.rs` takes
   a forgotten node's apps down and sets its data aside), `api` (standalone API). Apps record their images, and
   `Apps::prune_images` removes the ones they stopped using. `testing` is a fake runtime for unit tests.

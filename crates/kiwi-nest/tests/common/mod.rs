@@ -79,6 +79,8 @@ pub struct Node {
     pub url: String,
     /// The gateway's port.
     pub gateway: u16,
+    /// The internal gateway's address, if the node was started with `--internal-listen`.
+    pub internal: Option<String>,
     pub prefix: String,
     pub dir: tempfile::TempDir,
     pub volumes: tempfile::TempDir,
@@ -95,11 +97,12 @@ impl Node {
         let dir = tempfile::tempdir().unwrap();
         let volumes = tempfile::tempdir_in(btrfs_dir().expect("KIWI_NEST_TEST_BTRFS_DIR")).unwrap();
         let extra: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
-        let (child, url, gateway) = spawn_node(dir.path(), volumes.path(), prefix, &extra);
+        let (child, url, gateway, internal) = spawn_node(dir.path(), volumes.path(), prefix, &extra);
         Node {
             child,
             url,
             gateway,
+            internal,
             prefix: prefix.to_string(),
             dir,
             volumes,
@@ -111,10 +114,12 @@ impl Node {
     pub fn restart(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let (child, url, gateway) = spawn_node(self.dir.path(), self.volumes.path(), &self.prefix, &self.extra);
+        let (child, url, gateway, internal) =
+            spawn_node(self.dir.path(), self.volumes.path(), &self.prefix, &self.extra);
         self.child = child;
         self.url = url;
         self.gateway = gateway;
+        self.internal = internal;
     }
 
     /// A path in the node's volumes directory.
@@ -155,9 +160,11 @@ impl Node {
     }
 }
 
-/// Starts `kiwi-nest node --standalone` on loopback ports of its own; returns it, its API's URL and its gateway's
-/// port.
-pub fn spawn_node(dir: &Path, volumes: &Path, prefix: &str, extra: &[String]) -> (Child, String, u16) {
+/// Starts `kiwi-nest node --standalone` on loopback ports of its own; returns it, its API's URL, its gateway's
+/// port, and its internal gateway's address if `extra` has `--internal-listen` (which is off otherwise, so tests
+/// don't contend for its port).
+pub fn spawn_node(dir: &Path, volumes: &Path, prefix: &str, extra: &[String]) -> (Child, String, u16, Option<String>) {
+    let internal = extra.iter().any(|a| a == "--internal-listen");
     let mut child = Command::new(BIN)
         .args([
             "node",
@@ -174,6 +181,11 @@ pub fn spawn_node(dir: &Path, volumes: &Path, prefix: &str, extra: &[String]) ->
         .arg(volumes)
         .arg("--project-prefix")
         .arg(prefix)
+        .args(if internal {
+            &[][..]
+        } else {
+            &["--internal-listen", "off"][..]
+        })
         .args(extra)
         .env(
             "KIWI_NEST_LOG",
@@ -186,7 +198,7 @@ pub fn spawn_node(dir: &Path, volumes: &Path, prefix: &str, extra: &[String]) ->
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut lines = BufReader::new(stdout).lines();
-        for line in lines.by_ref().take(2).map_while(Result::ok) {
+        for line in lines.by_ref().take(if internal { 3 } else { 2 }).map_while(Result::ok) {
             let _ = tx.send(line);
         }
         for _ in lines {}
@@ -204,7 +216,15 @@ pub fn spawn_node(dir: &Path, volumes: &Path, prefix: &str, extra: &[String]) ->
         .and_then(|a| a.rsplit(':').next())
         .and_then(|p| p.parse().ok())
         .expect("the node should print its gateway's address");
-    (child, url, gateway)
+    let internal = internal.then(|| {
+        let line = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the internal gateway should start");
+        line.strip_prefix("internal gateway on http://")
+            .expect("the node should print its internal gateway's address")
+            .to_string()
+    });
+    (child, url, gateway, internal)
 }
 
 impl Drop for Node {
@@ -541,6 +561,7 @@ impl ClusterNode {
             .arg("--volumes-dir")
             .arg(self.volumes.path())
             .args(["--project-prefix", &self.prefix])
+            .args(["--internal-listen", "off"])
             .args(&self.extra)
             .env_remove("KIWI_NEST_CA_CERT")
             .env(

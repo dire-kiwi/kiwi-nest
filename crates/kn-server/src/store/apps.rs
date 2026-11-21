@@ -7,7 +7,8 @@
 //! of a name only ever grow, even across a delete, so a node never mistakes a new app for one it has already applied.
 //!
 //! **Nests.** An app's nest comes from what it's deployed with: the nest it's already in (a redeploy), its `--from`
-//! app's, each shared volume's, and `x-kiwi-nest.nest`. They must all agree, or the deploy is refused; with none of
+//! app's, each shared volume's, each app's it uses (`x-kiwi-nest.uses`, since it calls them through its node's
+//! gateway), and `x-kiwi-nest.nest`. They must all agree, or the deploy is refused; with none of
 //! them, it's the nest named after the app. A shared volume's is `--nest`, or the one named after it. A nest that
 //! exists stays on its node, whatever that node's memory (the deploy warns when it's full); a new one is placed by
 //! the [`scheduler`], or on `--node`.
@@ -229,7 +230,8 @@ fn agree(sources: &[Source]) -> Result<Option<(String, String)>> {
     let Some(first) = sources.first() else { return Ok(None) };
     if let Some(other) = sources.iter().find(|s| s.nest != first.nest) {
         return Err(Error::Conflict(format!(
-            "{}, but {}; an app's `--from` app, its shared volumes and `x-kiwi-nest.nest` must all be in one nest",
+            "{}, but {}; an app's `--from` app, its shared volumes, the apps it uses and `x-kiwi-nest.nest` must all \
+             be in one nest",
             first.why, other.why
         )));
     }
@@ -427,6 +429,25 @@ pub fn deploy(
                 nest: n.clone(),
                 via: format!("through shared volume `{v}`"),
                 why: format!("shared volume `{v}` is in nest `{n}`"),
+            });
+        }
+    }
+    for u in &d.bundle.uses {
+        if u == &d.name {
+            return Err(Error::BadRequest(format!(
+                "the bundle's `x-kiwi-nest.uses` names `{u}` itself; an app calls itself without kiwi-nest"
+            )));
+        }
+        let used = app(&tx, u)?.filter(|a| a.state == State::Active).ok_or_else(|| {
+            Error::NotFound(format!(
+                "the bundle uses app `{u}` (`x-kiwi-nest.uses`), which doesn't exist; deploy it first"
+            ))
+        })?;
+        if let Some(n) = &used.nest {
+            sources.push(Source {
+                nest: n.clone(),
+                via: format!("through uses {u}"),
+                why: format!("app `{u}` (in `x-kiwi-nest.uses`) is in nest `{n}`"),
             });
         }
     }

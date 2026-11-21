@@ -64,6 +64,13 @@ auth and never wakes the app. Use it for `code`, its previews and any private ap
 API, the web UI and the registry are LAN-only the same way (`--infra-access lan`). A 404 from the LAN on a LAN-only
 app means the name isn't routed; from outside, it's the refusal.
 
+**One app calling another: `x-kiwi-nest.uses: [cms]`** on the caller, which then reaches it at
+`http://cms.internal:7383` through its node's gateway (waking it if it's idle), LAN-only apps included. Never call
+another app through its public or LAN name from inside a container: the ingress sees the container's Docker network,
+not the LAN, so a LAN-only app answers 404, and making it `access: public` on a LAN-only name instead opens it to
+every container on the nodes. The caller joins the callee's nest (same node); deploy the callee first. Needs nodes
+newer than 0.2.1 (`node list` shows their versions). See `references/bundle-format.md`, example 7.
+
 **The move from site-deploy is in progress** (PRO-9). Until its switches happen, the tunnel still sends
 `*.dire.nz` to site-deploy, and `*.code.dire.nz` still resolves to VM 203's site-deploy, so an app on kiwi-nest
 isn't reachable at its name yet. Check it on the LAN with

@@ -170,6 +170,11 @@ pub struct NodeArgs {
     /// 10.0.0.5:7382. Requests there need the node's ingress token, which the ingress adds.
     #[arg(long, value_name = "ADDR")]
     pub ingress_listen: Option<SocketAddr>,
+    /// Where the gateway listens for apps calling the apps they use (`x-kiwi-nest.uses`, at
+    /// http://NAME.internal:PORT): an address of this host that containers reach. `auto` is Docker's bridge
+    /// (docker0) on port 7383, if it's there and free; `off` turns calls between apps off.
+    #[arg(long, value_name = "ADDR|auto|off", default_value = "auto")]
+    pub internal_listen: kn_node::InternalListen,
     /// Where the node keeps its state, bundles and generated files.
     #[arg(long, env = "KIWI_NEST_STATE_DIR", default_value = "/var/lib/kiwi-nest")]
     pub state_dir: PathBuf,
@@ -446,7 +451,7 @@ pub async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result
         if args.ingress_listen.is_some() {
             bail!("a standalone node has no ingress, so no --ingress-listen");
         }
-        return kn_node::run_standalone(cfg, args.listen, args.gateway_listen)
+        return kn_node::run_standalone(cfg, args.listen, args.gateway_listen, args.internal_listen)
             .await
             .map(|()| crate::Exit::Done);
     };
@@ -464,7 +469,15 @@ pub async fn node(global: &kn_cli::GlobalArgs, args: NodeArgs) -> anyhow::Result
             .with_context(|| format!("a label is KEY=VALUE, not {l}"))?;
         agent.labels.insert(k.trim().to_string(), v.trim().to_string());
     }
-    match kn_node::run_agent(cfg, agent, args.gateway_listen, args.ingress_listen).await? {
+    match kn_node::run_agent(
+        cfg,
+        agent,
+        args.gateway_listen,
+        args.ingress_listen,
+        args.internal_listen,
+    )
+    .await?
+    {
         kn_node::agent::Stopped::Asked => Ok(crate::Exit::Done),
         kn_node::agent::Stopped::Restart(binary) => Ok(crate::Exit::Exec(binary)),
     }

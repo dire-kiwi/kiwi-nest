@@ -11,7 +11,9 @@
 #
 # Each node gets its own state directory, gateway port, loop-mounted btrfs file (mounted with sudo, with
 # user_subvol_rm_allowed, and owned by you) and Compose project prefix (kn-dev-a-, kn-dev-b-). The server listens on
-# 127.0.0.1:7400, and the nodes' gateways on 127.0.0.1:7481 and :7482. Everything lives in .dev-cluster/ (or
+# 127.0.0.1:7400, and the nodes' gateways on 127.0.0.1:7481 and :7482; their internal gateways, for apps calling the
+# apps they use (`x-kiwi-nest.uses`), are on Docker's bridge at ports 7383 (a) and 7384 (b), since they share it, so
+# an app on b calls http://NAME.internal:7384. Everything lives in .dev-cluster/ (or
 # $KIWI_NEST_DEV_DIR), including a CLI configuration with the cluster added as `dev`:
 #
 #   export KIWI_NEST_CONFIG_DIR=$PWD/.dev-cluster/config
@@ -65,6 +67,7 @@ export KIWI_NEST_LOG=${KIWI_NEST_LOG:-info}
 
 gateway_port() { case $1 in a) echo 7481 ;; b) echo 7482 ;; esac; }
 ingress_port() { case $1 in a) echo 7491 ;; b) echo 7492 ;; esac; }
+internal_port() { case $1 in a) echo 7383 ;; b) echo 7384 ;; esac; }
 app_ports() { case $1 in a) echo 31000-31999 ;; b) echo 32000-32999 ;; esac; }
 
 # Where a node's volumes live: its loop mount, or a directory under KIWI_NEST_DEV_BTRFS.
@@ -212,6 +215,14 @@ start_node() {
   fi
   local listen=()
   [ -n "$caddy" ] && listen=(--ingress-listen "127.0.0.1:$(ingress_port "$n")")
+  local bridge
+  bridge=$(docker network inspect bridge --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}' 2>/dev/null |
+    tr ' ' '\n' | grep -v : | head -n 1 || true)
+  if [ -n "$bridge" ]; then
+    listen+=(--internal-listen "$bridge:$(internal_port "$n")")
+  else
+    listen+=(--internal-listen off)
+  fi
   : >"$dir/$n.log"
   "$bin" node --server "$url" "${ca[@]}" "${join[@]}" --name "$n" \
     --state-dir "$dir/$n/state" --volumes-dir "$(volumes_dir "$n")/volumes" \

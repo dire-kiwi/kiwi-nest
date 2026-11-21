@@ -15,6 +15,7 @@
 //!   node_labels: { disk: ssd }
 //!   backups: false          # optional: skip scheduled backups (previews); `kiwi-nest backup` still works
 //!   access: lan             # optional: public (the default), or lan: the ingress refuses peers off the LAN
+//!   uses: [cms]             # optional: apps it calls at `http://cms.internal:7383`, through its node's gateway
 //! ```
 
 use std::collections::BTreeMap;
@@ -42,6 +43,8 @@ pub struct Manifest {
     pub backups: bool,
     /// Who the ingress serves the app to.
     pub access: Access,
+    /// The apps it calls through its node's gateway, at `http://NAME.internal`: in its nest, so on its node.
+    pub uses: Vec<String>,
 }
 
 /// One basic-auth user, with a bcrypt hash of their password.
@@ -228,6 +231,7 @@ pub fn parse(value: &Value) -> Result<Manifest, Vec<Problem>> {
         node_labels: BTreeMap::new(),
         backups: true,
         access: Access::Public,
+        uses: Vec::new(),
     };
     let (mut domain, mut service, mut port) = (false, false, false);
     for (k, v) in map {
@@ -388,6 +392,24 @@ pub fn parse(value: &Value) -> Result<Manifest, Vec<Problem>> {
                     "must be `public` or `lan` (served only to clients on the cluster's LAN)".into(),
                 ),
             },
+            "uses" => {
+                let Some(list) = v.as_sequence() else {
+                    refuse(key, "must be a list of the apps it calls, such as `[cms]`".into());
+                    continue;
+                };
+                for (i, item) in list.iter().enumerate() {
+                    match item.as_str() {
+                        Some(n) if m.uses.iter().any(|u| u == n) => {
+                            refuse(&format!("uses[{i}]"), format!("`{n}` is listed twice"))
+                        }
+                        Some(n) if is_valid_app_name(n) => m.uses.push(n.to_string()),
+                        _ => refuse(
+                            &format!("uses[{i}]"),
+                            "must be an app's name: lowercase letters, digits and `-`".into(),
+                        ),
+                    }
+                }
+            }
             other => refuse(other, "isn't a known `x-kiwi-nest` setting".into()),
         }
     }
@@ -461,6 +483,7 @@ arch: arm64
 node_labels: {{ disk: ssd, gen: 3 }}
 backups: false
 access: lan
+uses: [cms, search-api]
 "#
         ))
         .unwrap();
@@ -486,6 +509,7 @@ access: lan
         assert_eq!(m.node_labels["gen"], "3");
         assert!(!m.backups);
         assert_eq!(m.access, Access::Lan);
+        assert_eq!(m.uses, vec!["cms".to_string(), "search-api".to_string()]);
     }
 
     #[test]
@@ -494,6 +518,7 @@ access: lan
         assert_eq!(m.idle_timeout_secs, 0);
         assert!(m.auth.is_empty() && m.shared.is_empty() && m.nest.is_none() && m.arch.is_none());
         assert!(m.backups, "scheduled backups are on unless turned off");
+        assert!(m.uses.is_empty(), "an app calls no other unless it says so");
         assert_eq!(m.access, Access::Public, "apps are public unless they say otherwise");
         let m = parse_str("{ domain: a.example.com, service: web, port: 80, access: public }").unwrap();
         assert_eq!(m.access, Access::Public);
@@ -575,6 +600,11 @@ access: lan
             ("access: LAN", "x-kiwi-nest.access"),
             ("access: true", "x-kiwi-nest.access"),
             ("access: [lan]", "x-kiwi-nest.access"),
+            ("uses: cms", "x-kiwi-nest.uses: must be a list"),
+            ("uses: [Cms]", "x-kiwi-nest.uses[0]"),
+            ("uses: [cms.internal]", "x-kiwi-nest.uses[0]"),
+            ("uses: [cms, 3]", "x-kiwi-nest.uses[1]"),
+            ("uses: [cms, cms]", "x-kiwi-nest.uses[1]: `cms` is listed twice"),
         ] {
             let key = extra.split(':').next().unwrap();
             let yaml = base

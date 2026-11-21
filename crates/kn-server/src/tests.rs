@@ -1128,6 +1128,72 @@ async fn a_bundle_naming_two_nests_is_refused_and_nothing_is_saved() {
 }
 
 #[tokio::test]
+async fn an_app_joins_the_nest_of_each_app_it_uses() {
+    let env = Env::new().await;
+    let mut a = env.join("a", 4 << 30).await;
+    let mut b = env.join("b", 16 << 30).await;
+    env.poll(&mut a).await;
+    env.poll(&mut b).await;
+    // The callee must exist, and can't be the app itself.
+    let (status, msg) = error(env.put("blog", &app_yaml("blog.test", "uses: [cms]", "128m"), "").await).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        msg.contains("uses app `cms` (`x-kiwi-nest.uses`), which doesn't exist"),
+        "{msg}"
+    );
+    let (status, msg) = error(env.put("cms", &app_yaml("cms.test", "uses: [cms]", "128m"), "").await).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(msg.contains("names `cms` itself"), "{msg}");
+    assert!(env.apps().await.is_empty());
+
+    // b has more room, but blog goes where cms is, and so does its preview.
+    env.placed("cms", &app_yaml("cms.test", "", "128m"), "node=a").await;
+    env.placed("shop", &app_yaml("shop.test", "", "128m"), "node=b").await;
+    let acc = env
+        .placed("blog", &app_yaml("blog.test", "uses: [cms]", "128m"), "")
+        .await;
+    assert_eq!((acc.node.as_str(), acc.nest.as_deref()), ("a", Some("cms")));
+    let info = env.inspect("blog").await;
+    assert!(info.placement.unwrap().starts_with("through uses cms"));
+    let acc = env
+        .placed("blog-pr1", &app_yaml("pr1.test", "uses: [cms]", "128m"), "from=blog")
+        .await;
+    assert_eq!((acc.node.as_str(), acc.nest.as_deref()), ("a", Some("cms")));
+    // An app can't use apps in two nests, nor one outside its own.
+    let (status, msg) = error(
+        env.put("both", &app_yaml("both.test", "uses: [cms, shop]", "1m"), "")
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        msg.contains("app `cms` (in `x-kiwi-nest.uses`) is in nest `cms`, but app `shop` (in `x-kiwi-nest.uses`) is in nest `shop`"),
+        "{msg}"
+    );
+    let (status, msg) = error(env.put("shop", &app_yaml("shop.test", "uses: [cms]", "1m"), "").await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(msg.contains("app `shop` is in nest `shop`"), "{msg}");
+
+    // A deploy token may only use the apps it may make previews from.
+    let ci = env
+        .token(json!({"kind": "deploy", "patterns": ["blog-pr*"], "from": ["blog"]}))
+        .await;
+    let with_cms = env
+        .token(json!({"kind": "deploy", "patterns": ["blog-pr*"], "from": ["blog", "cms"]}))
+        .await;
+    let put = |token: &str| {
+        env.req(reqwest::Method::PUT, "/apps/blog-pr2?from=blog", token)
+            .header("content-type", "application/zip")
+            .body(zip_of(&app_yaml("pr2.test", "uses: [cms]", "1m")))
+            .send()
+    };
+    let (status, msg) = error(put(&ci).await.unwrap()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(msg.contains("can't deploy an app that uses `cms`"), "{msg}");
+    assert_eq!(put(&with_cms).await.unwrap().status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
 async fn new_nests_spread_by_memory_and_a_full_nest_warns() {
     let env = Env::new().await;
     let mut a = env.join("a", 4 << 30).await;

@@ -75,6 +75,9 @@ pub struct AppRecord {
     /// `x-kiwi-nest.access`: only the cluster's ingress acts on it.
     #[serde(default, skip_serializing_if = "Access::is_public")]
     pub access: Access,
+    /// `x-kiwi-nest.uses`: the apps it may call through the internal gateway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<String>,
     pub bundle_digest: String,
     pub services: Vec<String>,
     pub volumes: Vec<String>,
@@ -361,18 +364,19 @@ impl Inner {
         usage.and_then(|u| u.apps.get(name).cloned()).unwrap_or_default()
     }
 
-    /// Routes `domain` to the app's gate, creating it (busy) if needed.
-    fn set_route(&self, name: &str, domain: &str, port: u16, idle_timeout_secs: u64) -> Arc<Gate> {
-        let idle = Duration::from_secs(idle_timeout_secs);
+    /// Routes the app's domain to its gate, creating it (busy) if needed.
+    fn set_route(&self, r: &AppRecord) -> Arc<Gate> {
+        let (name, port) = (r.name.as_str(), r.port);
+        let idle = Duration::from_secs(r.idle_timeout_secs);
         let mut gates = self.gates();
         let gate = gates
             .by_name
             .entry(name.to_string())
             .or_insert_with(|| Gate::new(name, port, idle, Phase::Busy))
             .clone();
-        gate.configure(port, idle);
+        gate.configure(port, idle, &r.uses);
         gates.by_domain.retain(|_, g| g.name() != name);
-        gates.by_domain.insert(domain.to_ascii_lowercase(), gate.clone());
+        gates.by_domain.insert(r.domain.to_ascii_lowercase(), gate.clone());
         gate
     }
 
@@ -597,7 +601,7 @@ impl Apps {
         }
         // Requests wait until each app has been adopted.
         for r in &records {
-            apps.inner.set_route(&r.name, &r.domain, r.port, r.idle_timeout_secs);
+            apps.inner.set_route(r);
             apps.inner.send(&r.name, Op::Adopt)?;
         }
         tokio::spawn(reaper(Arc::downgrade(&apps.inner), idle_check));
@@ -645,6 +649,17 @@ impl Apps {
     /// The gate of the app serving `host` (a domain in lowercase, without a port).
     pub fn route(&self, host: &str) -> Option<Arc<Gate>> {
         self.inner.gates().by_domain.get(host).cloned()
+    }
+
+    /// The gate of the app named `name`.
+    pub fn route_name(&self, name: &str) -> Option<Arc<Gate>> {
+        self.inner.gate(name)
+    }
+
+    /// The app a connection to the internal gateway from `ip` comes from: one that's running with `ip` on one of
+    /// its networks.
+    pub fn caller(&self, ip: std::net::IpAddr) -> Option<Arc<Gate>> {
+        self.inner.gates().by_name.values().find(|g| g.calls_from(ip)).cloned()
     }
 
     /// Starts the app behind `gate` for a request, unless it's already starting or can't be started now; returns
@@ -1209,6 +1224,13 @@ impl App<'_> {
                     list(&missing)
                 )));
             }
+            if !m.uses.is_empty() && cfg.internal.is_none() {
+                return Err(AppsError::Unsupported(format!(
+                    "the bundle uses {} (`x-kiwi-nest.uses`), but this node's internal gateway isn't listening \
+                     (see --internal-listen), so it couldn't call them",
+                    list(&m.uses)
+                )));
+            }
             let from = match (&opts.from, first) {
                 (Some(from), true) => {
                     let Some(source) = state.apps.get(from) else {
@@ -1284,6 +1306,7 @@ impl App<'_> {
                 container_port: m.port,
                 idle_timeout_secs: m.idle_timeout_secs,
                 access: m.access,
+                uses: m.uses.clone(),
                 bundle_digest: staged.digest.clone(),
                 services: staged.bundle.services.iter().map(|s| s.name.clone()).collect(),
                 volumes,
@@ -1308,9 +1331,7 @@ impl App<'_> {
             (record, previous)
         };
         // Requests wait for the deploy.
-        let gate = self
-            .inner
-            .set_route(self.name, &record.domain, record.port, record.idle_timeout_secs);
+        let gate = self.inner.set_route(&record);
         gate.set_phase(Phase::Busy);
         tracing::info!(app = self.name, generation = record.generation, digest = %record.bundle_digest, first, "deploying");
 
@@ -1325,10 +1346,10 @@ impl App<'_> {
         let failed = match self.apply(&record, previous.as_ref(), staged, first, &mut notes).await {
             Ok(()) => {
                 self.cleanup_generations(generation).await;
-                let record = self.update(|r| r.status = AppStatus::Running).await;
-                gate.set_phase(Phase::Ready);
+                let updated = self.update(|r| r.status = AppStatus::Running).await;
+                self.ready(&gate, &record).await;
                 tracing::info!(app = self.name, generation, "deployed");
-                let mut info = self.info(record?).await?;
+                let mut info = self.info(updated?).await?;
                 info.notes = notes;
                 return Ok(info);
             }
@@ -1351,8 +1372,7 @@ impl App<'_> {
                 ));
                 prev.updated_at = now();
                 // Its containers may still be running: the next request checks, and starts them if needed.
-                self.inner
-                    .set_route(self.name, &prev.domain, prev.port, prev.idle_timeout_secs);
+                self.inner.set_route(&prev);
                 gate.set_phase(resting_phase(prev.status));
                 let mut state = self.inner.state.lock().await;
                 state.release(&record.images, &prev.images);
@@ -1423,6 +1443,7 @@ impl App<'_> {
                 shared_dirs: &shared_dirs,
                 host_port: record.port,
                 labels: &labels,
+                internal: self.inner.cfg.internal.map(|a| a.ip()),
             },
         )
         .map_err(|e| Failure::NotStarted(AppsError::Internal(e.into())))?;

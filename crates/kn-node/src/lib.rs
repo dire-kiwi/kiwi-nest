@@ -63,6 +63,9 @@ pub struct NodeConfig {
     pub backup_targets: Option<PathBuf>,
     /// How often the volumes' space is measured; zero never.
     pub usage_interval: Duration,
+    /// Where the gateway listens for apps calling the apps they use (`x-kiwi-nest.uses`), if it does: an address
+    /// on the host that containers reach, Docker's bridge by default.
+    pub internal: Option<SocketAddr>,
 }
 
 impl NodeConfig {
@@ -87,6 +90,7 @@ impl NodeConfig {
             idle_check_interval: Duration::from_secs(1),
             backup_targets: None,
             usage_interval: Duration::from_secs(300),
+            internal: None,
         }
     }
 
@@ -143,7 +147,97 @@ pub fn check_loopback(addr: &SocketAddr) -> anyhow::Result<()> {
 ///
 /// Prints `listening on http://ADDR` (the API), then `gateway on http://ADDR`, to stdout once both are up. Apps
 /// keep running after the node exits, and the next node agent adopts them.
-pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen: SocketAddr) -> anyhow::Result<()> {
+/// The internal gateway's port, unless `--internal-listen` says otherwise: apps call those they use at
+/// `http://NAME.internal:7383`.
+pub const INTERNAL_PORT: u16 = 7383;
+
+/// Where the gateway listens for apps calling the apps they use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InternalListen {
+    /// On Docker's bridge address, port [`INTERNAL_PORT`], if there is one and it's free.
+    Auto,
+    Off,
+    At(SocketAddr),
+}
+
+impl std::str::FromStr for InternalListen {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "auto" => Ok(InternalListen::Auto),
+            "off" => Ok(InternalListen::Off),
+            a => a
+                .parse()
+                .map(InternalListen::At)
+                .map_err(|_| format!("`{a}` isn't `auto`, `off` or an address such as 172.17.0.1:7383")),
+        }
+    }
+}
+
+/// Listens for the internal gateway, if it should, and records where in `cfg`. An address that was asked for must
+/// work; otherwise not finding Docker's bridge, or its port being taken, only turns calls between apps off.
+async fn listen_internal(
+    cfg: &mut NodeConfig,
+    want: InternalListen,
+) -> anyhow::Result<Option<tokio::net::TcpListener>> {
+    let addr = match want {
+        InternalListen::Off => return Ok(None),
+        InternalListen::At(a) => {
+            if a.ip().is_unspecified() || a.ip().is_loopback() {
+                bail!(
+                    "the internal gateway must listen on an address of this host that containers reach, such as \
+                     Docker's bridge (172.17.0.1:{INTERNAL_PORT}); not {a}"
+                );
+            }
+            let l = tokio::net::TcpListener::bind(a)
+                .await
+                .with_context(|| format!("listening on {a}"))?;
+            cfg.internal = Some(l.local_addr()?);
+            return Ok(Some(l));
+        }
+        InternalListen::Auto => match runtime::Docker::for_node(cfg).bridge_gateway().await {
+            Ok(Some(ip)) => SocketAddr::new(ip, INTERNAL_PORT),
+            Ok(None) => {
+                tracing::warn!("Docker has no bridge network, so apps can't call other apps (see --internal-listen)");
+                return Ok(None);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "couldn't find Docker's bridge network, so apps can't call other apps");
+                return Ok(None);
+            }
+        },
+    };
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => {
+            cfg.internal = Some(l.local_addr()?);
+            Ok(Some(l))
+        }
+        Err(e) => {
+            tracing::warn!(%addr, error = %e, "couldn't listen for the internal gateway, so apps can't call other apps");
+            Ok(None)
+        }
+    }
+}
+
+/// Serves the internal gateway, if it's listening.
+async fn serve_internal(
+    listener: Option<tokio::net::TcpListener>,
+    apps: apps::Apps,
+    stop: tokio_util::sync::CancellationToken,
+) -> std::io::Result<()> {
+    match listener {
+        Some(l) => gateway::serve(l, apps, gateway::Access::Internal, stop.cancelled_owned()).await,
+        None => Ok(()),
+    }
+}
+
+pub async fn run_standalone(
+    cfg: NodeConfig,
+    listen: SocketAddr,
+    gateway_listen: SocketAddr,
+    internal: InternalListen,
+) -> anyhow::Result<()> {
     check_loopback(&listen)?;
     check_loopback(&gateway_listen)?;
     // A state directory of a node the server forgot is refused, once its apps are taken down if that was cut off,
@@ -151,6 +245,9 @@ pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen:
     cfg.validate()?;
     agent::prepare(&cfg, &runtime::Docker::for_node(&cfg), false).await?;
     let usage_interval = cfg.usage_interval;
+    let mut cfg = cfg;
+    let internal_listener = listen_internal(&mut cfg, internal).await?;
+    let internal_addr = cfg.internal;
     let apps = apps::Apps::open(cfg).await?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -161,6 +258,9 @@ pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen:
     let (addr, gw_addr) = (listener.local_addr()?, gw_listener.local_addr()?);
     println!("listening on http://{addr}");
     println!("gateway on http://{gw_addr}");
+    if let Some(a) = internal_addr {
+        println!("internal gateway on http://{a}");
+    }
     tracing::info!(%addr, gateway = %gw_addr, "standalone node listening");
     let stop = tokio_util::sync::CancellationToken::new();
     tokio::spawn({
@@ -173,7 +273,13 @@ pub async fn run_standalone(cfg: NodeConfig, listen: SocketAddr, gateway_listen:
     apps.spawn_usage(usage_interval, stop.clone());
     tokio::try_join!(
         api::serve(listener, apps.clone(), stop.clone().cancelled_owned()),
-        gateway::serve(gw_listener, apps, gateway::Access::Local, stop.cancelled_owned()),
+        gateway::serve(
+            gw_listener,
+            apps.clone(),
+            gateway::Access::Local,
+            stop.clone().cancelled_owned()
+        ),
+        serve_internal(internal_listener, apps, stop),
     )?;
     tracing::info!("stopped; apps keep running");
     Ok(())
@@ -202,6 +308,7 @@ pub async fn run_agent(
     mut agent: agent::AgentConfig,
     gateway_listen: SocketAddr,
     ingress_listen: Option<SocketAddr>,
+    internal: InternalListen,
 ) -> anyhow::Result<agent::Stopped> {
     check_loopback(&gateway_listen)?;
     if let Some(a) = &ingress_listen {
@@ -214,6 +321,10 @@ pub async fn run_agent(
     cfg.validate()?;
     agent::prepare(&cfg, &runtime::Docker::for_node(&cfg), agent.join_token.is_some()).await?;
     let usage_interval = cfg.usage_interval;
+    let internal_listener = listen_internal(&mut cfg, internal).await?;
+    if let Some(a) = cfg.internal {
+        println!("internal gateway on http://{a}");
+    }
     let apps = apps::Apps::open(cfg).await?;
     let gw_listener = tokio::net::TcpListener::bind(gateway_listen)
         .await
@@ -273,16 +384,18 @@ pub async fn run_agent(
         gateway::Access::Local,
         stop.clone().cancelled_owned(),
     );
+    let for_apps = serve_internal(internal_listener, apps.clone(), stop.clone());
     let for_ingress = async {
         match ingress {
             Some((l, access)) => gateway::serve(l, apps, access, stop.clone().cancelled_owned()).await,
             None => Ok(()),
         }
     };
-    let (polled, served, served_ingress) = tokio::join!(polling, gateway, for_ingress);
+    let (polled, served, served_ingress, served_internal) = tokio::join!(polling, gateway, for_ingress, for_apps);
     let stopped = polled?;
     served?;
     served_ingress?;
+    served_internal?;
     match &stopped {
         agent::Stopped::Asked => tracing::info!("stopped; apps keep running"),
         agent::Stopped::Restart(p) => {
@@ -319,9 +432,37 @@ mod tests {
         });
         std::fs::write(cfg.state_dir.join("agent.json"), file.to_string()).unwrap();
         let any = "127.0.0.1:0".parse().unwrap();
-        let err = run_standalone(cfg.clone(), any, any).await.unwrap_err().to_string();
+        let err = run_standalone(cfg.clone(), any, any, InternalListen::Off)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("forgot this node"), "{err}");
         assert!(!cfg.state_dir.join("apps").exists(), "its apps weren't opened");
+    }
+
+    #[test]
+    fn parses_where_the_internal_gateway_listens() {
+        assert_eq!("auto".parse(), Ok(InternalListen::Auto));
+        assert_eq!("off".parse(), Ok(InternalListen::Off));
+        assert_eq!(
+            "172.17.0.1:7383".parse(),
+            Ok(InternalListen::At("172.17.0.1:7383".parse().unwrap()))
+        );
+        assert!("172.17.0.1".parse::<InternalListen>().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_internal_gateway_needs_an_address_containers_reach() {
+        let mut cfg = NodeConfig::new("/var/lib/kiwi-nest".into());
+        for a in ["0.0.0.0:7383", "127.0.0.1:7383"] {
+            let err = listen_internal(&mut cfg, InternalListen::At(a.parse().unwrap()))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("containers reach"), "{err}");
+        }
+        assert!(listen_internal(&mut cfg, InternalListen::Off).await.unwrap().is_none());
+        assert_eq!(cfg.internal, None);
     }
 
     #[test]
