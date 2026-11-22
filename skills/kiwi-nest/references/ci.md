@@ -90,7 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # build the bundle into ./bundle here, unless the repository is the bundle
-      - uses: dire-kiwi/kiwi-nest@v0.2.1      # a release's tag
+      - uses: dire-kiwi/kiwi-nest@v0.3.0      # a release's tag
         with:
           server: https://kn.dire.nz
           token: ${{ secrets.KIWI_NEST_PREVIEW_TOKEN }}   # --pattern 'code-pr*' --from code
