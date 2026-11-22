@@ -1,25 +1,38 @@
 import { useState } from 'react'
-import { api, type AppSummary, type BackupResult, type NodeInfo } from '../api'
-import { Action, Badge, ErrorBox, PollState, Section, StatusBadge } from '../components'
-import { go, usePoll } from '../hooks'
-import { BackupResultView, IdleTimeout, LastActivity } from './shared'
+import { api, type AppStatus, type AppSummary, type BackupResult, type NodeInfo } from '../api'
+import { countByStatus, plural, STATUSES, useCluster } from '../cluster'
+import { Action, Badge, Empty, ErrorBox, PageHead, PollState, StatusBadge } from '../components'
+import { bytes } from '../format'
+import { IconSearch } from '../icons'
+import { BackupResultView, Domain, IdleTimeout, LastActivity } from './shared'
 
 const UNPLACED = '\u0000unplaced'
 
 export function Apps() {
-  const apps = usePoll(api.apps, 5000)
-  const nodes = usePoll(api.nodes, 5000)
+  const { apps, nodes } = useCluster()
+  const [query, setQuery] = useState('')
+  const [status, setStatus] = useState<AppStatus>()
   const [backup, setBackup] = useState<{ app: string; result: BackupResult }>()
   const [actionError, setActionError] = useState<{ app: string; error: Error }>()
 
+  const all = apps.data ?? []
+  const counts = countByStatus(all)
+  const q = query.trim().toLowerCase()
+  const filtering = q !== '' || status !== undefined
+  const shown = all.filter(
+    (a) =>
+      (status === undefined || a.status === status) &&
+      (q === '' || [a.name, a.domain, a.nest ?? ''].some((s) => s.toLowerCase().includes(q))),
+  )
+
   const byNode = new Map<string, AppSummary[]>()
-  for (const a of apps.data ?? []) {
+  for (const a of shown) {
     const key = a.node ?? UNPLACED
     byNode.set(key, [...(byNode.get(key) ?? []), a])
   }
   const nodeInfo = new Map<string, NodeInfo>((nodes.data ?? []).map((n) => [n.name, n]))
-  // Every node gets a section, even without apps, so it's clear where nothing runs.
-  for (const n of nodes.data ?? []) if (!byNode.has(n.name)) byNode.set(n.name, [])
+  // Every node gets a section, even without apps, so it's clear where nothing runs (unless the list is filtered).
+  if (!filtering) for (const n of nodes.data ?? []) if (!byNode.has(n.name)) byNode.set(n.name, [])
   const groups = [...byNode.entries()].sort(([a], [b]) =>
     a === UNPLACED ? 1 : b === UNPLACED ? -1 : a.localeCompare(b),
   )
@@ -28,107 +41,160 @@ export function Apps() {
   const failed = (app: string) => (error: Error) => setActionError({ app, error })
 
   return (
-    <Section title="Apps">
+    <>
+      <PageHead title="Apps" sub={apps.data ? `${plural(all.length, 'app')}, by node` : undefined} />
+      <div className="toolbar">
+        <label className="search">
+          <IconSearch />
+          <input
+            type="search"
+            placeholder="Filter by name, domain or nest"
+            aria-label="Filter apps"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </label>
+        <div className="filters" role="group" aria-label="Status">
+          <button className="filter" aria-pressed={status === undefined} onClick={() => setStatus(undefined)}>
+            All <span className="filter-count">{all.length}</span>
+          </button>
+          {STATUSES.filter((s) => counts[s] > 0 || s === status).map((s) => (
+            <button
+              key={s}
+              className="filter"
+              aria-pressed={status === s}
+              onClick={() => setStatus(status === s ? undefined : s)}
+            >
+              {s} <span className="filter-count">{counts[s]}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
       <PollState loading={apps.loading} error={apps.error} hasData={!!apps.data} />
       {backup && (
-        <div>
-          <p>
-            Backup of <strong>{backup.app}</strong>:
-          </p>
-          <BackupResultView result={backup.result} onClose={() => setBackup(undefined)} />
-        </div>
+        <BackupResultView
+          subject={<strong>{backup.app}</strong>}
+          result={backup.result}
+          onClose={() => setBackup(undefined)}
+        />
       )}
       {actionError && <ErrorBox error={actionError.error} prefix={actionError.app} />}
-      {apps.data && apps.data.length === 0 && <p className="muted">No apps are deployed.</p>}
+      {apps.data && all.length === 0 && <Empty>No apps are deployed.</Empty>}
+      {filtering && all.length > 0 && shown.length === 0 && <Empty>No apps match.</Empty>}
+
       {groups.map(([node, list]) => {
         const info = nodeInfo.get(node)
         return (
-          <div className="group" key={node}>
-            <h3 className="group-head">
-              {node === UNPLACED ? 'Not on a node' : `Node ${node}`}{' '}
-              {info && !info.online && <Badge kind="bad">offline</Badge>}
-              {info?.cordoned && <Badge kind="warn">CORDONED</Badge>}
-            </h3>
+          <section className="panel" key={node} data-node-group={node === UNPLACED ? '' : node}>
+            <header className="panel-head">
+              <h2>
+                {node === UNPLACED ? (
+                  'Not on a node'
+                ) : (
+                  <>
+                    <span className="muted">Node</span> <span className="name">{node}</span>
+                  </>
+                )}
+              </h2>
+              <span className="badges">
+                {info && !info.online && <Badge kind="bad">offline</Badge>}
+                {info?.cordoned && <Badge kind="warn">cordoned</Badge>}
+              </span>
+              <span className="panel-note">
+                {plural(list.length, 'app')}
+                {info && !filtering && <> · {bytes(info.app_memory_bytes)} of memory limits</>}
+              </span>
+            </header>
             {list.length === 0 ? (
-              <p className="muted">No apps.</p>
+              <Empty>No apps.</Empty>
             ) : (
               <div className="table-wrap">
-                <table>
+                <table className="apps-table">
                   <thead>
                     <tr>
                       <th>App</th>
                       <th>Status</th>
-                      <th>Containers</th>
-                      <th>Domain</th>
                       <th>Nest</th>
-                      <th>Idle timeout</th>
                       <th>Last activity</th>
-                      <th>Actions</th>
+                      <th className="col-actions">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {list
-                      .sort((a, b) => a.name.localeCompare(b.name))
+                      .sort((a, b) => (a.nest ?? '').localeCompare(b.nest ?? '') || a.name.localeCompare(b.name))
                       .map((a) => (
                         <tr key={a.name} data-app={a.name}>
                           <td>
-                            <a href={`#/apps/${encodeURIComponent(a.name)}`}>
-                              <strong>{a.name}</strong>
+                            <a className="name strong" href={`#/apps/${encodeURIComponent(a.name)}`}>
+                              {a.name}
                             </a>
-                            <div className="small muted">
-                              generation {a.generation}
-                              {a.pending !== undefined && <> · {a.pending} pending</>}
+                            <div className="sub">
+                              <Domain domain={a.domain} lan={a.access === 'lan'} />
                             </div>
                           </td>
                           <td>
                             <StatusBadge status={a.status} />
-                            {a.error && (
-                              <div className="small bad" title={a.error}>
-                                {a.error}
-                              </div>
+                            <div className="sub">
+                              {a.containers} · generation {a.generation}
+                              {a.pending !== undefined && <> · {a.pending} pending</>}
+                            </div>
+                            {a.error && <div className="sub bad">{a.error}</div>}
+                          </td>
+                          <td>
+                            {a.nest ? (
+                              <a className="name" href="#/nests">
+                                {a.nest}
+                              </a>
+                            ) : (
+                              '—'
                             )}
                           </td>
-                          <td className="small">{a.containers}</td>
-                          <td className="small">
-                            {a.domain}
-                            {a.access === 'lan' && <div className="muted">LAN only</div>}
-                          </td>
-                          <td>{a.nest ?? '—'}</td>
-                          <td className="small">
-                            <IdleTimeout secs={a.idle_timeout_secs} />
-                          </td>
-                          <td className="small">
+                          <td>
                             <LastActivity open={a.open_requests} at={a.last_request_at} />
+                            <div className="sub">
+                              <IdleTimeout secs={a.idle_timeout_secs} />
+                            </div>
                           </td>
-                          <td className="row-actions">
-                            {a.status === 'running' || a.status === 'idle' ? (
+                          <td className="col-actions">
+                            <span className="row-actions">
+                              {a.status !== 'running' && a.status !== 'deploying' ? (
+                                <Action
+                                  label="Resume"
+                                  busyLabel="Waking…"
+                                  // An idle app wakes on its next request anyway; the others stay down until resumed.
+                                  kind={a.status === 'idle' ? 'secondary' : 'primary'}
+                                  small
+                                  run={() => api.resume(a.name)}
+                                  onDone={done}
+                                  onError={failed(a.name)}
+                                />
+                              ) : null}
+                              {a.status === 'running' || a.status === 'idle' ? (
+                                <Action
+                                  label="Suspend"
+                                  small
+                                  run={() => api.suspend(a.name)}
+                                  onDone={done}
+                                  onError={failed(a.name)}
+                                />
+                              ) : null}
+                              <a
+                                className="btn btn-secondary btn-sm"
+                                href={`#/apps/${encodeURIComponent(a.name)}/logs`}
+                              >
+                                Logs
+                              </a>
                               <Action
-                                label="Suspend"
-                                run={() => api.suspend(a.name)}
-                                onDone={done}
+                                label="Back up"
+                                busyLabel="Backing up…"
+                                small
+                                title="Back up now, to every target"
+                                run={() => api.backupApp(a.name)}
+                                onDone={(r) => setBackup({ app: a.name, result: r as BackupResult })}
                                 onError={failed(a.name)}
                               />
-                            ) : null}
-                            {a.status !== 'running' && a.status !== 'deploying' ? (
-                              <Action
-                                label="Resume"
-                                busyLabel="Waking…"
-                                kind="primary"
-                                run={() => api.resume(a.name)}
-                                onDone={done}
-                                onError={failed(a.name)}
-                              />
-                            ) : null}
-                            <button className="btn btn-secondary" onClick={() => go(`/apps/${a.name}/logs`)}>
-                              Logs
-                            </button>
-                            <Action
-                              label="Back up now"
-                              busyLabel="Backing up…"
-                              run={() => api.backupApp(a.name)}
-                              onDone={(r) => setBackup({ app: a.name, result: r as BackupResult })}
-                              onError={failed(a.name)}
-                            />
+                            </span>
                           </td>
                         </tr>
                       ))}
@@ -136,9 +202,9 @@ export function Apps() {
                 </table>
               </div>
             )}
-          </div>
+          </section>
         )
       })}
-    </Section>
+    </>
   )
 }

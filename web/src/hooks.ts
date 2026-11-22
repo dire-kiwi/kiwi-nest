@@ -59,9 +59,9 @@ export function usePoll<T>(fetcher: () => Promise<T>, intervalMs?: number, deps:
   return { data, error, loading, refresh }
 }
 
-/** The page's hash route, without the `#`: `/apps/blog`. */
+/** The page's hash route, without the `#`: `/apps/blog`, or `/` (the overview) when there's none. */
 export function useRoute(): string {
-  const read = () => decodeURI(window.location.hash.replace(/^#/, '')) || '/apps'
+  const read = () => decodeURI(window.location.hash.replace(/^#/, '')) || '/'
   const [route, setRoute] = useState(read)
   useEffect(() => {
     const on = () => setRoute(read())
@@ -69,8 +69,4 @@ export function useRoute(): string {
     return () => window.removeEventListener('hashchange', on)
   }, [])
   return route
-}
-
-export function go(route: string) {
-  window.location.hash = route
 }
