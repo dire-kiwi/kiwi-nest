@@ -447,7 +447,8 @@ pub enum TokenCommand {
         /// (repeatable).
         #[arg(long = "pattern", value_name = "PATTERN")]
         patterns: Vec<String>,
-        /// For a deploy token: apps it may name as `--from` besides its own, such as `blog` (repeatable).
+        /// For a deploy token: apps it may name as `--from` besides its own, or call (`x-kiwi-nest.uses`), such as
+        /// `blog` (repeatable).
         #[arg(long = "from", value_name = "PATTERN")]
         from: Vec<String>,
     },

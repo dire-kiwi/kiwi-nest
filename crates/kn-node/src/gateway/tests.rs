@@ -26,6 +26,8 @@ struct Env {
     gw: SocketAddr,
     /// The listener for the ingress, which needs [`INGRESS_TOKEN`].
     ingress: SocketAddr,
+    /// The internal listener, for apps calling the apps they use.
+    internal: SocketAddr,
 }
 
 const INGRESS_TOKEN: &str = "kni_0123456789abcdef";
@@ -53,9 +55,18 @@ impl Env {
 
     async fn open(dir: tempfile::TempDir, fake: Arc<Fake>) -> Env {
         let volumes = Arc::new(crate::volumes::fake::Fake::default());
-        let apps = Apps::open_with_runtime(config(dir.path()), volumes, fake.clone())
-            .await
-            .unwrap();
+        // On loopback here, with the test's clients on addresses of their own in 127.0.0.0/8.
+        let internal_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let internal = internal_listener.local_addr().unwrap();
+        let mut cfg = config(dir.path());
+        cfg.internal = Some(internal);
+        let apps = Apps::open_with_runtime(cfg, volumes, fake.clone()).await.unwrap();
+        tokio::spawn(super::serve(
+            internal_listener,
+            apps.clone(),
+            super::Access::Internal,
+            std::future::pending(),
+        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let gw = listener.local_addr().unwrap();
         tokio::spawn(super::serve(
@@ -78,7 +89,32 @@ impl Env {
             apps,
             gw,
             ingress,
+            internal,
         }
+    }
+
+    /// Deploys `name` like [`Env::deploy`], always on, calling the apps in `uses`.
+    async fn deploy_using(&self, name: &str, uses: &str) {
+        let b = self.dir.path().join(format!("bundle-{name}"));
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(
+            b.join("compose.yaml"),
+            format!(
+                "x-kiwi-nest: {{ domain: {name}.test, service: web, port: 80, uses: {uses} }}\n\
+                 services:\n  web:\n    image: x\n"
+            ),
+        )
+        .unwrap();
+        let staged = self.apps.stage_dir(b).await.unwrap();
+        self.apps.deploy(name, staged, DeployOptions::default()).await.unwrap();
+    }
+
+    /// Sends a request to the internal listener from the address `from`, as an app's container would.
+    async fn call_from(&self, from: &str, req: Request<Full<Bytes>>) -> Reply {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(format!("{from}:0").parse().unwrap()).unwrap();
+        let stream = socket.connect(self.internal).await.unwrap();
+        self.send_on(stream, req).await
     }
 
     /// Deploys `name` at `NAME.test`, with one service, `web`.
@@ -137,6 +173,10 @@ impl Env {
 
     async fn send_to(&self, addr: SocketAddr, req: Request<Full<Bytes>>) -> Reply {
         let stream = TcpStream::connect(addr).await.unwrap();
+        self.send_on(stream, req).await
+    }
+
+    async fn send_on(&self, stream: TcpStream, req: Request<Full<Bytes>>) -> Reply {
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
             .unwrap();
@@ -785,4 +825,114 @@ fn an_empty_ingress_token_admits_nobody() {
         .unwrap();
     assert_eq!(super::admit(&access, &mut req), super::Admitted::FromIngress);
     assert!(!req.headers().contains_key("kiwi-nest-ingress"));
+}
+
+#[tokio::test]
+async fn apps_call_the_apps_they_use_through_the_internal_listener() {
+    let env = Env::new().await;
+    env.deploy("cms", "1s").await;
+    env.deploy("shop", "0").await;
+    // blog's containers are at 127.0.0.2, other's at 127.0.0.3; other uses nothing.
+    env.fake.set_networks("kn-blog", &["127.0.0.2/32"]);
+    env.fake.set_networks("kn-other", &["127.0.0.3/32"]);
+    env.deploy_using("blog", "[cms, gone]").await;
+    env.deploy("other", "0").await;
+    env.until_stopped("cms").await;
+    let starts = env.starts("cms");
+    let call = |host: &str| headers_request(host, &[("x-forwarded-for", "203.0.113.7"), ("x-real-ip", "1.2.3.4")]);
+
+    // blog calls cms, which wakes for it; the gateway says where the call came from, whatever it claimed.
+    let r = env.call_from("127.0.0.2", call("cms.internal:7383")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.body.contains("x-forwarded-for: 127.0.0.2\n"), "{}", r.body);
+    assert!(r.body.contains("x-forwarded-host: cms.internal:7383\n"), "{}", r.body);
+    assert!(!r.body.contains("x-real-ip"), "{}", r.body);
+    assert_eq!(env.starts("cms"), starts + 1);
+    assert_eq!(
+        env.fake.calls("networks", "kn-blog"),
+        1,
+        "looked up when it became ready"
+    );
+    assert_eq!(
+        env.fake.calls("networks", "kn-other"),
+        0,
+        "an app that uses nothing isn't looked up"
+    );
+
+    // Only the apps it lists, and only as NAME.internal.
+    let r = env.call_from("127.0.0.2", call("shop.internal")).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert!(r.body.contains("app `blog` doesn't list `shop`"), "{}", r.body);
+    let r = env.call_from("127.0.0.2", call("gone.internal")).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
+    assert!(r.body.contains("app `gone` isn't on this node"), "{}", r.body);
+    for host in ["cms.test", "cms", "x.cms.internal"] {
+        let r = env.call_from("127.0.0.2", call(host)).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{host}");
+    }
+
+    // Nothing else may call: an app that uses nothing, an address that's no app's, the ingress's token.
+    for from in ["127.0.0.3", "127.0.0.1", "127.0.0.4"] {
+        let r = env.call_from(from, call("cms.internal")).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{from}");
+        assert!(
+            r.body.contains("only takes requests from this node's running apps"),
+            "{}",
+            r.body
+        );
+    }
+    let r = env
+        .call_from(
+            "127.0.0.3",
+            headers_request("cms.internal", &[("kiwi-nest-ingress", INGRESS_TOKEN)]),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    // NAME.internal means nothing on the other listeners.
+    assert_eq!(env.get("cms.internal", "/").await.status, StatusCode::NOT_FOUND);
+
+    // A suspended app calls nothing, and calls again once it's running, at its networks as they are then.
+    env.apps.suspend("blog").await.unwrap();
+    let r = env.call_from("127.0.0.2", call("cms.internal")).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    env.fake.set_networks("kn-blog", &["127.0.0.5/32"]);
+    env.apps.resume("blog").await.unwrap();
+    assert_eq!(
+        env.call_from("127.0.0.2", call("cms.internal")).await.status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        env.call_from("127.0.0.5", call("cms.internal")).await.status,
+        StatusCode::OK
+    );
+
+    // A redeploy that stops using it can't call it any more.
+    env.deploy_using("blog", "[shop]").await;
+    let r = env.call_from("127.0.0.5", call("cms.internal")).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        env.call_from("127.0.0.5", call("shop.internal")).await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn an_app_that_uses_others_needs_the_internal_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let volumes = Arc::new(crate::volumes::fake::Fake::default());
+    let apps = Apps::open_with_runtime(config(dir.path()), volumes, Fake::new())
+        .await
+        .unwrap();
+    let b = dir.path().join("bundle");
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(
+        b.join("compose.yaml"),
+        "x-kiwi-nest: { domain: blog.test, service: web, port: 80, uses: [cms] }\nservices:\n  web:\n    image: x\n",
+    )
+    .unwrap();
+    let staged = apps.stage_dir(b).await.unwrap();
+    let e = apps.deploy("blog", staged, DeployOptions::default()).await.unwrap_err();
+    assert!(matches!(e, AppsError::Unsupported(_)), "{e}");
+    assert!(e.to_string().contains("internal gateway isn't listening"), "{e}");
+    assert!(apps.inspect("blog").await.is_err(), "nothing was recorded");
 }

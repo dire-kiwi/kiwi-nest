@@ -3,6 +3,7 @@
 //! Every call names the project and its generated file explicitly, and runs with an empty environment apart from
 //! what Docker itself needs, so nothing on the node (variables, `.env` files) leaks into an app.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -97,6 +98,46 @@ pub enum ImageRemoval {
     InUse,
 }
 
+/// An IP network, such as `172.18.0.0/16`: one of a project's networks, whose containers' addresses are in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subnet {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl Subnet {
+    /// Parses `ADDR/PREFIX`.
+    pub fn parse(s: &str) -> Option<Subnet> {
+        let (addr, prefix) = s.trim().split_once('/')?;
+        let addr: IpAddr = addr.parse().ok()?;
+        let prefix: u8 = prefix.parse().ok()?;
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        (prefix <= max).then_some(Subnet { addr, prefix })
+    }
+
+    /// Whether `ip` is in it. An IPv4 address mapped into IPv6 (as a dual-stack socket reports it) counts as the
+    /// IPv4 address.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        let (a, b, bits) = match (self.addr, ip) {
+            (IpAddr::V4(a), IpAddr::V4(b)) => (u32::from(a) as u128, u32::from(b) as u128, 32),
+            (IpAddr::V6(a), IpAddr::V6(b)) => (u128::from(a), u128::from(b), 128),
+            _ => return false,
+        };
+        let shift = bits - u32::from(self.prefix);
+        shift >= bits || (a >> shift) == (b >> shift)
+    }
+}
+
+impl std::fmt::Display for Subnet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
 /// What the node needs from a container runtime: an app's Compose project, created, started, stopped and listed.
 ///
 /// [`Docker`] is the real one. Tests use a fake, so the gateway's lifecycle can be checked without Docker.
@@ -122,6 +163,8 @@ pub trait Runtime: Send + Sync + 'static {
     fn logs(&self, p: &Project, opts: &LogsOptions) -> Result<Child, RuntimeError>;
     /// Removes an image by reference, unless a container (any container on the engine) uses it.
     fn remove_image<'a>(&'a self, reference: &'a str) -> BoxFuture<'a, Result<ImageRemoval, RuntimeError>>;
+    /// The subnets of the project's own networks, which its containers' addresses are in.
+    fn networks<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<Vec<Subnet>, RuntimeError>>;
 }
 
 /// Runs `docker compose`.
@@ -177,6 +220,24 @@ impl Docker {
         }
         c.args(args);
         c
+    }
+
+    /// The address of Docker's default bridge network on this host (`docker0`), which is also where a container's
+    /// `host-gateway` points by default, if it has one.
+    pub async fn bridge_gateway(&self) -> Result<Option<IpAddr>, RuntimeError> {
+        let mut c = self.base();
+        c.args([
+            "network",
+            "inspect",
+            "bridge",
+            "--format",
+            "{{range .IPAM.Config}}{{.Gateway}} {{end}}",
+        ]);
+        let out = self.run(c).await?;
+        // The IPv4 gateway, if there's one, as an IPv6 one may come first.
+        let mut ips: Vec<IpAddr> = out.split_whitespace().filter_map(|a| a.parse().ok()).collect();
+        ips.sort_by_key(|ip| !ip.is_ipv4());
+        Ok(ips.first().copied())
     }
 
     async fn run(&self, mut c: Command) -> Result<String, RuntimeError> {
@@ -320,6 +381,37 @@ impl Runtime for Docker {
             }
         })
     }
+
+    fn networks<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<Vec<Subnet>, RuntimeError>> {
+        Box::pin(async move {
+            let mut c = self.base();
+            c.args(["network", "ls", "--quiet", "--no-trunc", "--filter"])
+                .arg(format!("label=com.docker.compose.project={}", p.name));
+            let ids = self.run(c).await?;
+            let ids: Vec<&str> = ids.split_whitespace().collect();
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut c = self.base();
+            c.args([
+                "network",
+                "inspect",
+                "--format",
+                "{{range .IPAM.Config}}{{.Subnet}} {{end}}",
+            ])
+            .args(&ids);
+            let command = describe(&c);
+            let out = self.run(c).await?;
+            out.split_whitespace()
+                .map(|s| {
+                    Subnet::parse(s).ok_or_else(|| RuntimeError::Output {
+                        command: command.clone(),
+                        message: format!("`{s}` isn't a subnet"),
+                    })
+                })
+                .collect()
+        })
+    }
 }
 
 /// Parses Compose's JSON output: one object per line in current versions, an array in older ones.
@@ -358,6 +450,28 @@ mod tests {
         let arr: Vec<ContainerState> = parse_json_lines(&format!("[{line}]")).unwrap();
         assert_eq!(arr, one[..1]);
         assert!(parse_json_lines::<ContainerState>("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn subnets() {
+        let s = Subnet::parse("172.18.0.0/16").unwrap();
+        assert_eq!(s.to_string(), "172.18.0.0/16");
+        assert!(s.contains("172.18.0.5".parse().unwrap()));
+        assert!(s.contains("172.18.255.255".parse().unwrap()));
+        assert!(!s.contains("172.19.0.5".parse().unwrap()));
+        assert!(
+            s.contains("::ffff:172.18.0.5".parse().unwrap()),
+            "an IPv4-mapped address"
+        );
+        assert!(!s.contains("fd00::5".parse().unwrap()));
+        let one = Subnet::parse("10.0.0.7/32").unwrap();
+        assert!(one.contains("10.0.0.7".parse().unwrap()) && !one.contains("10.0.0.8".parse().unwrap()));
+        assert!(Subnet::parse("0.0.0.0/0").unwrap().contains("8.8.8.8".parse().unwrap()));
+        let v6 = Subnet::parse("fd00:1::/64").unwrap();
+        assert!(v6.contains("fd00:1::9".parse().unwrap()) && !v6.contains("fd00:2::9".parse().unwrap()));
+        for bad in ["172.18.0.0", "172.18.0.0/33", "fd00::/129", "x/8", "10.0.0.0/-1"] {
+            assert!(Subnet::parse(bad).is_none(), "{bad}");
+        }
     }
 
     #[test]

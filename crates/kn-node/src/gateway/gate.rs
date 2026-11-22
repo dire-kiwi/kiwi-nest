@@ -10,6 +10,8 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime::Subnet;
+
 /// Where an app is, as far as requests are concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -58,6 +60,12 @@ struct State {
     last_request: Option<SystemTime>,
     /// Cancelled to break every open lease.
     cancel: CancellationToken,
+    /// The apps it may call through the internal gateway (`x-kiwi-nest.uses`).
+    uses: Vec<String>,
+    /// Its networks' subnets, found when it last became ready: the internal gateway's requests from them are its.
+    /// Every other change of phase forgets them, since a network can be removed and its subnet given to another
+    /// app once the app isn't running.
+    networks: Vec<Subnet>,
 }
 
 impl Gate {
@@ -71,6 +79,8 @@ impl Gate {
                 last_active: Instant::now(),
                 last_request: None,
                 cancel: CancellationToken::new(),
+                uses: Vec::new(),
+                networks: Vec::new(),
             }),
             phase: watch::Sender::new(phase),
         })
@@ -94,20 +104,44 @@ impl Gate {
         self.phase.subscribe()
     }
 
-    /// Where requests go, and when the app is stopped for being idle.
-    pub fn configure(&self, port: u16, idle_timeout: Duration) {
+    /// Where requests go, when the app is stopped for being idle, and which apps it calls.
+    pub fn configure(&self, port: u16, idle_timeout: Duration, uses: &[String]) {
         let mut s = self.lock();
         s.port = port;
         s.idle_timeout = idle_timeout;
+        s.uses = uses.to_vec();
     }
 
+    /// Whether the app may call `app` through the internal gateway.
+    pub fn uses(&self, app: &str) -> bool {
+        self.lock().uses.iter().any(|u| u == app)
+    }
+
+    /// Changes the phase, and forgets the app's networks (see [`Gate::set_ready`]).
     pub fn set_phase(&self, phase: Phase) {
+        self.set(phase, Vec::new());
+    }
+
+    /// Marks the app ready, with the subnets of its networks: requests to the internal gateway from them are the
+    /// app's until its phase next changes.
+    pub fn set_ready(&self, networks: Vec<Subnet>) {
+        self.set(Phase::Ready, networks);
+    }
+
+    fn set(&self, phase: Phase, networks: Vec<Subnet>) {
         let mut s = self.lock();
         if phase == Phase::Ready {
             // The idle timeout counts from when the app came up.
             s.last_active = Instant::now();
         }
+        s.networks = networks;
         self.phase.send_replace(phase);
+    }
+
+    /// Whether a connection from `ip` comes from this app: it's ready, and `ip` is on one of its networks.
+    pub fn calls_from(&self, ip: std::net::IpAddr) -> bool {
+        let s = self.lock();
+        *self.phase.borrow() == Phase::Ready && s.networks.iter().any(|n| n.contains(ip))
     }
 
     /// A lease for a request, if the app is ready; otherwise the phase it's in.
@@ -177,8 +211,9 @@ impl Gate {
 
     /// A connection to the app failed: the next request checks it, and starts it if needed.
     pub fn upstream_failed(&self) {
-        let _s = self.lock();
+        let mut s = self.lock();
         if *self.phase.borrow() == Phase::Ready {
+            s.networks.clear();
             self.phase.send_replace(Phase::Stopped);
         }
     }
@@ -251,6 +286,26 @@ mod tests {
         assert!(g.begin_idle_stop(later));
         assert_eq!(g.phase(), Phase::Stopping);
         assert!(matches!(g.lease(), Err(Phase::Stopping)));
+    }
+
+    #[test]
+    fn an_app_owns_its_networks_only_while_ready() {
+        let g = Gate::new("a", 1, Duration::ZERO, Phase::Busy);
+        g.configure(1, Duration::ZERO, &["cms".to_string()]);
+        assert!(g.uses("cms") && !g.uses("shop"));
+        let ip = "172.18.0.5".parse().unwrap();
+        g.set_ready(vec![Subnet::parse("172.18.0.0/16").unwrap()]);
+        assert!(g.calls_from(ip));
+        assert!(!g.calls_from("172.19.0.5".parse().unwrap()));
+        // Stopping keeps the networks, but nothing calls from a stopped app; any other phase forgets them.
+        assert!(g.begin_suspend().is_ok());
+        assert!(!g.calls_from(ip));
+        g.set_phase(Phase::Ready);
+        assert!(!g.calls_from(ip), "becoming ready without its networks forgets them");
+        g.set_ready(vec![Subnet::parse("172.18.0.0/16").unwrap()]);
+        g.upstream_failed();
+        g.set_phase(Phase::Ready);
+        assert!(!g.calls_from(ip));
     }
 
     #[test]

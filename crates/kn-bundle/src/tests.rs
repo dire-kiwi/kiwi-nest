@@ -453,6 +453,7 @@ impl Gen {
             shared_dirs: &self.shared_dirs,
             host_port: 31234,
             labels: &self.labels,
+            internal: Some("172.17.0.1".parse().unwrap()),
         }
     }
 
@@ -514,6 +515,62 @@ fn named_volumes_become_bind_mounts_of_the_apps_directories() {
     assert_eq!(get(data, "read_only").as_bool(), Some(false));
     assert_eq!(get(data, "bind.create_host_path").as_bool(), Some(false));
     assert_eq!(get(&out, "services.db.volumes.0.source"), "/vol/apps/blog/db");
+}
+
+#[test]
+fn used_apps_get_host_entries_for_the_internal_gateway() {
+    let uses = |web: &str| bundle(web, "").replacen("port: 8080 }", "port: 8080, uses: [cms, search] }", 1);
+    let out = Gen::new().run(&uses(""));
+    for svc in ["web", "db"] {
+        let hosts = get(&out, &format!("services.{svc}.extra_hosts")).as_sequence().unwrap();
+        assert_eq!(
+            hosts,
+            &[
+                Value::from("cms.internal:172.17.0.1"),
+                Value::from("search.internal:172.17.0.1")
+            ]
+        );
+    }
+    // The bundle's own entries stay, apart from one for the same name.
+    let out = Gen::new().run(&uses(r#"extra_hosts: ["cms.internal:10.0.0.9", "db.lan:10.0.0.8"]"#));
+    let hosts = get(&out, "services.web.extra_hosts").as_sequence().unwrap();
+    assert_eq!(
+        hosts,
+        &[
+            Value::from("db.lan:10.0.0.8"),
+            Value::from("cms.internal:172.17.0.1"),
+            Value::from("search.internal:172.17.0.1")
+        ]
+    );
+    let out = Gen::new().run(&uses("extra_hosts: { cms.internal: 10.0.0.9, db.lan: 10.0.0.8 }"));
+    let hosts = get(&out, "services.web.extra_hosts").as_mapping().unwrap();
+    assert_eq!(hosts.get("cms.internal").unwrap(), "172.17.0.1");
+    assert_eq!(hosts.get("db.lan").unwrap(), "10.0.0.8");
+    // A service in another's network namespace shares its hosts, and Docker refuses entries of its own there.
+    let yaml = uses("").replace(
+        "  db:
+    image: postgres:17
+",
+        "  db:
+    image: postgres:17
+    network_mode: service:web
+",
+    );
+    let out = Gen::new().run(&yaml);
+    assert!(get(&out, "services.db").get("extra_hosts").is_none());
+    // An app that uses none gets none.
+    let out = Gen::new().run(&bundle("", ""));
+    assert!(get(&out, "services.web").get("extra_hosts").is_none());
+    // IPv6.
+    let g = Gen::new();
+    let b = ok(&uses(""));
+    let mut p = g.params(Path::new("/b"));
+    p.internal = Some("fd00::1".parse().unwrap());
+    let out: Value = serde_yaml_ng::from_str(&generate(&b, &p).unwrap()).unwrap();
+    assert_eq!(get(&out, "services.web.extra_hosts.0"), "cms.internal=[fd00::1]");
+    // Without the internal gateway, there's nothing to point them at.
+    p.internal = None;
+    assert!(matches!(generate(&b, &p), Err(GenerateError::NoInternal)));
 }
 
 /// The base bundle, with `x-kiwi-nest.shared` set to `shared`.

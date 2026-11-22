@@ -27,6 +27,7 @@ Goals:
   that ask for it.
 - Scale to zero: an idle app is stopped, and a request starts it again.
 - One ingress per cluster, handling TLS, basic auth, LAN-only apps and routing a domain to its node.
+- Apps can call the apps they name, LAN-only ones included, through their node's gateway.
 - A private image registry for the cluster.
 - Install, joining nodes, and upgrades without SSH to every node.
 - A web UI, and a GitHub Action for previews.
@@ -112,6 +113,7 @@ x-kiwi-nest:
   node_labels: { disk: ssd }
   backups: false          # optional: skip scheduled backups (previews)
   access: lan             # optional: public (the default), or lan: only clients on the cluster's LAN
+  uses: [cms]             # optional: apps it calls, at http://cms.internal:7383 (see the gateway)
 
 services:
   web:
@@ -141,14 +143,16 @@ volumes:
   - `x-kiwi-nest` needs `domain`, `service` and `port`. `idle_timeout` defaults to `0` (always on), so forgetting it
     never stops a production app; previews set it. `backups` defaults to `true`, so scheduled backups include an
     app unless it says otherwise; previews can. `access` is `public` (the default) or `lan` (see the ingress).
-    Unknown keys are refused, which catches typos.
+    `uses` lists app names, each once. Unknown keys are refused, which catches typos.
   - A shared volume is mounted into every service, or only those its `services` list names (which must exist). Its
     target can't be where the service already mounts something, or where another shared volume lands.
   - Every problem in a bundle is reported at once, each with where it is (`services.web.ports: …`).
 - **Generated files.** The node writes its own Compose file from the bundle. In it, every named volume becomes a bind
   mount of that app's subvolume, each shared volume a bind mount of the shared subvolume (read-only for `ro`) or of
-  the app's own snapshot of it, and only the routed service gets a port, bound to `127.0.0.1`. The generated file is
-  kept outside the bundle's directory, so a writable mount can't change it.
+  the app's own snapshot of it, and only the routed service gets a port, bound to `127.0.0.1`. An app that `uses`
+  others gets a host entry for each, `NAME.internal`, pointing at the node's internal gateway, in every service
+  with a network of its own (replacing any entry of the bundle's for that name). The generated file is kept outside
+  the bundle's directory, so a writable mount can't change it.
 - **Redeploying updates in place.** `deploy` on an existing app replaces its bundle: the node stops the old project
   and starts the new one (brief downtime). The app's volumes stay. `--create-only` refuses if the app exists.
 - **Reading a bundle safely.** A ZIP is checked entry by entry before anything is written, and a directory is read
@@ -264,7 +268,7 @@ VOLUMES/                         one btrfs filesystem per node
 ## Nests and placement
 
 - **An app's nest** comes from the nest it's already in (a redeploy), its `--from` app's, the nest of each shared
-  volume it mounts, and an explicit `nest:`. If those name two different nests, the deploy is refused before
+  volume it mounts, the nest of each app it `uses` (which must exist, and isn't itself), and an explicit `nest:`. If those name two different nests, the deploy is refused before
   anything is saved, saying which two disagree. With none of them, the app is in the nest named after it. A shared
   volume is in `--nest`, or the nest named after it (a volume whose name can't name a nest needs `--nest`). Nests
   are known by name, so an app or volume that names a nest that exists joins it: `nest: shop` puts `shop-admin`
@@ -366,8 +370,8 @@ command with what it acts on and who asked), on a thread of its own, in WAL
   anything is saved, and only moved into the store by the transaction that saves the change, so a refused deploy
   leaves nothing. Each node keeps a small state file of what it has applied.
 - **Tokens**, stored only as hashes: admin tokens; deploy tokens limited to name patterns (for example `blog-pr*`
-  for a repository's previews), which may also name apps they may use as `--from` (`blog`) without being able to
-  change them, and may mount shared volumes `ro` or `snapshot` but not `rw`; node tokens, which `node forget`
+  for a repository's previews), which may also name apps they may use as `--from` (`blog`), or call through
+  `uses`, without being able to change them, and may mount shared volumes `ro` or `snapshot` but not `rw`; node tokens, which `node forget`
   revokes; one-time join tokens. The first start of a server prints its first admin token, once. The last admin
   token can't be revoked. Each node's ingress token (`kni_…`) is the exception: the server keeps it as it is, since
   the ingress's configuration needs it. Each node's registry credential (`knr_…`) is kept as a hash, and only
@@ -438,6 +442,33 @@ command with what it acts on and who asked), on a thread of its own, in WAL
   stopped one back. A failed start is followed by `docker compose stop`, so Docker's restart policy doesn't keep a
   crashing app going, and requests are refused for `--start-cooldown` (15 seconds) before one may try again; an
   explicit `resume` skips the cooldown. The app shows as `idle`, with the start's error.
+- **Calls between apps.** Apps are separate Compose projects with networks of their own, so one can't reach
+  another directly, and going out through the ingress doesn't work for LAN-only apps: a container's connection to
+  its own host comes from its Docker network, not the LAN. So an app lists the apps it calls (`uses: [cms]`), and
+  calls them at `http://cms.internal:7383` through its node's gateway, which wakes an idle callee as for any
+  request (D34).
+  - **The internal listener** (`--internal-listen`) is on an address of the host that containers reach: by default
+    (`auto`) Docker's bridge (`docker0`, such as `172.17.0.1`), port 7383, if Docker has one and the port is free;
+    otherwise calls between apps are off and the node says so, as does a deploy that `uses` others (refused). An
+    address given outright must work, and can't be loopback or unspecified. `off` turns it off. The generated
+    Compose file's `NAME.internal` entries name the address, and the bundle names the port, so nodes should keep
+    the default; the dev cluster's two nodes share one bridge, so b's is 7384.
+  - **The caller is known by its address.** When an app that uses others becomes ready (deployed, started,
+    adopted), its node looks up the subnets of its project's networks (`docker network ls` and `inspect`), and
+    the gateway takes a request there as that app's if its peer is in one of them, and the app is ready. Any other
+    change of phase forgets them, since a network is only removed (and its subnet given to another project) once
+    the app's containers are down. A container's connection to its own host is delivered locally, never
+    masqueraded, so the peer is its address on its network; no header changes it.
+  - Each request goes to `NAME` if the caller lists it in `uses` and it's on the node (`403` or `404` otherwise,
+    saying which), with its forwarding headers replaced as on loopback (`X-Forwarded-Host: cms.internal:7383`).
+    The callee's basic auth and access are the ingress's, so they don't apply: listing an app in `uses` is what
+    lets an app call it. Requests from anything that isn't a running app that uses others get `403`, and other
+    hosts `404`.
+  - The caller and callee share a node because the caller joins the callee's nest (see [Nests and
+    placement](#nests-and-placement)). A deploy token may only deploy an app that uses one it may manage or name as
+    `--from`, so a repository's previews can't call into another's apps.
+  - A service must be on a network that isn't `internal: true` to reach the host, and a host firewall must let the
+    apps' networks reach the port (`ufw` drops them by default).
 - **When the node agent restarts**, it adopts each app from its containers, and nothing that's running is restarted.
   Requests wait while it looks.
   - All running (healthy or not, or one-off services exited 0): ready.
@@ -494,6 +525,10 @@ command with what it acts on and who asked), on a thread of its own, in WAL
     listener on loopback is unaffected.
   - `inspect`, `list` and the web UI show which apps are LAN-only; `deploy --access` and the Action's `access`
     input change it (D32).
+  - An app that calls a LAN-only app, such as a public site rendering pages from a private CMS, lists it in `uses`
+    and calls it through its node's gateway (see [the gateway](#gateway-wake-on-request-stop-when-idle)), rather
+    than through the ingress: from a container on the ingress's host, the ingress would see the container's Docker
+    network as the peer, not the LAN.
 - **The server's own API** is published at `--api-domain` (such as `kn.example.com`), proxied to the server's
   listener (`--listen`, loopback by default), so nodes and the CLI reach it over HTTPS. No app may use that domain.
 - **TLS modes**, per cluster (`--ingress MODE`), all with HTTP on `--http-port` (80) and HTTPS on `--https-port`
@@ -976,6 +1011,7 @@ for macOS.
 | D31 | The CLI sends its version in its `User-Agent`, and the server refuses an older one with `426`; `/version` answers anyone. | An older CLI might misread answers or send what the server now reads differently; refusing it with which version to install is clearer than a confusing failure. Nothing new needs adding to old CLIs, which already sent `kiwi-nest/VERSION`, and `/version` lets the Action install the server's own version. |
 | D32 | A preview's domain, idle timeout, backups and access are set at deploy time by the CLI rewriting the bundle's `x-kiwi-nest` (`deploy --domain`), not by the server. | One bundle serves production and every preview, the server and nodes check an ordinary bundle, and nothing new crosses the agent link. Overrides kept by the server would have to reach the node's generated Compose file and be recorded with every generation; templating the bundle would bring back the interpolation D12 refuses. |
 | D33 | A LAN-only app is refused at the ingress by the TCP peer's address (`remote_ip`) against `--lan-cidr`, with the unknown host's 404, before basic auth. | No header can change the peer, so a tunnel's or proxy's requests are refused whatever `X-Forwarded-For` or `CF-Connecting-IP` they carry. Caddy's `client_ip` reads those headers from trusted proxies, and one wrong proxy setting would let a forged one in; it would also tie the check to Cloudflare. Refusing before basic auth and the gateway means a refused request wakes nothing and learns nothing; a 403 would say the name is served. DNS alone (no public record) stops nobody who sends the name through the tunnel. |
+| D34 | An app calls another through its own node's gateway, at `NAME.internal`, if it lists it in `x-kiwi-nest.uses`; the gateway knows the caller by the peer's address on the caller's Docker networks, and the caller joins the callee's nest. | The peer is the only thing a container can't forge, as for D33, and the gateway already wakes idle apps and holds their leases. Going through the ingress can't tell one container from another (a node's containers reach another host masqueraded as the node), and LAN-only apps would refuse them from the ingress's own host. A callee-side allow list (`allow_from`) would need the caller's name on every request, which only an address or a token can carry; tokens in the caller's environment would leak into logs and previews. Joining the nest keeps both on one node without calls crossing to another node's gateway, which would need nodes to trust each other. Attaching the caller to the callee's network would skip the gateway (no waking) and expose all of the callee's services. |
 
 ## Build plan
 
@@ -1183,6 +1219,12 @@ flowchart LR
   traffic look local, and so does a range that takes in a tunnel's connector. A LAN client reaching the ingress over
   IPv6 needs its prefix listed too. The ranges are the administrator's to get right; the docs say what to leave
   out.
+- **Calls between apps trust the container's address.** The internal gateway takes a connection from an address in
+  an app's Docker network as that app's. A container can't forge that over TCP (it would have to answer from
+  another network's address), but anything on the node's host can bind such an address, so the host is trusted, as
+  it is with the loopback gateway; and a container given `NET_ADMIN` could move itself, which kiwi-nest refuses.
+  Basic auth and LAN-only access don't apply to these calls, so an app's `uses` is the whole permission, checked
+  against deploy tokens at deploy time.
 - **Caddy's admin API.** It listens on loopback without authentication, as Caddy's does, so anything running on the
   server's host can read the configuration (the nodes' ingress tokens, the bcrypt hashes) and change it. The
   server's host is expected to run nothing else untrusted. Caddy keeps the configuration only in memory.

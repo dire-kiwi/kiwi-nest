@@ -440,6 +440,9 @@ async fn deploy(
                 .into(),
         ));
     }
+    for u in &checked.uses {
+        caller.may_call(u)?;
+    }
     if !caller.is_admin() && !checked.shared_rw.is_empty() {
         return Err(Error::Forbidden(format!(
             "a deploy token can't mount shared volumes read-write ({}); mount them `ro` or `snapshot`, or deploy \

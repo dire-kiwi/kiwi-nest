@@ -36,6 +36,7 @@ Required, at the top level of `compose.yaml`. Unknown keys are refused, which ca
 | `node_labels` | no | Labels the node must have, such as `{ vm: "201" }`. Applied when the app's nest is placed, and checked for every member joining it. Quote the values. |
 | `backups` | no | `false` leaves the app out of scheduled backups (`backup app` still works). Default `true`. `deploy --no-backups` sets it. |
 | `access` | no | `public` (the default) or `lan`. With `lan`, the ingress serves the app only to connections from the server's `--lan-cidr` (`192.168.50.0/24` on `dire` and `home`), matched on the TCP peer, never a header. Anyone else, including everything through the Cloudflare tunnel, gets the ingress's 404 for an unknown host, before basic auth, and the app isn't woken. A server without `--lan-cidr` refuses the deploy. `deploy --access lan\|public` overrides it. |
+| `uses` | no | Apps this one calls, such as `[cms]`: each is reached from its containers at `http://cms.internal:7383`, through the node's gateway, which wakes it if it's idle. LAN-only apps included, and nothing goes through the ingress, so the callee's `auth` and `access` don't apply to these calls. The app joins the nest of each app it uses (so it runs on the same node); they must exist and be in one nest. A deploy token may only use apps it may manage or name as `--from` (`token create deploy --from cms`). Needs a node newer than 0.2.1. See example 7. |
 
 Generate a hash with `htpasswd -nbB USER PASSWORD` (apache-tools; the part after `:`), or
 `docker run --rm caddy:2 caddy hash-password --plaintext PASSWORD`. Don't put the password in the bundle or the repo.
@@ -109,7 +110,8 @@ volume (`kiwi-nest volume create` and `volume load`) or the app's own volume.
 
 A nest is a group of apps and shared volumes that live on one node, because btrfs snapshots don't cross
 filesystems. An app's nest comes from (in effect, all must agree): the nest it's already in (a redeploy), its
-`--from` app's nest, the nests of the shared volumes it mounts, and `x-kiwi-nest.nest`. With none, it's a new nest
+`--from` app's nest, the nests of the shared volumes it mounts, the nests of the apps it `uses`, and
+`x-kiwi-nest.nest`. With none, it's a new nest
 named after the app. Two that disagree refuse the deploy. A new nest is placed on a node that is online, not
 cordoned, has the `arch` and every `node_labels`, and allows the host paths; then by memory headroom, unless
 `deploy --node NODE` picks it. **Once placed, a nest never moves**, so `node_labels` on a redeploy only checks,
@@ -295,3 +297,40 @@ Mounting `corpus` puts the app in corpus's nest. `ro` mounts the volume itself r
 every app mounting it (admin tokens only), and `snapshot` gives the app its own writable copy, kept across
 redeploys and deleted with the app unless `delete --keep-data`. `volume load` is refused while any app mounts the
 volume `ro` or `rw`; snapshots keep what they had.
+
+### 7. An app calling another (a public site and its private CMS)
+
+The CMS is LAN-only; the site renders pages from it on each request. Deploy `cms` first, then `blog`, which goes
+into cms's nest and so onto its node:
+
+```yaml
+# cms/compose.yaml
+x-kiwi-nest:
+  domain: cms.code.dire.nz        # LAN-only, for editing
+  service: web
+  port: 3000
+  access: lan
+  idle_timeout: "30m"             # woken by the blog's calls too
+  node_labels: { vm: "201" }
+...
+```
+
+```yaml
+# blog/compose.yaml
+x-kiwi-nest:
+  domain: blog.dire.nz
+  service: web
+  port: 8080
+  idle_timeout: "0"
+  uses: [cms]                     # http://cms.internal:7383 from blog's containers
+services:
+  web:
+    image: registry.dire.nz/blog-deps:1
+    env_file: [ ./blog.env ]      # CMS_URL=http://cms.internal:7383
+```
+
+The call arrives at cms with `Host: cms.internal:7383` and `X-Forwarded-For` the caller's container address, not
+through the ingress. Another app's containers can't reach it this way: the node's gateway only serves `NAME.internal`
+to the apps that list `NAME` in `uses`, recognised by their Docker network's addresses, so no header lets anyone
+else in. A redeploy of `blog` that was already deployed in a nest of its own is refused (a nest never moves):
+delete it and deploy it again, or give `cms` `nest: blog` when it's first deployed instead.

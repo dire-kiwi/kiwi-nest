@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Child;
 use tokio::task::JoinHandle;
 
-use crate::runtime::{ContainerState, ImageRemoval, LogsOptions, Project, ProjectState, Runtime, RuntimeError};
+use crate::runtime::{ContainerState, ImageRemoval, LogsOptions, Project, ProjectState, Runtime, RuntimeError, Subnet};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -43,6 +43,8 @@ pub struct Fake {
     pub behaviour: Mutex<Behaviour>,
     /// The images on the engine: those `up` pulled.
     images: Mutex<BTreeSet<String>>,
+    /// Each project's networks, as [`Fake::set_networks`] gave them.
+    networks: Mutex<HashMap<String, Vec<Subnet>>>,
 }
 
 struct FakeProject {
@@ -123,6 +125,12 @@ impl Fake {
             .iter()
             .filter(|(c, p)| *c == call && p == project)
             .count()
+    }
+
+    /// The subnets `networks` reports for `project`, such as `127.0.0.2/32` for a test client bound there.
+    pub fn set_networks(&self, project: &str, subnets: &[&str]) {
+        let subnets = subnets.iter().map(|s| Subnet::parse(s).expect("a subnet")).collect();
+        self.networks.lock().unwrap().insert(project.to_string(), subnets);
     }
 
     pub fn set_behaviour(&self, b: Behaviour) {
@@ -308,6 +316,12 @@ impl Runtime for Fake {
             ImageRemoval::Missing
         };
         Box::pin(async move { Ok(r) })
+    }
+
+    fn networks<'a>(&'a self, p: &'a Project) -> BoxFuture<'a, Result<Vec<Subnet>, RuntimeError>> {
+        self.log("networks", &p.name);
+        let n = self.networks.lock().unwrap().get(&p.name).cloned().unwrap_or_default();
+        Box::pin(async move { Ok(n) })
     }
 }
 

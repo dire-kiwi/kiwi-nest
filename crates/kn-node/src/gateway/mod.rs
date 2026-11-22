@@ -21,6 +21,11 @@
 //!   `X-Forwarded-For`, `-Proto` and `-Host` are passed on only from requests that carried the token, since the
 //!   ingress sets them; on any other request they're replaced with what the gateway saw. `Forwarded`,
 //!   `X-Forwarded-Port` and `X-Real-IP`, which the ingress doesn't set, are always removed.
+//! - **Calls between apps.** The internal listener ([`Access::Internal`]), on an address of the host that containers
+//!   reach (Docker's bridge), serves `NAME.internal` to the apps that list `NAME` in `x-kiwi-nest.uses`, and to
+//!   nothing else. The caller is the running app with the connection's peer address on one of its networks (see
+//!   [`gate::Gate::calls_from`]), so no header can make a request another app's. Its forwarding headers are
+//!   replaced, as on loopback.
 
 pub mod gate;
 pub mod pages;
@@ -91,6 +96,8 @@ pub enum Access {
     Local,
     /// On the node's private address, for the ingress: every request must carry this token.
     Ingress(std::sync::Arc<str>),
+    /// For apps calling the apps they use, at `NAME.internal`; the caller is known by its address.
+    Internal,
 }
 
 /// Compares two byte strings in time that depends only on their lengths.
@@ -119,7 +126,7 @@ fn admit<B>(access: &Access, req: &mut Request<B>) -> Admitted {
             [one] if !token.is_empty() && same(one.as_bytes(), token.as_bytes()) => Admitted::FromIngress,
             _ => Admitted::Refused,
         },
-        Access::Local => Admitted::Local,
+        Access::Local | Access::Internal => Admitted::Local,
     }
 }
 
@@ -186,7 +193,14 @@ pub async fn serve(
                             ));
                         }
                     }
-                    Ok::<_, Infallible>(handle(&apps, req).await)
+                    let gate = match &access {
+                        Access::Internal => internal_route(&apps, &req, peer.ip()),
+                        Access::Local | Access::Ingress(_) => route(&apps, &req),
+                    };
+                    Ok::<_, Infallible>(match gate {
+                        Ok(gate) => handle(&apps, gate, req).await,
+                        Err(refused) => *refused,
+                    })
                 }
             });
             let conn = hyper::server::conn::http1::Builder::new()
@@ -246,13 +260,55 @@ fn is_upgrade(headers: &HeaderMap) -> bool {
             .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
 }
 
-async fn handle(apps: &Apps, req: Request<Incoming>) -> Response<Body> {
-    let Some(host) = request_host(&req) else {
-        return text(StatusCode::BAD_REQUEST, "the request has no valid Host\n");
+/// A request's answer, when it goes to no app (boxed, as a response is large).
+type Refused = Box<Response<Body>>;
+
+fn refuse(status: StatusCode, msg: impl Into<Bytes>) -> Refused {
+    Box::new(text(status, msg))
+}
+
+/// The app a request is for, by its Host: its domain.
+fn route<B>(apps: &Apps, req: &Request<B>) -> Result<std::sync::Arc<Gate>, Refused> {
+    let Some(host) = request_host(req) else {
+        return Err(refuse(StatusCode::BAD_REQUEST, "the request has no valid Host\n"));
     };
-    let Some(gate) = apps.route(&host) else {
-        return text(StatusCode::NOT_FOUND, "nothing is served at this address\n");
+    apps.route(&host)
+        .ok_or_else(|| refuse(StatusCode::NOT_FOUND, "nothing is served at this address\n"))
+}
+
+/// The app a request to the internal listener is for: `NAME.internal`, if the app calling from `peer` uses it.
+fn internal_route<B>(apps: &Apps, req: &Request<B>, peer: std::net::IpAddr) -> Result<std::sync::Arc<Gate>, Refused> {
+    let Some(host) = request_host(req) else {
+        return Err(refuse(StatusCode::BAD_REQUEST, "the request has no valid Host\n"));
     };
+    let Some(name) = host
+        .strip_suffix(".internal")
+        .filter(|n| kn_bundle::manifest::is_valid_app_name(n))
+    else {
+        return Err(refuse(
+            StatusCode::NOT_FOUND,
+            "this address serves apps as NAME.internal, to the apps that use them\n",
+        ));
+    };
+    let Some(caller) = apps.caller(peer) else {
+        tracing::debug!(%peer, app = name, "refused a call from an address that's no running app's");
+        return Err(refuse(
+            StatusCode::FORBIDDEN,
+            "this address only takes requests from this node's running apps, for the apps they list in \
+             x-kiwi-nest.uses\n",
+        ));
+    };
+    if !caller.uses(name) {
+        return Err(refuse(
+            StatusCode::FORBIDDEN,
+            format!("app `{}` doesn't list `{name}` in x-kiwi-nest.uses\n", caller.name()),
+        ));
+    }
+    apps.route_name(name)
+        .ok_or_else(|| refuse(StatusCode::NOT_FOUND, format!("app `{name}` isn't on this node\n")))
+}
+
+async fn handle(apps: &Apps, gate: std::sync::Arc<Gate>, req: Request<Incoming>) -> Response<Body> {
     if req.method() == Method::GET && req.headers().contains_key(pages::STATUS_HEADER) {
         return status(apps, &gate);
     }
@@ -312,7 +368,7 @@ fn full(s: impl Into<Bytes>) -> Body {
     Full::new(s.into()).map_err(|never| match never {}).boxed()
 }
 
-fn text(status: StatusCode, msg: &'static str) -> Response<Body> {
+fn text(status: StatusCode, msg: impl Into<Bytes>) -> Response<Body> {
     let mut resp = Response::new(full(msg));
     *resp.status_mut() = status;
     let h = resp.headers_mut();

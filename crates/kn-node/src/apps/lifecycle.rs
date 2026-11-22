@@ -119,6 +119,24 @@ impl App<'_> {
         })
     }
 
+    /// Marks the app ready. One that calls other apps has its networks looked up first, so the internal gateway
+    /// knows its requests; if that fails, it's ready all the same, but its calls are refused until its next start.
+    pub(super) async fn ready(&self, gate: &crate::gateway::gate::Gate, r: &AppRecord) {
+        let networks = if r.uses.is_empty() {
+            Vec::new()
+        } else {
+            match self.inner.runtime.networks(&self.project(r)).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(app = self.name, error = %e, "couldn't find the app's networks, so it can't call other apps");
+                    Vec::new()
+                }
+            }
+        };
+        tracing::debug!(app = self.name, networks = ?networks, "ready");
+        gate.set_ready(networks);
+    }
+
     /// Records the app's status (and error), logging rather than failing if the state file can't be written: the
     /// containers have already changed.
     async fn set_status(&self, status: AppStatus, error: Option<String>) -> Option<AppRecord> {
@@ -176,7 +194,7 @@ impl App<'_> {
             Ok(()) => {
                 tracing::info!(app = self.name, elapsed = ?started.elapsed(), "started");
                 let r = self.set_status(AppStatus::Running, None).await.unwrap_or(r);
-                gate.set_phase(Phase::Ready);
+                self.ready(&gate, &r).await;
                 self.info(r).await
             }
             Err(message) => {
@@ -293,7 +311,7 @@ impl App<'_> {
                     if r.status != AppStatus::Running {
                         self.set_status(AppStatus::Running, r.error.clone()).await;
                     }
-                    gate.set_phase(Phase::Ready);
+                    self.ready(&gate, &r).await;
                 }
                 Found::Stopped => {
                     if r.status != AppStatus::Idle {

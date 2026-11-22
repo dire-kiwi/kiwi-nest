@@ -176,6 +176,8 @@ pub struct CheckedApp {
     pub access: kn_proto::state::Access,
     /// Its services' images, as the bundle names them.
     pub images: Vec<String>,
+    /// The apps it calls (`x-kiwi-nest.uses`), which put it in their nest.
+    pub uses: Vec<String>,
 }
 
 fn bundle_error(e: kn_bundle::BundleError) -> Error {
@@ -245,6 +247,7 @@ pub fn check_app(zip: &Path, scratch: &Path, limits: &Limits) -> Result<CheckedA
             })
             .collect(),
         access: m.access,
+        uses: m.uses.clone(),
         images,
     })
 }

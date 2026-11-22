@@ -213,6 +213,96 @@ fn two_nodes_share_one_engine() {
     assert!(!project_exists(&format!("{}same", b.prefix)));
 }
 
+/// A busybox httpd app at `NAME.localhost` serving `page`, with more `x-kiwi-nest` (such as `uses: [cms]`).
+fn write_named_web_bundle(dir: &Path, name: &str, page: &str, extra: &str) {
+    write_web_bundle(dir, page);
+    let yaml = std::fs::read_to_string(dir.join("compose.yaml")).unwrap();
+    let yaml = yaml.replacen(
+        "domain: same.localhost, service: web, port: 8080",
+        &format!("domain: {name}.localhost, service: web, port: 8080{extra}"),
+        1,
+    );
+    std::fs::write(dir.join("compose.yaml"), yaml).unwrap();
+}
+
+/// Runs `wget` for `url` in an app's container; its output, or its error.
+fn wget_in(project: &str, url: &str) -> Result<String, String> {
+    let out = Command::new("docker")
+        .args([
+            "exec",
+            &format!("{project}-web-1"),
+            "wget",
+            "-q",
+            "-T",
+            "20",
+            "-O",
+            "-",
+            url,
+        ])
+        .output()
+        .unwrap();
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+#[test]
+fn an_app_calls_the_apps_it_uses_through_the_internal_gateway() {
+    if !docker_and_btrfs() {
+        return;
+    }
+    let out = Command::new("docker")
+        .args([
+            "network",
+            "inspect",
+            "bridge",
+            "--format",
+            "{{range .IPAM.Config}}{{.Gateway}} {{end}}",
+        ])
+        .output()
+        .unwrap();
+    let bridge = String::from_utf8(out.stdout).unwrap();
+    let bridge = bridge
+        .split_whitespace()
+        .find(|a| !a.contains(':'))
+        .expect("Docker's bridge address");
+    // A port of its own, so it doesn't contend with a node on this machine.
+    let prefix = random_prefix();
+    let node = Node::start_with(&prefix, &["--internal-listen", &format!("{bridge}:0")]);
+    let internal = node.internal.clone().unwrap();
+    let port = internal.rsplit(':').next().unwrap();
+    let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    write_named_web_bundle(dirs[0].path(), "cms", "from cms", ", idle_timeout: 2s");
+    write_named_web_bundle(dirs[1].path(), "blog", "from blog", ", uses: [cms]");
+    write_named_web_bundle(dirs[2].path(), "other", "from other", "");
+    for (name, d) in ["cms", "blog", "other"].iter().zip(&dirs) {
+        node.ok(&["deploy", name, d.path().to_str().unwrap()]);
+    }
+    let generated = std::fs::read_to_string(node.dir.path().join("state/apps/blog/compose-1.yaml")).unwrap();
+    assert!(generated.contains(&format!("cms.internal:{bridge}")), "{generated}");
+
+    // cms idles out, and blog's call wakes it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while node.inspect("cms")["status"] != "idle" {
+        assert!(std::time::Instant::now() < deadline, "cms never idled");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let url = format!("http://cms.internal:{port}/");
+    let (blog, other) = (format!("{prefix}blog"), format!("{prefix}other"));
+    assert_eq!(wget_in(&blog, &url).unwrap(), "from cms");
+    assert_eq!(node.inspect("cms")["status"], "running");
+
+    // An app that doesn't use cms is refused, by name or at the address itself.
+    let err = wget_in(&other, &format!("http://cms.internal:{port}/")).unwrap_err();
+    assert!(err.contains("bad address"), "other has no host entry: {err}");
+    let err = wget_in(&other, &format!("http://{internal}/")).unwrap_err();
+    assert!(err.contains("403") || err.contains("404"), "{err}");
+    let err = wget_in(&blog, &format!("http://other.internal:{port}/")).unwrap_err();
+    assert!(err.contains("bad address"), "{err}");
+}
+
 /// Doesn't need Docker or btrfs: the version, and the node's refusals at startup.
 #[test]
 fn version_and_refusals_at_startup() {
