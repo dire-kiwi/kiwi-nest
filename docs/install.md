@@ -40,7 +40,7 @@ binaries: server, node and CLI in one), and the CLI for macOS, `…-aarch64-appl
 Download yours and check it:
 
 ```sh
-V=0.2.1   # the release
+V=0.3.0   # the release
 T=x86_64-unknown-linux-musl
 curl -fLO https://github.com/dire-kiwi/kiwi-nest/releases/download/v$V/kiwi-nest-$V-$T
 curl -fLO https://github.com/dire-kiwi/kiwi-nest/releases/download/v$V/SHA256SUMS
@@ -161,6 +161,14 @@ ufw allow from 192.168.1.10 to any port 7382 proto tcp
 ufw deny 7382/tcp
 ```
 
+Calls between apps (`x-kiwi-nest.uses`) go to the gateway's internal listener, on Docker's bridge (`docker0`, such as
+172.17.0.1) port 7383 by default (`--internal-listen`; `auto` is decided when the node starts, so restart it after
+installing Docker). A host firewall must let the apps' Docker networks reach it; ufw drops them by default:
+
+```sh
+ufw allow from 172.16.0.0/12 to 172.17.0.1 port 7383 proto tcp   # Docker's default address pools
+```
+
 ## Your workstation
 
 Install the CLI for your machine as above, somewhere on your PATH, then:
@@ -198,7 +206,7 @@ jobs:
     runs-on: ubuntu-latest      # it must reach the server's API: a self-hosted runner for a LAN-only cluster
     steps:
       - uses: actions/checkout@v4
-      - uses: dire-kiwi/kiwi-nest@v0.2.1
+      - uses: dire-kiwi/kiwi-nest@v0.3.0
         id: preview
         with:
           server: https://kn.example.com
